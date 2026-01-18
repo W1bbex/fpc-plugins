@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Cardinal runtime & storage
+storage/
+logs/
+cache/
+*.log
+*.json
+
+# Backups & local dev
+backups/
+.env
+.idea/
+.vscode/
