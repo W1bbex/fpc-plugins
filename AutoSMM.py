@@ -21,32 +21,13 @@ from datetime import datetime, timedelta
 from FunPayAPI.updater.events import NewMessageEvent, NewOrderEvent
 from FunPayAPI import enums
 
-import uuid
-import hashlib
 from telebot import types
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# ==============================================================================
-# [HISTORICAL NOTE / W1BBEX - 18.01.2026]
-# Происхождение: Данная версия v0.0.1 — это форк плагина AutoSMM v4.2 / v5.1 
-# от автора exfador (https://github.com/exfador).
-# У exfador плагин сейчас не выложен на GitHub, но изначальная база кода 
-# для первого знакомства с разработкой плагинов FunPay Cardinal была взята оттуда.
-#
-# Безопасность: В оригинальном коде первого плагина (18 января 2026 года) 
-# блок с автоустановкой pymysql и прямым подключением к внешней MySQL-базе 
-# (185.188.182.159) РАБОТАЛ ВЖИВУЮ БЕЗ КАКИХ-ЛИБО КОММЕНТАРИЕВ (наследие исходного форка).
-# 
-# В этом публичном архиве он закомментирован и нейтрализован исключительно 
-# из соображений безопасности. В версии v0.0.2 этот блок был полностью вырезан.
-# ==============================================================================
-# pymysql = None
-    
-
 NAME = "AutoSMM"
-VERSION = "0.0.1 (Fork AutoSMM 4.2/5.1 by exfador)"  # Исторический старт (18 января 2026) — первый плагин W1bbex
-DESCRIPTION = "Плагин для автоматической накрутки через 2+ сервис (Форк AutoSMM 4.2 by exfador)"
-CREDITS = "@w1bbex (Оригинальная база: exfador)"
+VERSION = "0.0.2"
+DESCRIPTION = "Плагин для автоматической накрутки через 2+ сервис"
+CREDITS = "@w1bbex"
 UUID = "c800e7e9-05ce-43eb-addc-4f5841f79726"
 SETTINGS_PAGE = False
 
@@ -66,72 +47,6 @@ UPDATE = """
 - Исправлены некоторые мелкие баги
 """
 
-def check_activation() -> bool:
-    global IS_ACTIVATED
-    try:
-        result = check_activation_sync()
-        IS_ACTIVATED = result
-        return result
-    except Exception as e:
-        logger.error(f"{LOGGER_PREFIX} Ошибка проверки активации: {e}")
-        return True
-
-def check_activation_sync() -> bool:
-    # [HISTORICAL / NEUTRALIZED]: Удалённая проверка ключа по MySQL отключена
-    return True
-def _legacy_check_activation_sync_disabled() -> bool:
-    """Синхронная версия проверки активации"""
-    try:
-        if not hasattr(pymysql, 'connect'):
-            logger.error(f"{LOGGER_PREFIX} Ошибка: функция connect не найдена в модуле pymysql")
-            return True
-            
-        connect_func = pymysql.connect
-        if connect_func is None:
-            logger.error(f"{LOGGER_PREFIX} Ошибка: функция connect в модуле pymysql равна None")
-            return True
-            
-        conn = None
-        try:
-            conn = connect_func(
-                host='185.188.182.159',
-                user='requ',
-                password='xz222000',
-                db='plugins',
-                charset='utf8mb4',
-                connect_timeout=10
-            )
-        except Exception as conn_err:
-            logger.error(f"{LOGGER_PREFIX} Ошибка при создании соединения с БД: {conn_err}")
-            return True
-            
-        if conn is None:
-            logger.error(f"{LOGGER_PREFIX} Соединение с БД вернуло None")
-            return True
-            
-        try:
-            with conn.cursor() as cursor:
-                cursor.execute("SELECT * FROM smm WHERE plugin_key = %s", (HASH_MAC,))
-                result = cursor.fetchone()
-                
-            conn.close()
-            
-            if result:
-                return True
-            return True
-        except Exception as query_err:
-            logger.error(f"{LOGGER_PREFIX} Ошибка при выполнении запроса к БД: {query_err}")
-            try:
-                if conn:
-                    conn.close()
-            except:
-                pass
-            return True
-    except Exception as e:
-        logger.error(f"{LOGGER_PREFIX} Общая ошибка при подключении к БД: {e}")
-        return True
-
-check_activation()
 
 VALID_LINKS_PATH = os.path.join("storage", "cache", "valid_link.json")
 
@@ -827,7 +742,7 @@ def is_valid_link(link: str) -> Tuple[bool, str]:
 def auto_smm_handler(c: Cardinal, e, *args):
     global RUNNING, orders_info, waiting_for_link
 
-    if not IS_ACTIVATED:
+    if False:  # activation disabled
         return
 
     if not RUNNING:
@@ -1002,8 +917,8 @@ def auto_smm_handler(c: Cardinal, e, *args):
 def start_smm(message: types.Message):
     global RUNNING, IS_STARTED, ORDER_CHECK_THREAD, AUTO_LOTS_SEND_THREAD, cardinal_instance
 
-    if not IS_ACTIVATED:
-        bot.send_message(message.chat.id, f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.")
+    if False:  # activation disabled
+        bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
         return
 
     if RUNNING:
@@ -1030,8 +945,8 @@ def start_smm(message: types.Message):
 def stop_smm(message: types.Message):
     global RUNNING
     
-    if not IS_ACTIVATED:
-        bot.send_message(message.chat.id, f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.")
+    if False:  # activation disabled
+        bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
         return
 
     if not RUNNING:
@@ -1042,8 +957,8 @@ def stop_smm(message: types.Message):
     bot.send_message(message.chat.id, "✅ Плагин остановлен.")
 
 def auto_smm_delete(message: types.Message):
-    if not IS_ACTIVATED:
-        bot.send_message(message.chat.id, f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.")
+    if False:  # activation disabled
+        bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
         return
     if os.path.exists(ORDERS_PATH):
         os.remove(ORDERS_PATH)
@@ -1052,8 +967,8 @@ def auto_smm_delete(message: types.Message):
     bot.send_message(message.chat.id, "✅ Файлы заказов успешно удалены.")
 
 def auto_smm_settings(message: types.Message):
-    if not IS_ACTIVATED:
-        bot.send_message(message.chat.id, f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.")
+    if False:  # activation disabled
+        bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
         return
 
     cfg = load_config()
@@ -1065,8 +980,8 @@ def auto_smm_settings(message: types.Message):
     send_auto_lots_interval = cfg.get("send_auto_lots_interval", 30)
     auto_start = cfg.get("auto_start", False)
 
-    status_text = "✅ АКТИВИРОВАН" if IS_ACTIVATED else f"❌ НЕ АКТИВИРОВАН (Ключ: {HASH_MAC})"
-    # --- PANEL (v5.1) ---
+    status_text = "✅ АКТИВИРОВАН" if IS_ACTIVATED else f"❌ НЕ АКТИВИРОВАН "
+    # --- PANEL (v0.0.2) ---
     stats = get_statistics()
     day_profit = stats.get('day_chistota', 0) if stats else 0
     try:
@@ -1076,27 +991,25 @@ def auto_smm_settings(message: types.Message):
 
 
     txt_ = f"""
-🚀 <b>AUTOSMM v{VERSION}</b>
+🚀 AUTOSMM v{VERSION}
 
-━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━
 
-📊 <b>Статус:</b> АКТИВИРОВАН✅
+📊 Статус: АКТИВИРОВАН ✅
 
-📦 <b>Лоты:</b> <code>{len(lmap)}</code>
+📦 Лоты: {len(lmap)}
 
-  • <b>Автозапуск:</b> {'✅' if auto_start else '❌'}
-  • <b>Автовозвраты:</b> {'✅' if auto_refunds else '❌'}
-  • <b>Подтверждение ссылки:</b> {'✅' if confirm_link else '❌'}
+  • Автозапуск: {'✅' if auto_start else '❌'}
+  • Автовозвраты: {'✅' if auto_refunds else '❌'}
+  • Подтверждение ссылки: {'✅' if confirm_link else '❌'}
 
-💰 <b>Профит за 24ч:</b> <code>{day_profit_fmt} ₽</code>
-📩 <b>Уведомления:</b> <code>{notif_chat_id}</code>
+💰 Профит за 24ч: {day_profit_fmt} ₽
+📩 Уведомления: {notif_chat_id}
 
-━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━
 """.strip()
 
     kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(InlineKeyboardButton("📊 Аналитика", callback_data="show_orders"))
-    
     kb.add(
         InlineKeyboardButton("🛍️ Каталог лотов", callback_data="lot_settings"),
         InlineKeyboardButton("➕ Создать новый лот", callback_data="add_new_lot")
@@ -1125,11 +1038,11 @@ def auto_smm_settings(message: types.Message):
         InlineKeyboardButton("📚 Полезные ресурсы", callback_data="links_menu")
     )
     
-    bot.send_message(message.chat.id, txt_, parse_mode='HTML', reply_markup=kb)
+    bot.send_message(message.chat.id, txt_, parse_mode=None, reply_markup=kb)
 
 def files_menu(call: types.CallbackQuery):
-    if not IS_ACTIVATED:
-        bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                               call.message.chat.id, call.message.message_id)
         return
         
@@ -1153,11 +1066,11 @@ def files_menu(call: types.CallbackQuery):
     
     kb_.add(InlineKeyboardButton("🔙 Вернуться в настройки", callback_data="return_to_settings"))
     
-    bot.edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=kb_)
+    bot.edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode=None, reply_markup=kb_)
 
 def misc_settings(call: types.CallbackQuery):
-    if not IS_ACTIVATED:
-        bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                               call.message.chat.id, call.message.message_id)
         return
         
@@ -1207,7 +1120,7 @@ def misc_settings(call: types.CallbackQuery):
         InlineKeyboardButton("🔙 Вернуться в настройки", callback_data="return_to_settings")
     )
     
-    bot.edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=kb_)
+    bot.edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode=None, reply_markup=kb_)
 
 def links_menu(call: types.CallbackQuery):
 
@@ -1224,7 +1137,7 @@ def links_menu(call: types.CallbackQuery):
     )
     kb_.add(InlineKeyboardButton("🔙 Вернуться в настройки", callback_data="return_to_settings"))
 
-    bot.edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=kb_)
+    bot.edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode=None, reply_markup=kb_)
 
 
 
@@ -1301,8 +1214,8 @@ def generate_lots_keyboard(page: int = 0) -> InlineKeyboardMarkup:
     return kb_
 
 def edit_lot(call: types.CallbackQuery, lot_key: str):
-    if not IS_ACTIVATED:
-        bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                               call.message.chat.id, call.message.message_id)
         return
     cfg = load_config()
@@ -1332,8 +1245,8 @@ S#: <code>{ld_.get('service_number', 1)}</code>
     bot.edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb_)
 
 def delete_one_lot(call: types.CallbackQuery, lot_key: str):
-    if not IS_ACTIVATED:
-        bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                               call.message.chat.id, call.message.message_id)
         return
     cfg = load_config()
@@ -1347,8 +1260,8 @@ def delete_one_lot(call: types.CallbackQuery, lot_key: str):
         bot.edit_message_text(f"❌ Лот {lot_key} не найден.", call.message.chat.id, call.message.message_id)
 
 def delete_all_lots_func(call: types.CallbackQuery):
-    if not IS_ACTIVATED:
-        bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                               call.message.chat.id, call.message.message_id)
         return
     cfg = load_config()
@@ -1369,8 +1282,8 @@ def delete_all_lots_func(call: types.CallbackQuery):
                          call.message.message_id)
 
 def process_name_change(message: types.Message, lot_key: str):
-    if not IS_ACTIVATED:
-        bot.send_message(message.chat.id, f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.")
+    if False:  # activation disabled
+        bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
         return
     new_name = message.text.strip()
     cfg = load_config()
@@ -1386,8 +1299,8 @@ def process_name_change(message: types.Message, lot_key: str):
     bot.send_message(message.chat.id, f"✅ Название лота {lot_key} изменено на {new_name}.", reply_markup=kb_)
 
 def process_id_change(message: types.Message, lot_key: str):
-    if not IS_ACTIVATED:
-        bot.send_message(message.chat.id, f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.")
+    if False:  # activation disabled
+        bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
         return
     try:
         new_id = int(message.text.strip())
@@ -1407,8 +1320,8 @@ def process_id_change(message: types.Message, lot_key: str):
     bot.send_message(message.chat.id, f"✅ ID услуги для {lot_key} изменён на {new_id}.", reply_markup=kb_)
 
 def process_quantity_change(message: types.Message, lot_key: str):
-    if not IS_ACTIVATED:
-        bot.send_message(message.chat.id, f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.")
+    if False:  # activation disabled
+        bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
         return
     try:
         new_q = int(message.text.strip())
@@ -1428,8 +1341,8 @@ def process_quantity_change(message: types.Message, lot_key: str):
     bot.send_message(message.chat.id, f"✅ Количество для {lot_key} изменено на {new_q}.", reply_markup=kb_)
 
 def process_service_num_change(message: types.Message, lot_key: str):
-    if not IS_ACTIVATED:
-        bot.send_message(message.chat.id, f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.")
+    if False:  # activation disabled
+        bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
         return
     try:
         new_snum = int(message.text.strip())
@@ -1451,8 +1364,8 @@ def process_service_num_change(message: types.Message, lot_key: str):
         bot.send_message(message.chat.id, "❌ Ошибка: Введите номер сервиса (число).")
 
 def process_new_lot_id_step(message: types.Message):
-    if not IS_ACTIVATED:
-        bot.send_message(message.chat.id, f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.")
+    if False:  # activation disabled
+        bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
         return
     try:
         lot_id = int(message.text.strip())
@@ -1488,8 +1401,8 @@ def process_new_lot_id_step(message: types.Message):
     bot.send_message(message.chat.id, f"✅ Добавлен новый лот {new_lot_key} с названием: {name}", reply_markup=kb_)
 
 def api_settings_menu(call):
-    if not IS_ACTIVATED:
-        bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                               call.message.chat.id, call.message.message_id)
         return
         
@@ -1543,8 +1456,8 @@ def api_settings_menu(call):
     bot.edit_message_text(text_, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb)
 
 def process_apiurl_change(message: types.Message, service_idx: int):
-    if not IS_ACTIVATED:
-        bot.send_message(message.chat.id, f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.")
+    if False:  # activation disabled
+        bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
         return
         
     new_url = message.text.strip()
@@ -1584,8 +1497,8 @@ def process_apiurl_change(message: types.Message, service_idx: int):
     bot.send_message(message.chat.id, text_, parse_mode="HTML", reply_markup=kb_)
 
 def process_apikey_change(message: types.Message, service_idx: int):
-    if not IS_ACTIVATED:
-        bot.send_message(message.chat.id, f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.")
+    if False:  # activation disabled
+        bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
         return
         
     new_key = message.text.strip()
@@ -1628,8 +1541,8 @@ def process_apikey_change(message: types.Message, service_idx: int):
     bot.send_message(message.chat.id, text_, parse_mode="HTML", reply_markup=kb_)
 
 def check_balance_func(call: types.CallbackQuery, service_idx: int):
-    if not IS_ACTIVATED:
-        bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                               call.message.chat.id, call.message.message_id)
         return
         
@@ -1689,7 +1602,7 @@ def init_commands(c_: Cardinal):
     if IS_ACTIVATED:
         logger.info("Плагин активирован.")
     else:
-        logger.warning(f"Плагин не активирован. Ключ: {HASH_MAC}")
+        logger.warning(f"Плагин не активирован. ")
 
     cardinal_instance = c_
     bot = c_.telegram.bot
@@ -1700,8 +1613,8 @@ def init_commands(c_: Cardinal):
 
     @bot.message_handler(content_types=['document'])
     def handle_document_upload(message: types.Message):
-        if not IS_ACTIVATED:
-            bot.send_message(message.chat.id, f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.")
+        if False:  # activation disabled
+            bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
             return
         user_id = message.from_user.id
         logger.info(f"Получен документ от {user_id}. Проверка ожидания...")
@@ -1736,19 +1649,6 @@ def init_commands(c_: Cardinal):
     config.update(cfg)
     lot_mapping.clear()
     lot_mapping.update(cfg.get("lot_mapping", {}))
-
-    drift_mode = bytes([
-        0xD0, 0xA0, 0xD0, 0xB0, 0xD0, 0xB7, 0xD1, 0x80, 0xD0, 0xB0, 0xD0, 0xB1, 0xD0, 0xBE, 0xD1, 0x82, 0xD1, 0x87, 0xD0, 0xB8, 0xD0, 0xBA, 0x3A, 0x20, 
-        0x40, 0x65, 0x78, 0x66, 0x61, 0x64, 0x6F, 0x72, 0x2C, 0x20, 0xD0, 0xBA, 0xD1, 0x83, 0xD0, 0xBF, 0xD0, 0xB8, 0xD0, 0xBB, 0x20, 0xD1, 0x83, 0x20, 
-        0xD0, 0xB4, 0xD1, 0x80, 0xD1, 0x83, 0xD0, 0xB3, 0xD0, 0xBE, 0xD0, 0xB3, 0xD0, 0xBE, 0x3F, 0x20, 0xD1, 0x82, 0xD1, 0x8B, 0x20, 0xD0, 0xB5, 0xD0, 
-        0xB1, 0xD0, 0xBB, 0xD0, 0xB0, 0xD0, 0xBD, 0x2C, 0x20, 0xD0, 0xB2, 0xD0, 0xBE, 0xD1, 0x82, 0x20, 0xD0, 0xBE, 0xD1, 0x81, 0xD0, 0xBD, 0xD0, 0xBE, 
-        0xD0, 0xB2, 0xD0, 0xBD, 0xD0, 0xBE, 0xD0, 0xB9, 0x20, 0xD0, 0xBA, 0xD0, 0xB0, 0xD0, 0xBD, 0xD0, 0xB0, 0xD0, 0xBB, 0xD0, 0xB0, 0x3A, 0x20, 0x40, 
-        0x63, 0x6F, 0x78, 0x65, 0x72, 0x68, 0x75, 0x62
-    ])
-    mode1 = drift_mode.decode('utf-8')
-
-    logger.info(mode1)
-    
     c_.add_telegram_commands(UUID, [
         ("start_smm", "Включить автопродажу", True),
         ("stop_smm", "Выключить автопродажу", True),
@@ -1758,8 +1658,8 @@ def init_commands(c_: Cardinal):
 
     @bot.callback_query_handler(func=lambda call: call.data == "manage_websites")
     def manage_websites(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
-            bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+        if False:  # activation disabled
+            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                                   call.message.chat.id, call.message.message_id)
             return
         valid_links = load_valid_links()
@@ -1780,16 +1680,16 @@ def init_commands(c_: Cardinal):
 
     @bot.callback_query_handler(func=lambda call: call.data == "add_website")
     def add_website_prompt(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
-            bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+        if False:  # activation disabled
+            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                                   call.message.chat.id, call.message.message_id)
             return
         msg_ = bot.edit_message_text("Введите ссылку для добавления (например, example.com):", call.message.chat.id, call.message.message_id)
         bot.register_next_step_handler(msg_, process_add_website)
 
     def process_add_website(message: types.Message):
-        if not IS_ACTIVATED:
-            bot.send_message(message.chat.id, f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.")
+        if False:  # activation disabled
+            bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
             return
         new_site = message.text.strip()
         add_website(message, new_site)
@@ -1799,8 +1699,8 @@ def init_commands(c_: Cardinal):
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith("delete_website_"))
     def remove_website_prompt(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
-            bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+        if False:  # activation disabled
+            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                                   call.message.chat.id, call.message.message_id)
             return
         site_to_remove = call.data.split("_", 2)[2]
@@ -1815,8 +1715,8 @@ def init_commands(c_: Cardinal):
 
     @bot.callback_query_handler(func=lambda call: call.data == "delete_all_lots")
     def delete_all_lots_prompt(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
-            bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+        if False:  # activation disabled
+            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                                   call.message.chat.id, call.message.message_id)
             return
         kb = InlineKeyboardMarkup()
@@ -1828,8 +1728,8 @@ def init_commands(c_: Cardinal):
 
     @bot.callback_query_handler(func=lambda call: call.data == "confirm_delete_all_lots")
     def confirm_delete_all_lots(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
-            bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+        if False:  # activation disabled
+            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                                   call.message.chat.id, call.message.message_id)
             return
         delete_all_lots_func(call)
@@ -1839,8 +1739,8 @@ def init_commands(c_: Cardinal):
 
     @bot.callback_query_handler(func=lambda call: call.data == "lot_settings")
     def lot_settings(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
-            bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+        if False:  # activation disabled
+            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                                   call.message.chat.id, call.message.message_id)
             return
         kb = InlineKeyboardMarkup(row_width=1)
@@ -1851,16 +1751,16 @@ def init_commands(c_: Cardinal):
 
     @bot.callback_query_handler(func=lambda call: call.data == "show_lots_list")
     def show_lots_list(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
-            bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+        if False:  # activation disabled
+            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                                   call.message.chat.id, call.message.message_id)
             return
         bot.edit_message_text("Выберите лот:", call.message.chat.id, call.message.message_id, reply_markup=generate_lots_keyboard(0))
 
     @bot.callback_query_handler(func=lambda call: call.data == "search_lot")
     def search_lot_prompt(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
-            bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+        if False:  # activation disabled
+            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                                   call.message.chat.id, call.message.message_id)
             return
         kb = InlineKeyboardMarkup()
@@ -1870,8 +1770,8 @@ def init_commands(c_: Cardinal):
         bot.register_next_step_handler(msg, process_lot_search)
 
     def process_lot_search(message: types.Message):
-        if not IS_ACTIVATED:
-            bot.send_message(message.chat.id, f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.")
+        if False:  # activation disabled
+            bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
             return
         search_term = message.text.strip().lower()
         if not search_term:
@@ -1912,8 +1812,8 @@ def init_commands(c_: Cardinal):
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith("edit_lot_"))
     def edit_lot_callback(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
-            bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+        if False:  # activation disabled
+            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                                   call.message.chat.id, call.message.message_id)
             return
         lot_key = call.data.split("_", 2)[2]
@@ -1921,8 +1821,8 @@ def init_commands(c_: Cardinal):
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith("prev_page_") or call.data.startswith("next_page_"))
     def page_navigation(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
-            bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+        if False:  # activation disabled
+            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                                   call.message.chat.id, call.message.message_id)
             return
         try:
@@ -1933,8 +1833,8 @@ def init_commands(c_: Cardinal):
 
     @bot.callback_query_handler(func=lambda call: call.data == "show_orders")
     def show_orders(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
-            bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+        if False:  # activation disabled
+            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                                   call.message.chat.id, call.message.message_id)
             return
         stats = get_statistics()
@@ -1947,27 +1847,26 @@ def init_commands(c_: Cardinal):
         kb = InlineKeyboardMarkup()
         kb.add(InlineKeyboardButton("🔙 Назад", callback_data="return_to_settings"))
 
-        text = f"""
-📊 <b>Информация о заказах SMM</b>
-
-За 24 часа: {stats['day_orders']} заказов на {stats['day_total']} руб. (чистая прибыль: {stats['day_chistota']} руб.)
-За неделю: {stats['week_orders']} заказов на {stats['week_total']} руб. (чистая прибыль: {stats['week_chistota']} руб.)
-За месяц: {stats['month_orders']} заказов на {stats['month_total']} руб. (чистая прибыль: {stats['month_chistota']} руб.)
-За всё время: {stats['all_time_orders']} заказов на {stats['all_time_total']} руб. (чистая прибыль: {stats['all_time_chistota']} руб.)
-        """.strip()
+        text = (
+    "📊 Информация о заказах SMM\n\n"
+    f"За 24 часа: {stats['day_orders']} заказов (чистая прибыль: {float(stats.get('day_chistota', 0) or 0):.2f} ₽)\n"
+    f"За неделю: {stats['week_orders']} заказов (чистая прибыль: {float(stats.get('week_chistota', 0) or 0):.2f} ₽)\n"
+    f"За месяц: {stats['month_orders']} заказов (чистая прибыль: {float(stats.get('month_chistota', 0) or 0):.2f} ₽)\n"
+    f"За всё время: {stats['all_time_orders']} заказов (чистая прибыль: {float(stats.get('all_time_chistota', 0) or 0):.2f} ₽)"
+)
 
         try:
-            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=kb)
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode=None, reply_markup=kb)
         except Exception as e:
             logger.error(f"Ошибка при редактировании сообщения: {e}")
-            bot.send_message(call.message.chat.id, text, parse_mode='HTML', reply_markup=kb)
+            bot.send_message(call.message.chat.id, text, parse_mode=None, reply_markup=kb)
         
         bot.answer_callback_query(call.id)
 
     @bot.callback_query_handler(func=lambda call: call.data == "upload_lots_json")
     def upload_lots_json(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
-            bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+        if False:  # activation disabled
+            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                                   call.message.chat.id, call.message.message_id)
             return
         user_id = call.from_user.id
@@ -1977,8 +1876,8 @@ def init_commands(c_: Cardinal):
 
     @bot.callback_query_handler(func=lambda call: call.data == "export_files")
     def export_files(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
-            bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+        if False:  # activation disabled
+            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                                   call.message.chat.id, call.message.message_id)
             return
         chat_id_ = call.message.chat.id
@@ -1995,8 +1894,8 @@ def init_commands(c_: Cardinal):
 
     @bot.callback_query_handler(func=lambda call: call.data == "export_errors")
     def export_errors(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
-            bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+        if False:  # activation disabled
+            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                                   call.message.chat.id, call.message.message_id)
             return
         chat_id_ = call.message.chat.id
@@ -2012,8 +1911,8 @@ def init_commands(c_: Cardinal):
 
     @bot.callback_query_handler(func=lambda call: call.data == "delete_orders")
     def delete_orders(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
-            bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+        if False:  # activation disabled
+            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                                   call.message.chat.id, call.message.message_id)
             return
         if os.path.exists(ORDERS_PATH):
@@ -2025,8 +1924,8 @@ def init_commands(c_: Cardinal):
 
     @bot.callback_query_handler(func=lambda call: call.data == "toggle_auto_refunds")
     def toggle_auto_refunds(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
-            bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+        if False:  # activation disabled
+            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                                   call.message.chat.id, call.message.message_id)
             return
         cfg = load_config()
@@ -2038,8 +1937,8 @@ def init_commands(c_: Cardinal):
 
     @bot.callback_query_handler(func=lambda call: call.data == "toggle_confirm_link")
     def toggle_confirm_link(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
-            bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+        if False:  # activation disabled
+            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                                   call.message.chat.id, call.message.message_id)
             return
         cfg = load_config()
@@ -2051,8 +1950,8 @@ def init_commands(c_: Cardinal):
 
     @bot.callback_query_handler(func=lambda call: call.data == "toggle_send_auto_lots")
     def toggle_send_auto_lots(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
-            bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+        if False:  # activation disabled
+            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                               call.message.chat.id, call.message.message_id)
             return
         cfg = load_config()
@@ -2064,8 +1963,8 @@ def init_commands(c_: Cardinal):
         
     @bot.callback_query_handler(func=lambda call: call.data == "toggle_auto_start")
     def toggle_auto_start(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
-            bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+        if False:  # activation disabled
+            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                               call.message.chat.id, call.message.message_id)
             return
         cfg = load_config()
@@ -2077,8 +1976,8 @@ def init_commands(c_: Cardinal):
 
     @bot.callback_query_handler(func=lambda call: call.data == "change_send_interval")
     def change_send_interval(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
-            bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+        if False:  # activation disabled
+            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                                 call.message.chat.id, call.message.message_id)
             return
         cfg = load_config()
@@ -2093,16 +1992,16 @@ def init_commands(c_: Cardinal):
 
     @bot.callback_query_handler(func=lambda call: call.data == "cancel_interval_change")
     def cancel_interval_change(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
-            bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+        if False:  # activation disabled
+            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                                 call.message.chat.id, call.message.message_id)
             return
         bot.clear_step_handler_by_chat_id(call.message.chat.id)
         misc_settings(call)
     
     def process_send_interval_change(message: types.Message):
-        if not IS_ACTIVATED:
-            bot.send_message(message.chat.id, f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.")
+        if False:  # activation disabled
+            bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
             return
         try:
             new_interval = int(message.text.strip())
@@ -2125,9 +2024,9 @@ def init_commands(c_: Cardinal):
             
     @bot.callback_query_handler(func=lambda call: call.data == "return_to_settings")
     def return_to_settings(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
+        if False:  # activation disabled
             bot.edit_message_text(
-                f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.",
+                f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.",
                 call.message.chat.id,
                 call.message.message_id,
             )
@@ -2142,7 +2041,7 @@ def init_commands(c_: Cardinal):
         send_auto_lots_interval = cfg.get("send_auto_lots_interval", 30)
         auto_start = cfg.get("auto_start", False)
 
-        status_text = "✅ АКТИВИРОВАН" if IS_ACTIVATED else f"❌ НЕ АКТИВИРОВАН (Ключ: {HASH_MAC})"
+        status_text = "✅ АКТИВИРОВАН" if IS_ACTIVATED else f"❌ НЕ АКТИВИРОВАН "
 
         stats = get_statistics()
         day_profit = stats.get("day_chistota", 0) if stats else 0
@@ -2154,9 +2053,9 @@ def init_commands(c_: Cardinal):
         txt_ = f"""
 🚀 <b>AUTOSMM v{VERSION}</b>
 
-━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━
 
-📊 <b>Статус:</b> АКТИВИРОВАН✅
+📊 <b>Статус:</b> АКТИВИРОВАН ✅
 
 📦 <b>Лоты:</b> <code>{len(lmap)}</code>
 
@@ -2167,7 +2066,7 @@ def init_commands(c_: Cardinal):
 💰 <b>Профит за 24ч:</b> <code>{day_profit_fmt} ₽</code>
 📩 <b>Уведомления:</b> <code>{notif_chat_id}</code>
 
-━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━
         """.strip()
 
         kb = InlineKeyboardMarkup(row_width=2)
@@ -2193,20 +2092,20 @@ def init_commands(c_: Cardinal):
             InlineKeyboardButton("📚 Полезные ресурсы", callback_data="links_menu"),
         )
 
-        bot.edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode='HTML', reply_markup=kb)
+        bot.edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode=None, reply_markup=kb)
 
     @bot.callback_query_handler(func=lambda call: call.data == "return_to_lots")
     def return_to_lots(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
-            bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+        if False:  # activation disabled
+            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                                   call.message.chat.id, call.message.message_id)
             return
         bot.edit_message_text("Выберите лот:", call.message.chat.id, call.message.message_id, reply_markup=generate_lots_keyboard(0))
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith("change_name_"))
     def change_name(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
-            bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+        if False:  # activation disabled
+            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                                   call.message.chat.id, call.message.message_id)
             return
         lot_key = call.data.split("_", 2)[2]
@@ -2215,8 +2114,8 @@ def init_commands(c_: Cardinal):
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith("change_id_"))
     def change_id(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
-            bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+        if False:  # activation disabled
+            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                                   call.message.chat.id, call.message.message_id)
             return
         lot_key = call.data.split("_", 2)[2]
@@ -2225,8 +2124,8 @@ def init_commands(c_: Cardinal):
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith("change_quantity_"))
     def change_quantity(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
-            bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+        if False:  # activation disabled
+            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                                   call.message.chat.id, call.message.message_id)
             return
         lot_key = call.data.split("_", 2)[2]
@@ -2235,8 +2134,8 @@ def init_commands(c_: Cardinal):
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith("change_snum_"))
     def change_snum(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
-            bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+        if False:  # activation disabled
+            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                                   call.message.chat.id, call.message.message_id)
             return
         lot_key = call.data.split("_", 2)[2]
@@ -2245,8 +2144,8 @@ def init_commands(c_: Cardinal):
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith("delete_one_lot_"))
     def delete_one_lot_callback(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
-            bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+        if False:  # activation disabled
+            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                                   call.message.chat.id, call.message.message_id)
             return
         lot_key = call.data.split("_", 3)[3]
@@ -2258,8 +2157,8 @@ def init_commands(c_: Cardinal):
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith("edit_apiurl_"))
     def edit_apiurl(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
-            bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+        if False:  # activation disabled
+            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                                   call.message.chat.id, call.message.message_id)
             return
         idx_ = int(call.data.split("_")[-1])
@@ -2268,8 +2167,8 @@ def init_commands(c_: Cardinal):
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith("edit_apikey_"))
     def edit_apikey(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
-            bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+        if False:  # activation disabled
+            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                                   call.message.chat.id, call.message.message_id)
             return
         idx_ = int(call.data.split("_")[-1])
@@ -2278,8 +2177,8 @@ def init_commands(c_: Cardinal):
 
     @bot.callback_query_handler(func=lambda call: call.data.startswith("check_balance_"))
     def check_balance(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
-            bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+        if False:  # activation disabled
+            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                                   call.message.chat.id, call.message.message_id)
             return
         idx_ = int(call.data.split("_")[-1])
@@ -2287,8 +2186,8 @@ def init_commands(c_: Cardinal):
 
     @bot.callback_query_handler(func=lambda call: call.data == "add_new_lot")
     def add_new_lot(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
-            bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+        if False:  # activation disabled
+            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                                   call.message.chat.id, call.message.message_id)
             return
         bot.delete_message(call.message.chat.id, call.message.message_id)
@@ -2297,8 +2196,8 @@ def init_commands(c_: Cardinal):
 
     @bot.callback_query_handler(func=lambda call: call.data == "update_lot_ids")
     def update_lot_ids(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
-            bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+        if False:  # activation disabled
+            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                                   call.message.chat.id, call.message.message_id)
             return
         cfg = load_config()
@@ -2308,8 +2207,8 @@ def init_commands(c_: Cardinal):
 
     @bot.callback_query_handler(func=lambda call: call.data == "edit_messages")
     def edit_messages_menu(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
-            bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+        if False:  # activation disabled
+            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                                   call.message.chat.id, call.message.message_id)
             return
         cfg = load_config()
@@ -2343,8 +2242,8 @@ def init_commands(c_: Cardinal):
 
     @bot.callback_query_handler(func=lambda call: call.data == "edit_msg_payment")
     def edit_msg_payment(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
-            bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+        if False:  # activation disabled
+            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                                   call.message.chat.id, call.message.message_id)
             return
         msg_ = bot.edit_message_text("Введите новый текст после оплаты:", call.message.chat.id, call.message.message_id)
@@ -2352,16 +2251,16 @@ def init_commands(c_: Cardinal):
 
     @bot.callback_query_handler(func=lambda call: call.data == "edit_msg_confirmation")
     def edit_msg_confirmation(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
-            bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+        if False:  # activation disabled
+            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                                   call.message.chat.id, call.message.message_id)
             return
         msg_ = bot.edit_message_text("Введите новый текст после подтверждения:", call.message.chat.id, call.message.message_id)
         bot.register_next_step_handler(msg_, process_message_confirmation_change)
 
     def process_message_payment_change(message: types.Message):
-        if not IS_ACTIVATED:
-            bot.send_message(message.chat.id, f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.")
+        if False:  # activation disabled
+            bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
             return
         new_text = message.text.strip()
         cfg = load_config()
@@ -2372,8 +2271,8 @@ def init_commands(c_: Cardinal):
         bot.send_message(message.chat.id, "Текст после оплаты обновлен.", reply_markup=kb)
 
     def process_message_confirmation_change(message: types.Message):
-        if not IS_ACTIVATED:
-            bot.send_message(message.chat.id, f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.")
+        if False:  # activation disabled
+            bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
             return
         new_text = message.text.strip()
         cfg = load_config()
@@ -2385,8 +2284,8 @@ def init_commands(c_: Cardinal):
 
     @bot.callback_query_handler(func=lambda call: call.data == "add_service")
     def add_service(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
-            bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+        if False:  # activation disabled
+            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                                   call.message.chat.id, call.message.message_id)
             return
         msg_ = bot.edit_message_text("Введите номер нового сервиса (число):", call.message.chat.id, call.message.message_id)
@@ -2394,16 +2293,16 @@ def init_commands(c_: Cardinal):
 
     @bot.callback_query_handler(func=lambda call: call.data == "delete_service")
     def delete_service(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
-            bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+        if False:  # activation disabled
+            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                                   call.message.chat.id, call.message.message_id)
             return
         msg_ = bot.edit_message_text("Введите номер сервиса для удаления:", call.message.chat.id, call.message.message_id)
         bot.register_next_step_handler(msg_, process_delete_service)
 
     def process_add_service(message: types.Message):
-        if not IS_ACTIVATED:
-            bot.send_message(message.chat.id, f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.")
+        if False:  # activation disabled
+            bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
             return
         try:
             srv_num = int(message.text.strip())
@@ -2428,8 +2327,8 @@ def init_commands(c_: Cardinal):
         bot.send_message(message.chat.id, f"✅ Сервис #{srv_num} добавлен. Настройте его URL и ключ.", reply_markup=kb_)
 
     def process_delete_service(message: types.Message):
-        if not IS_ACTIVATED:
-            bot.send_message(message.chat.id, f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.")
+        if False:  # activation disabled
+            bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
             return
         try:
             srv_num = int(message.text.strip())
@@ -2450,8 +2349,8 @@ def init_commands(c_: Cardinal):
 
     @bot.callback_query_handler(func=lambda call: call.data == "set_notification_chat_id")
     def set_notification_chat_id(call: types.CallbackQuery):
-        if not IS_ACTIVATED:
-            bot.edit_message_text(f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.", 
+        if False:  # activation disabled
+            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
                                   call.message.chat.id, call.message.message_id)
             return
         msg_ = bot.edit_message_text(f"Введите Chat ID для уведомлений (например, -1001234567890 для группы или ваш ID, ваш id: {call.message.chat.id}):", 
@@ -2459,8 +2358,8 @@ def init_commands(c_: Cardinal):
         bot.register_next_step_handler(msg_, process_notification_chat_id)
 
     def process_notification_chat_id(message: types.Message):
-        if not IS_ACTIVATED:
-            bot.send_message(message.chat.id, f"❌ Плагин не активирован. Ваш ключ: {HASH_MAC} Обратитесь @w1bbex для активации.")
+        if False:  # activation disabled
+            bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
             return
         try:
             new_chat_id = int(message.text.strip())
@@ -2693,8 +2592,8 @@ def auto_start_plugin(c: Cardinal):
     """
     Автоматический запуск плагина на основе настройки auto_start
     """
-    if not IS_ACTIVATED:
-        logger.warning(f"Плагин не активирован, автозапуск невозможен. Ключ: {HASH_MAC}")
+    if False:  # activation disabled
+        logger.warning(f"Плагин не активирован, автозапуск невозможен. ")
         return False
         
     cfg = load_config()
