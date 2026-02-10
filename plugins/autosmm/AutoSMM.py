@@ -25,7 +25,7 @@ from telebot import types
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 NAME = "AutoSMM"
-VERSION = "0.0.2"
+VERSION = "0.0.3"
 DESCRIPTION = "Плагин для автоматической накрутки через 2+ сервис"
 CREDITS = "@w1bbex"
 UUID = "c800e7e9-05ce-43eb-addc-4f5841f79726"
@@ -168,7 +168,7 @@ def load_config() -> Dict:
                             }
                         }
                     if "auto_refunds" not in cfg:
-                        cfg["auto_refunds"] = True
+                        cfg["auto_refunds"] = False
                     if "confirm_link" not in cfg:
                         cfg["confirm_link"] = True
                     if "messages" not in cfg:
@@ -179,7 +179,7 @@ def load_config() -> Dict:
                     if "notification_chat_id" not in cfg:
                         cfg["notification_chat_id"] = None
                     if "send_auto_lots" not in cfg:
-                        cfg["send_auto_lots"] = True
+                        cfg["send_auto_lots"] = False
                     if "send_auto_lots_interval" not in cfg:
                         cfg["send_auto_lots_interval"] = 30
                     if "auto_start" not in cfg:
@@ -217,7 +217,7 @@ def create_default_config() -> Dict:
                 "api_key": "YOUR_API_KEY"
             }
         },
-        "auto_refunds": True,
+        "auto_refunds": False,
         "confirm_link": True,
         "messages": {
             "after_payment": """👾 Благодарю за оплату!
@@ -616,6 +616,11 @@ def check_order_status(
             status_lower = status_.lower()
 
             if status_lower in completed_statuses or (remains_ is not None and remains_ == 0):
+                try:
+                    order_data["failed_status_checks"] = 0
+                    save_orders_data(orders)
+                except Exception:
+                    pass
                 if order_info:
                     try:
                         with file_lock:
@@ -638,16 +643,44 @@ def check_order_status(
                 return
 
             elif status_lower in failed_statuses:
+                # --- fail-safe: 3 attempts with 5s cooldown before refund ---
+                try:
+                    fail_cnt = int(order_data.get("failed_status_checks", 0)) + 1
+                except Exception:
+                    fail_cnt = 1
+
+                order_data["failed_status_checks"] = fail_cnt
+                try:
+                    save_orders_data(orders)
+                except Exception as _e:
+                    logger.error(f"Не удалось сохранить счётчик failed_status_checks для заказа #{order_id_funpay}: {_e}")
+
+                if fail_cnt < 3:
+                    logger.warning(
+                        f"Заказ #{twiboost_order_id} имеет статус '{status_}' (попытка {fail_cnt}/3). Повторная проверка через 5 сек..."
+                    )
+                    threading.Timer(
+                        5,
+                        check_order_status,
+                        args=(c, twiboost_order_id, buyer_chat_id, link, order_id_funpay, attempt + 1)
+                    ).start()
+                    return
+
                 refund_order(
                     c,
                     order_id_funpay,
                     buyer_chat_id,
                     reason="Заказ не выполнен.",
-                    detailed_reason=f"Заказ в сервисе имеет статус '{status_}'."
+                    detailed_reason=f"Заказ в сервисе имеет статус '{status_}' (3/3)."
                 )
                 return
 
             else:
+                try:
+                    order_data["failed_status_checks"] = 0
+                    save_orders_data(orders)
+                except Exception:
+                    pass
                 logger.info(f"Заказ #{twiboost_order_id} в статусе '{status_}' (осталось: {remains_}).")
                 delay = 300
 
@@ -935,10 +968,17 @@ def start_smm(message: types.Message):
         ORDER_CHECK_THREAD.daemon = True
         ORDER_CHECK_THREAD.start()
     
-    if not AUTO_LOTS_SEND_THREAD or not AUTO_LOTS_SEND_THREAD.is_alive():
-        AUTO_LOTS_SEND_THREAD = threading.Thread(target=start_auto_lots_sender, args=(c_,))
-        AUTO_LOTS_SEND_THREAD.daemon = True
-        AUTO_LOTS_SEND_THREAD.start()
+    try:
+        cfg = load_config()
+        send_auto_lots = cfg.get("send_auto_lots", False)
+    except Exception:
+        send_auto_lots = False
+
+    if send_auto_lots:
+        if not AUTO_LOTS_SEND_THREAD or not AUTO_LOTS_SEND_THREAD.is_alive():
+            AUTO_LOTS_SEND_THREAD = threading.Thread(target=start_auto_lots_sender, args=(c_,))
+            AUTO_LOTS_SEND_THREAD.daemon = True
+            AUTO_LOTS_SEND_THREAD.start()
     
     bot.send_message(message.chat.id, "✅ Плагин успешно запущен.")
 
@@ -976,12 +1016,12 @@ def auto_smm_settings(message: types.Message):
     auto_refunds = cfg.get("auto_refunds", True)
     confirm_link = cfg.get("confirm_link", True)
     notif_chat_id = cfg.get("notification_chat_id", "Не задан")
-    send_auto_lots = cfg.get("send_auto_lots", True)
+    send_auto_lots = cfg.get("send_auto_lots", False)
     send_auto_lots_interval = cfg.get("send_auto_lots_interval", 30)
     auto_start = cfg.get("auto_start", False)
 
     status_text = "✅ АКТИВИРОВАН" if IS_ACTIVATED else f"❌ НЕ АКТИВИРОВАН "
-    # --- PANEL (v0.0.2) ---
+    # --- PANEL (v0.0.3) ---
     stats = get_statistics()
     day_profit = stats.get('day_chistota', 0) if stats else 0
     try:
@@ -1077,7 +1117,7 @@ def misc_settings(call: types.CallbackQuery):
     cfg = load_config()
     auto_refunds = cfg.get("auto_refunds", True)
     confirm_link = cfg.get("confirm_link", True)
-    send_auto_lots = cfg.get("send_auto_lots", True)
+    send_auto_lots = cfg.get("send_auto_lots", False)
     send_auto_lots_interval = cfg.get("send_auto_lots_interval", 30)
     auto_start = cfg.get("auto_start", False)
     
@@ -2037,7 +2077,7 @@ def init_commands(c_: Cardinal):
         auto_refunds = cfg.get("auto_refunds", True)
         confirm_link = cfg.get("confirm_link", True)
         notif_chat_id = cfg.get("notification_chat_id", "Не задан")
-        send_auto_lots = cfg.get("send_auto_lots", True)
+        send_auto_lots = cfg.get("send_auto_lots", False)
         send_auto_lots_interval = cfg.get("send_auto_lots_interval", 30)
         auto_start = cfg.get("auto_start", False)
 
@@ -2560,7 +2600,7 @@ def start_auto_lots_sender(c: Cardinal):
         try:
             cfg = load_config()
             chat_id = cfg.get("notification_chat_id")
-            send_auto_lots = cfg.get("send_auto_lots", True)
+            send_auto_lots = cfg.get("send_auto_lots", False)
             interval_minutes = cfg.get("send_auto_lots_interval", 30)
             
             if chat_id and send_auto_lots and os.path.exists(CONFIG_PATH):
@@ -2610,10 +2650,17 @@ def auto_start_plugin(c: Cardinal):
             ORDER_CHECK_THREAD.daemon = True
             ORDER_CHECK_THREAD.start()
         
-        if not AUTO_LOTS_SEND_THREAD or not AUTO_LOTS_SEND_THREAD.is_alive():
-            AUTO_LOTS_SEND_THREAD = threading.Thread(target=start_auto_lots_sender, args=(c,))
-            AUTO_LOTS_SEND_THREAD.daemon = True
-            AUTO_LOTS_SEND_THREAD.start()
+        try:
+            cfg2 = load_config()
+            send_auto_lots2 = cfg2.get("send_auto_lots", False)
+        except Exception:
+            send_auto_lots2 = False
+
+        if send_auto_lots2:
+            if not AUTO_LOTS_SEND_THREAD or not AUTO_LOTS_SEND_THREAD.is_alive():
+                AUTO_LOTS_SEND_THREAD = threading.Thread(target=start_auto_lots_sender, args=(c,))
+                AUTO_LOTS_SEND_THREAD.daemon = True
+                AUTO_LOTS_SEND_THREAD.start()
             
         logger.info("Плагин SMM успешно запущен автоматически")
         return True
