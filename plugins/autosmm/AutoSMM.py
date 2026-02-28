@@ -25,27 +25,17 @@ from telebot import types
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 NAME = "AutoSMM"
-VERSION = "0.0.3"
+VERSION = "0.0.4"
 DESCRIPTION = "Плагин для автоматической накрутки через 2+ сервис"
 CREDITS = "@w1bbex"
 UUID = "c800e7e9-05ce-43eb-addc-4f5841f79726"
 SETTINGS_PAGE = False
-
-
-IS_ACTIVATED = True
 
 LOGGER_PREFIX = "[AUTO autosmm]"
 logger = logging.getLogger("FPC.autosmm")
 
 waiting_for_lots_upload = set()
 
-UPDATE = """
-Примечания к обновлению:
-
-- Можно включить/выключить подтверждение ссылки
-- Теперь правильно считается чистая прибыль
-- Исправлены некоторые мелкие баги
-"""
 
 
 VALID_LINKS_PATH = os.path.join("storage", "cache", "valid_link.json")
@@ -324,13 +314,15 @@ def save_order_data(
         "order_id": order_id,
         "id_zakaz": twiboost_id,
         "status": status,
-        "chistota": chistota,
+        "chistota": 0.0,  # will be updated after charge is known
+        
         "customer_url": customer_url,
         "quantity": quantity,
         "service_number": service_number,
         "is_refunded": is_refunded,
         "spent": 0.0,
-        "summa": chistota,
+        "summa": float(chistota),  # FunPay amount at creation time
+        
         "currency": "RUB"
     }
     
@@ -708,7 +700,7 @@ def check_order_status(
     ).start()
 
 def start_order_checking(c: Cardinal):
-    if RUNNING and IS_ACTIVATED:  
+    if RUNNING:  
         try:
             all_data = load_orders_data()
         except Exception as e:
@@ -921,7 +913,7 @@ def auto_smm_handler(c: Cardinal, e, *args):
             "summa": orderPrice
         }
 
-        save_order_info(orderID, orderPrice, orderDesc, orderPrice)
+        save_order_info(orderID, orderPrice, orderDesc, 0)
 
         try:
             msg_payment = cfg["messages"]["after_payment"].format(
@@ -951,7 +943,7 @@ def start_smm(message: types.Message):
     global RUNNING, IS_STARTED, ORDER_CHECK_THREAD, AUTO_LOTS_SEND_THREAD, cardinal_instance
 
     if False:  # activation disabled
-        bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
+        bot.send_message(message.chat.id, f"❌  ")
         return
 
     if RUNNING:
@@ -986,7 +978,7 @@ def stop_smm(message: types.Message):
     global RUNNING
     
     if False:  # activation disabled
-        bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
+        bot.send_message(message.chat.id, f"❌  ")
         return
 
     if not RUNNING:
@@ -996,19 +988,10 @@ def stop_smm(message: types.Message):
     RUNNING = False
     bot.send_message(message.chat.id, "✅ Плагин остановлен.")
 
-def auto_smm_delete(message: types.Message):
-    if False:  # activation disabled
-        bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
-        return
-    if os.path.exists(ORDERS_PATH):
-        os.remove(ORDERS_PATH)
-    if os.path.exists(ORDERS_DATA_PATH):
-        os.remove(ORDERS_DATA_PATH)
-    bot.send_message(message.chat.id, "✅ Файлы заказов успешно удалены.")
 
 def auto_smm_settings(message: types.Message):
     if False:  # activation disabled
-        bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
+        bot.send_message(message.chat.id, f"❌  ")
         return
 
     cfg = load_config()
@@ -1020,8 +1003,8 @@ def auto_smm_settings(message: types.Message):
     send_auto_lots_interval = cfg.get("send_auto_lots_interval", 30)
     auto_start = cfg.get("auto_start", False)
 
-    status_text = "✅ АКТИВИРОВАН" if IS_ACTIVATED else f"❌ НЕ АКТИВИРОВАН "
-    # --- PANEL (v0.0.3) ---
+    status_text = "🟢 ВКЛ" if RUNNING else "🔴 ВЫКЛ"
+# --- PANEL (v0.0.3) ---
     stats = get_statistics()
     day_profit = stats.get('day_chistota', 0) if stats else 0
     try:
@@ -1082,7 +1065,7 @@ def auto_smm_settings(message: types.Message):
 
 def files_menu(call: types.CallbackQuery):
     if False:  # activation disabled
-        bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+        bot.edit_message_text(f"❌  ", 
                               call.message.chat.id, call.message.message_id)
         return
         
@@ -1110,7 +1093,7 @@ def files_menu(call: types.CallbackQuery):
 
 def misc_settings(call: types.CallbackQuery):
     if False:  # activation disabled
-        bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+        bot.edit_message_text(f"❌  ", 
                               call.message.chat.id, call.message.message_id)
         return
         
@@ -1255,7 +1238,7 @@ def generate_lots_keyboard(page: int = 0) -> InlineKeyboardMarkup:
 
 def edit_lot(call: types.CallbackQuery, lot_key: str):
     if False:  # activation disabled
-        bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+        bot.edit_message_text(f"❌  ", 
                               call.message.chat.id, call.message.message_id)
         return
     cfg = load_config()
@@ -1286,7 +1269,7 @@ S#: <code>{ld_.get('service_number', 1)}</code>
 
 def delete_one_lot(call: types.CallbackQuery, lot_key: str):
     if False:  # activation disabled
-        bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+        bot.edit_message_text(f"❌  ", 
                               call.message.chat.id, call.message.message_id)
         return
     cfg = load_config()
@@ -1301,7 +1284,7 @@ def delete_one_lot(call: types.CallbackQuery, lot_key: str):
 
 def delete_all_lots_func(call: types.CallbackQuery):
     if False:  # activation disabled
-        bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+        bot.edit_message_text(f"❌  ", 
                               call.message.chat.id, call.message.message_id)
         return
     cfg = load_config()
@@ -1323,7 +1306,7 @@ def delete_all_lots_func(call: types.CallbackQuery):
 
 def process_name_change(message: types.Message, lot_key: str):
     if False:  # activation disabled
-        bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
+        bot.send_message(message.chat.id, f"❌  ")
         return
     new_name = message.text.strip()
     cfg = load_config()
@@ -1340,7 +1323,7 @@ def process_name_change(message: types.Message, lot_key: str):
 
 def process_id_change(message: types.Message, lot_key: str):
     if False:  # activation disabled
-        bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
+        bot.send_message(message.chat.id, f"❌  ")
         return
     try:
         new_id = int(message.text.strip())
@@ -1361,7 +1344,7 @@ def process_id_change(message: types.Message, lot_key: str):
 
 def process_quantity_change(message: types.Message, lot_key: str):
     if False:  # activation disabled
-        bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
+        bot.send_message(message.chat.id, f"❌  ")
         return
     try:
         new_q = int(message.text.strip())
@@ -1382,7 +1365,7 @@ def process_quantity_change(message: types.Message, lot_key: str):
 
 def process_service_num_change(message: types.Message, lot_key: str):
     if False:  # activation disabled
-        bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
+        bot.send_message(message.chat.id, f"❌  ")
         return
     try:
         new_snum = int(message.text.strip())
@@ -1405,7 +1388,7 @@ def process_service_num_change(message: types.Message, lot_key: str):
 
 def process_new_lot_id_step(message: types.Message):
     if False:  # activation disabled
-        bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
+        bot.send_message(message.chat.id, f"❌  ")
         return
     try:
         lot_id = int(message.text.strip())
@@ -1442,7 +1425,7 @@ def process_new_lot_id_step(message: types.Message):
 
 def api_settings_menu(call):
     if False:  # activation disabled
-        bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+        bot.edit_message_text(f"❌  ", 
                               call.message.chat.id, call.message.message_id)
         return
         
@@ -1497,7 +1480,7 @@ def api_settings_menu(call):
 
 def process_apiurl_change(message: types.Message, service_idx: int):
     if False:  # activation disabled
-        bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
+        bot.send_message(message.chat.id, f"❌  ")
         return
         
     new_url = message.text.strip()
@@ -1538,7 +1521,7 @@ def process_apiurl_change(message: types.Message, service_idx: int):
 
 def process_apikey_change(message: types.Message, service_idx: int):
     if False:  # activation disabled
-        bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
+        bot.send_message(message.chat.id, f"❌  ")
         return
         
     new_key = message.text.strip()
@@ -1582,7 +1565,7 @@ def process_apikey_change(message: types.Message, service_idx: int):
 
 def check_balance_func(call: types.CallbackQuery, service_idx: int):
     if False:  # activation disabled
-        bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+        bot.edit_message_text(f"❌  ", 
                               call.message.chat.id, call.message.message_id)
         return
         
@@ -1638,12 +1621,6 @@ def check_balance_func(call: types.CallbackQuery, service_idx: int):
 def init_commands(c_: Cardinal):
     global bot, config, lot_mapping, cardinal_instance
     logger.info("=== init_commands() from auto_smm (2 services) ===")
-
-    if IS_ACTIVATED:
-        logger.info("Плагин активирован.")
-    else:
-        logger.warning(f"Плагин не активирован. ")
-
     cardinal_instance = c_
     bot = c_.telegram.bot
     
@@ -1654,7 +1631,7 @@ def init_commands(c_: Cardinal):
     @bot.message_handler(content_types=['document'])
     def handle_document_upload(message: types.Message):
         if False:  # activation disabled
-            bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
+            bot.send_message(message.chat.id, f"❌  ")
             return
         user_id = message.from_user.id
         logger.info(f"Получен документ от {user_id}. Проверка ожидания...")
@@ -1693,13 +1670,12 @@ def init_commands(c_: Cardinal):
         ("start_smm", "Включить автопродажу", True),
         ("stop_smm", "Выключить автопродажу", True),
         ("auto_smm_settings", "Настройки автопродажи", True),
-        ("auto_smm_delete", "Удалить файлы заказов", True)
-    ])
+            ])
 
     @bot.callback_query_handler(func=lambda call: call.data == "manage_websites")
     def manage_websites(call: types.CallbackQuery):
         if False:  # activation disabled
-            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+            bot.edit_message_text(f"❌  ", 
                                   call.message.chat.id, call.message.message_id)
             return
         valid_links = load_valid_links()
@@ -1721,7 +1697,7 @@ def init_commands(c_: Cardinal):
     @bot.callback_query_handler(func=lambda call: call.data == "add_website")
     def add_website_prompt(call: types.CallbackQuery):
         if False:  # activation disabled
-            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+            bot.edit_message_text(f"❌  ", 
                                   call.message.chat.id, call.message.message_id)
             return
         msg_ = bot.edit_message_text("Введите ссылку для добавления (например, example.com):", call.message.chat.id, call.message.message_id)
@@ -1729,7 +1705,7 @@ def init_commands(c_: Cardinal):
 
     def process_add_website(message: types.Message):
         if False:  # activation disabled
-            bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
+            bot.send_message(message.chat.id, f"❌  ")
             return
         new_site = message.text.strip()
         add_website(message, new_site)
@@ -1740,7 +1716,7 @@ def init_commands(c_: Cardinal):
     @bot.callback_query_handler(func=lambda call: call.data.startswith("delete_website_"))
     def remove_website_prompt(call: types.CallbackQuery):
         if False:  # activation disabled
-            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+            bot.edit_message_text(f"❌  ", 
                                   call.message.chat.id, call.message.message_id)
             return
         site_to_remove = call.data.split("_", 2)[2]
@@ -1756,7 +1732,7 @@ def init_commands(c_: Cardinal):
     @bot.callback_query_handler(func=lambda call: call.data == "delete_all_lots")
     def delete_all_lots_prompt(call: types.CallbackQuery):
         if False:  # activation disabled
-            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+            bot.edit_message_text(f"❌  ", 
                                   call.message.chat.id, call.message.message_id)
             return
         kb = InlineKeyboardMarkup()
@@ -1769,7 +1745,7 @@ def init_commands(c_: Cardinal):
     @bot.callback_query_handler(func=lambda call: call.data == "confirm_delete_all_lots")
     def confirm_delete_all_lots(call: types.CallbackQuery):
         if False:  # activation disabled
-            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+            bot.edit_message_text(f"❌  ", 
                                   call.message.chat.id, call.message.message_id)
             return
         delete_all_lots_func(call)
@@ -1780,7 +1756,7 @@ def init_commands(c_: Cardinal):
     @bot.callback_query_handler(func=lambda call: call.data == "lot_settings")
     def lot_settings(call: types.CallbackQuery):
         if False:  # activation disabled
-            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+            bot.edit_message_text(f"❌  ", 
                                   call.message.chat.id, call.message.message_id)
             return
         kb = InlineKeyboardMarkup(row_width=1)
@@ -1792,7 +1768,7 @@ def init_commands(c_: Cardinal):
     @bot.callback_query_handler(func=lambda call: call.data == "show_lots_list")
     def show_lots_list(call: types.CallbackQuery):
         if False:  # activation disabled
-            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+            bot.edit_message_text(f"❌  ", 
                                   call.message.chat.id, call.message.message_id)
             return
         bot.edit_message_text("Выберите лот:", call.message.chat.id, call.message.message_id, reply_markup=generate_lots_keyboard(0))
@@ -1800,7 +1776,7 @@ def init_commands(c_: Cardinal):
     @bot.callback_query_handler(func=lambda call: call.data == "search_lot")
     def search_lot_prompt(call: types.CallbackQuery):
         if False:  # activation disabled
-            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+            bot.edit_message_text(f"❌  ", 
                                   call.message.chat.id, call.message.message_id)
             return
         kb = InlineKeyboardMarkup()
@@ -1811,7 +1787,7 @@ def init_commands(c_: Cardinal):
 
     def process_lot_search(message: types.Message):
         if False:  # activation disabled
-            bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
+            bot.send_message(message.chat.id, f"❌  ")
             return
         search_term = message.text.strip().lower()
         if not search_term:
@@ -1853,7 +1829,7 @@ def init_commands(c_: Cardinal):
     @bot.callback_query_handler(func=lambda call: call.data.startswith("edit_lot_"))
     def edit_lot_callback(call: types.CallbackQuery):
         if False:  # activation disabled
-            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+            bot.edit_message_text(f"❌  ", 
                                   call.message.chat.id, call.message.message_id)
             return
         lot_key = call.data.split("_", 2)[2]
@@ -1862,7 +1838,7 @@ def init_commands(c_: Cardinal):
     @bot.callback_query_handler(func=lambda call: call.data.startswith("prev_page_") or call.data.startswith("next_page_"))
     def page_navigation(call: types.CallbackQuery):
         if False:  # activation disabled
-            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+            bot.edit_message_text(f"❌  ", 
                                   call.message.chat.id, call.message.message_id)
             return
         try:
@@ -1874,7 +1850,7 @@ def init_commands(c_: Cardinal):
     @bot.callback_query_handler(func=lambda call: call.data == "show_orders")
     def show_orders(call: types.CallbackQuery):
         if False:  # activation disabled
-            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+            bot.edit_message_text(f"❌  ", 
                                   call.message.chat.id, call.message.message_id)
             return
         stats = get_statistics()
@@ -1906,7 +1882,7 @@ def init_commands(c_: Cardinal):
     @bot.callback_query_handler(func=lambda call: call.data == "upload_lots_json")
     def upload_lots_json(call: types.CallbackQuery):
         if False:  # activation disabled
-            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+            bot.edit_message_text(f"❌  ", 
                                   call.message.chat.id, call.message.message_id)
             return
         user_id = call.from_user.id
@@ -1917,7 +1893,7 @@ def init_commands(c_: Cardinal):
     @bot.callback_query_handler(func=lambda call: call.data == "export_files")
     def export_files(call: types.CallbackQuery):
         if False:  # activation disabled
-            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+            bot.edit_message_text(f"❌  ", 
                                   call.message.chat.id, call.message.message_id)
             return
         chat_id_ = call.message.chat.id
@@ -1935,7 +1911,7 @@ def init_commands(c_: Cardinal):
     @bot.callback_query_handler(func=lambda call: call.data == "export_errors")
     def export_errors(call: types.CallbackQuery):
         if False:  # activation disabled
-            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+            bot.edit_message_text(f"❌  ", 
                                   call.message.chat.id, call.message.message_id)
             return
         chat_id_ = call.message.chat.id
@@ -1950,22 +1926,55 @@ def init_commands(c_: Cardinal):
             bot.edit_message_text("Лог-файл не найден.", chat_id_, call.message.message_id)
 
     @bot.callback_query_handler(func=lambda call: call.data == "delete_orders")
-    def delete_orders(call: types.CallbackQuery):
-        if False:  # activation disabled
-            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
-                                  call.message.chat.id, call.message.message_id)
-            return
-        if os.path.exists(ORDERS_PATH):
-            os.remove(ORDERS_PATH)
-        if os.path.exists(ORDERS_DATA_PATH):
-            os.remove(ORDERS_DATA_PATH)
-        bot.edit_message_text("Файлы заказов удалены.", call.message.chat.id, call.message.message_id)
-        files_menu(call)
+    def confirm_delete_orders(call: types.CallbackQuery):
+        """Просит подтверждение перед удалением истории заказов."""
+        kb2 = InlineKeyboardMarkup(row_width=2)
+        kb2.row(
+            InlineKeyboardButton("✅ Да, удалить", callback_data="delete_orders_yes"),
+            InlineKeyboardButton("❌ Отмена", callback_data="files_menu")
+        )
+        bot.edit_message_text(
+            "⚠️ <b>Вы действительно хотите удалить ВСЮ историю заказов?</b>\n\n"
+            "Это действие необратимо.",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="HTML",
+            reply_markup=kb2
+        )
+
+    @bot.callback_query_handler(func=lambda call: call.data == "delete_orders_yes")
+    def delete_orders_yes(call: types.CallbackQuery):
+        """Удаляет файлы истории заказов после подтверждения."""
+        try:
+            delete_orders_file()
+            bot.answer_callback_query(call.id, "✅ История заказов удалена.")
+        except Exception as e:
+            bot.answer_callback_query(call.id, "❌ Ошибка удаления.")
+            try:
+                send_debug(f"delete_orders_yes error: {e}")
+            except Exception:
+                pass
+
+        # Возвращаемся в меню файлов
+        try:
+            # переиспользуем существующий обработчик меню файлов
+            files_menu_callback(call)
+        except Exception:
+            # фолбэк: просто скажем, что ок
+            try:
+                bot.edit_message_text(
+                    "✅ Готово.",
+                    call.message.chat.id,
+                    call.message.message_id,
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
 
     @bot.callback_query_handler(func=lambda call: call.data == "toggle_auto_refunds")
     def toggle_auto_refunds(call: types.CallbackQuery):
         if False:  # activation disabled
-            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+            bot.edit_message_text(f"❌  ", 
                                   call.message.chat.id, call.message.message_id)
             return
         cfg = load_config()
@@ -1978,7 +1987,7 @@ def init_commands(c_: Cardinal):
     @bot.callback_query_handler(func=lambda call: call.data == "toggle_confirm_link")
     def toggle_confirm_link(call: types.CallbackQuery):
         if False:  # activation disabled
-            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+            bot.edit_message_text(f"❌  ", 
                                   call.message.chat.id, call.message.message_id)
             return
         cfg = load_config()
@@ -1991,7 +2000,7 @@ def init_commands(c_: Cardinal):
     @bot.callback_query_handler(func=lambda call: call.data == "toggle_send_auto_lots")
     def toggle_send_auto_lots(call: types.CallbackQuery):
         if False:  # activation disabled
-            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+            bot.edit_message_text(f"❌  ", 
                               call.message.chat.id, call.message.message_id)
             return
         cfg = load_config()
@@ -2004,7 +2013,7 @@ def init_commands(c_: Cardinal):
     @bot.callback_query_handler(func=lambda call: call.data == "toggle_auto_start")
     def toggle_auto_start(call: types.CallbackQuery):
         if False:  # activation disabled
-            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+            bot.edit_message_text(f"❌  ", 
                               call.message.chat.id, call.message.message_id)
             return
         cfg = load_config()
@@ -2017,7 +2026,7 @@ def init_commands(c_: Cardinal):
     @bot.callback_query_handler(func=lambda call: call.data == "change_send_interval")
     def change_send_interval(call: types.CallbackQuery):
         if False:  # activation disabled
-            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+            bot.edit_message_text(f"❌  ", 
                                 call.message.chat.id, call.message.message_id)
             return
         cfg = load_config()
@@ -2033,7 +2042,7 @@ def init_commands(c_: Cardinal):
     @bot.callback_query_handler(func=lambda call: call.data == "cancel_interval_change")
     def cancel_interval_change(call: types.CallbackQuery):
         if False:  # activation disabled
-            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+            bot.edit_message_text(f"❌  ", 
                                 call.message.chat.id, call.message.message_id)
             return
         bot.clear_step_handler_by_chat_id(call.message.chat.id)
@@ -2041,7 +2050,7 @@ def init_commands(c_: Cardinal):
     
     def process_send_interval_change(message: types.Message):
         if False:  # activation disabled
-            bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
+            bot.send_message(message.chat.id, f"❌  ")
             return
         try:
             new_interval = int(message.text.strip())
@@ -2066,7 +2075,7 @@ def init_commands(c_: Cardinal):
     def return_to_settings(call: types.CallbackQuery):
         if False:  # activation disabled
             bot.edit_message_text(
-                f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.",
+                f"❌  ",
                 call.message.chat.id,
                 call.message.message_id,
             )
@@ -2081,8 +2090,7 @@ def init_commands(c_: Cardinal):
         send_auto_lots_interval = cfg.get("send_auto_lots_interval", 30)
         auto_start = cfg.get("auto_start", False)
 
-        status_text = "✅ АКТИВИРОВАН" if IS_ACTIVATED else f"❌ НЕ АКТИВИРОВАН "
-
+        status_text = "🟢 ВКЛ" if RUNNING else "🔴 ВЫКЛ"
         stats = get_statistics()
         day_profit = stats.get("day_chistota", 0) if stats else 0
         try:
@@ -2095,7 +2103,7 @@ def init_commands(c_: Cardinal):
 
 ━━━━━━━━━━━━━━━━━━━━━
 
-📊 <b>Статус:</b> АКТИВИРОВАН ✅
+📊 <b>Статус:</b> {status_text}
 
 📦 <b>Лоты:</b> <code>{len(lmap)}</code>
 
@@ -2137,7 +2145,7 @@ def init_commands(c_: Cardinal):
     @bot.callback_query_handler(func=lambda call: call.data == "return_to_lots")
     def return_to_lots(call: types.CallbackQuery):
         if False:  # activation disabled
-            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+            bot.edit_message_text(f"❌  ", 
                                   call.message.chat.id, call.message.message_id)
             return
         bot.edit_message_text("Выберите лот:", call.message.chat.id, call.message.message_id, reply_markup=generate_lots_keyboard(0))
@@ -2145,7 +2153,7 @@ def init_commands(c_: Cardinal):
     @bot.callback_query_handler(func=lambda call: call.data.startswith("change_name_"))
     def change_name(call: types.CallbackQuery):
         if False:  # activation disabled
-            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+            bot.edit_message_text(f"❌  ", 
                                   call.message.chat.id, call.message.message_id)
             return
         lot_key = call.data.split("_", 2)[2]
@@ -2155,7 +2163,7 @@ def init_commands(c_: Cardinal):
     @bot.callback_query_handler(func=lambda call: call.data.startswith("change_id_"))
     def change_id(call: types.CallbackQuery):
         if False:  # activation disabled
-            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+            bot.edit_message_text(f"❌  ", 
                                   call.message.chat.id, call.message.message_id)
             return
         lot_key = call.data.split("_", 2)[2]
@@ -2165,7 +2173,7 @@ def init_commands(c_: Cardinal):
     @bot.callback_query_handler(func=lambda call: call.data.startswith("change_quantity_"))
     def change_quantity(call: types.CallbackQuery):
         if False:  # activation disabled
-            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+            bot.edit_message_text(f"❌  ", 
                                   call.message.chat.id, call.message.message_id)
             return
         lot_key = call.data.split("_", 2)[2]
@@ -2175,7 +2183,7 @@ def init_commands(c_: Cardinal):
     @bot.callback_query_handler(func=lambda call: call.data.startswith("change_snum_"))
     def change_snum(call: types.CallbackQuery):
         if False:  # activation disabled
-            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+            bot.edit_message_text(f"❌  ", 
                                   call.message.chat.id, call.message.message_id)
             return
         lot_key = call.data.split("_", 2)[2]
@@ -2185,7 +2193,7 @@ def init_commands(c_: Cardinal):
     @bot.callback_query_handler(func=lambda call: call.data.startswith("delete_one_lot_"))
     def delete_one_lot_callback(call: types.CallbackQuery):
         if False:  # activation disabled
-            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+            bot.edit_message_text(f"❌  ", 
                                   call.message.chat.id, call.message.message_id)
             return
         lot_key = call.data.split("_", 3)[3]
@@ -2198,7 +2206,7 @@ def init_commands(c_: Cardinal):
     @bot.callback_query_handler(func=lambda call: call.data.startswith("edit_apiurl_"))
     def edit_apiurl(call: types.CallbackQuery):
         if False:  # activation disabled
-            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+            bot.edit_message_text(f"❌  ", 
                                   call.message.chat.id, call.message.message_id)
             return
         idx_ = int(call.data.split("_")[-1])
@@ -2208,7 +2216,7 @@ def init_commands(c_: Cardinal):
     @bot.callback_query_handler(func=lambda call: call.data.startswith("edit_apikey_"))
     def edit_apikey(call: types.CallbackQuery):
         if False:  # activation disabled
-            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+            bot.edit_message_text(f"❌  ", 
                                   call.message.chat.id, call.message.message_id)
             return
         idx_ = int(call.data.split("_")[-1])
@@ -2218,7 +2226,7 @@ def init_commands(c_: Cardinal):
     @bot.callback_query_handler(func=lambda call: call.data.startswith("check_balance_"))
     def check_balance(call: types.CallbackQuery):
         if False:  # activation disabled
-            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+            bot.edit_message_text(f"❌  ", 
                                   call.message.chat.id, call.message.message_id)
             return
         idx_ = int(call.data.split("_")[-1])
@@ -2227,7 +2235,7 @@ def init_commands(c_: Cardinal):
     @bot.callback_query_handler(func=lambda call: call.data == "add_new_lot")
     def add_new_lot(call: types.CallbackQuery):
         if False:  # activation disabled
-            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+            bot.edit_message_text(f"❌  ", 
                                   call.message.chat.id, call.message.message_id)
             return
         bot.delete_message(call.message.chat.id, call.message.message_id)
@@ -2237,7 +2245,7 @@ def init_commands(c_: Cardinal):
     @bot.callback_query_handler(func=lambda call: call.data == "update_lot_ids")
     def update_lot_ids(call: types.CallbackQuery):
         if False:  # activation disabled
-            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+            bot.edit_message_text(f"❌  ", 
                                   call.message.chat.id, call.message.message_id)
             return
         cfg = load_config()
@@ -2248,7 +2256,7 @@ def init_commands(c_: Cardinal):
     @bot.callback_query_handler(func=lambda call: call.data == "edit_messages")
     def edit_messages_menu(call: types.CallbackQuery):
         if False:  # activation disabled
-            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+            bot.edit_message_text(f"❌  ", 
                                   call.message.chat.id, call.message.message_id)
             return
         cfg = load_config()
@@ -2283,7 +2291,7 @@ def init_commands(c_: Cardinal):
     @bot.callback_query_handler(func=lambda call: call.data == "edit_msg_payment")
     def edit_msg_payment(call: types.CallbackQuery):
         if False:  # activation disabled
-            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+            bot.edit_message_text(f"❌  ", 
                                   call.message.chat.id, call.message.message_id)
             return
         msg_ = bot.edit_message_text("Введите новый текст после оплаты:", call.message.chat.id, call.message.message_id)
@@ -2292,7 +2300,7 @@ def init_commands(c_: Cardinal):
     @bot.callback_query_handler(func=lambda call: call.data == "edit_msg_confirmation")
     def edit_msg_confirmation(call: types.CallbackQuery):
         if False:  # activation disabled
-            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+            bot.edit_message_text(f"❌  ", 
                                   call.message.chat.id, call.message.message_id)
             return
         msg_ = bot.edit_message_text("Введите новый текст после подтверждения:", call.message.chat.id, call.message.message_id)
@@ -2300,7 +2308,7 @@ def init_commands(c_: Cardinal):
 
     def process_message_payment_change(message: types.Message):
         if False:  # activation disabled
-            bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
+            bot.send_message(message.chat.id, f"❌  ")
             return
         new_text = message.text.strip()
         cfg = load_config()
@@ -2312,7 +2320,7 @@ def init_commands(c_: Cardinal):
 
     def process_message_confirmation_change(message: types.Message):
         if False:  # activation disabled
-            bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
+            bot.send_message(message.chat.id, f"❌  ")
             return
         new_text = message.text.strip()
         cfg = load_config()
@@ -2325,7 +2333,7 @@ def init_commands(c_: Cardinal):
     @bot.callback_query_handler(func=lambda call: call.data == "add_service")
     def add_service(call: types.CallbackQuery):
         if False:  # activation disabled
-            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+            bot.edit_message_text(f"❌  ", 
                                   call.message.chat.id, call.message.message_id)
             return
         msg_ = bot.edit_message_text("Введите номер нового сервиса (число):", call.message.chat.id, call.message.message_id)
@@ -2334,7 +2342,7 @@ def init_commands(c_: Cardinal):
     @bot.callback_query_handler(func=lambda call: call.data == "delete_service")
     def delete_service(call: types.CallbackQuery):
         if False:  # activation disabled
-            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+            bot.edit_message_text(f"❌  ", 
                                   call.message.chat.id, call.message.message_id)
             return
         msg_ = bot.edit_message_text("Введите номер сервиса для удаления:", call.message.chat.id, call.message.message_id)
@@ -2342,7 +2350,7 @@ def init_commands(c_: Cardinal):
 
     def process_add_service(message: types.Message):
         if False:  # activation disabled
-            bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
+            bot.send_message(message.chat.id, f"❌  ")
             return
         try:
             srv_num = int(message.text.strip())
@@ -2368,7 +2376,7 @@ def init_commands(c_: Cardinal):
 
     def process_delete_service(message: types.Message):
         if False:  # activation disabled
-            bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
+            bot.send_message(message.chat.id, f"❌  ")
             return
         try:
             srv_num = int(message.text.strip())
@@ -2390,7 +2398,7 @@ def init_commands(c_: Cardinal):
     @bot.callback_query_handler(func=lambda call: call.data == "set_notification_chat_id")
     def set_notification_chat_id(call: types.CallbackQuery):
         if False:  # activation disabled
-            bot.edit_message_text(f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.", 
+            bot.edit_message_text(f"❌  ", 
                                   call.message.chat.id, call.message.message_id)
             return
         msg_ = bot.edit_message_text(f"Введите Chat ID для уведомлений (например, -1001234567890 для группы или ваш ID, ваш id: {call.message.chat.id}):", 
@@ -2399,7 +2407,7 @@ def init_commands(c_: Cardinal):
 
     def process_notification_chat_id(message: types.Message):
         if False:  # activation disabled
-            bot.send_message(message.chat.id, f"❌ Плагин не активирован. Обратитесь @w1bbex для активации.")
+            bot.send_message(message.chat.id, f"❌  ")
             return
         try:
             new_chat_id = int(message.text.strip())
@@ -2435,7 +2443,7 @@ BIND_TO_NEW_ORDER = [auto_smm_handler]
 BIND_TO_DELETE = None
 
 def start_order_checking_if_needed(c: Cardinal):
-    if RUNNING and IS_ACTIVATED:  
+    if RUNNING:  
         start_order_checking(c)
 
 def send_order_started_notification(c: Cardinal, order_id_funpay: str, twiboost_id: int, link: str, api_url: str, api_key: str, lot_price: float, real_amount: int):
@@ -2458,6 +2466,12 @@ def send_order_started_notification(c: Cardinal, order_id_funpay: str, twiboost_
         currency = status_data.get("currency", "USD")
         
         net_profit = round(lot_price - charge, 2)
+
+        # Сохраняем фактические траты/прибыль в файлы статистики
+        try:
+            update_order_charge_and_net(order_id, charge, net_profit)
+        except Exception:
+            pass
 
         
         order_data = c.account.get_order(order_id_funpay)
@@ -2633,7 +2647,7 @@ def auto_start_plugin(c: Cardinal):
     Автоматический запуск плагина на основе настройки auto_start
     """
     if False:  # activation disabled
-        logger.warning(f"Плагин не активирован, автозапуск невозможен. ")
+        logger.warning(f", автозапуск невозможен. ")
         return False
         
     cfg = load_config()
