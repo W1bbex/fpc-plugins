@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import TYPE_CHECKING, Dict, List, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 if TYPE_CHECKING:
     from cardinal import Cardinal
 
@@ -24,8 +24,11 @@ from FunPayAPI import enums
 from telebot import types
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
+import _autosmm_orders as orders
+import _autosmm_analytics as analytics
+
 NAME = "AutoSMM"
-VERSION = "0.0.4"
+VERSION = "0.0.5.22"
 DESCRIPTION = "Плагин для автоматической накрутки через 2+ сервис"
 CREDITS = "@w1bbex"
 UUID = "c800e7e9-05ce-43eb-addc-4f5841f79726"
@@ -88,6 +91,7 @@ def remove_website(message: types.Message, site_to_remove: str):
 LOG_DIR = os.path.join("storage", "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 LOG_PATH = os.path.join(LOG_DIR, "auto_smm.log")
+EXPECTED_API_KEY_LENGTH = 60
 
 logger = logging.getLogger("FPC.autosmm")
 logger.setLevel(logging.INFO)
@@ -159,6 +163,8 @@ def load_config() -> Dict:
                         }
                     if "auto_refunds" not in cfg:
                         cfg["auto_refunds"] = False
+                    if "fallback_enabled" not in cfg:
+                        cfg["fallback_enabled"] = False
                     if "confirm_link" not in cfg:
                         cfg["confirm_link"] = True
                     if "messages" not in cfg:
@@ -208,6 +214,7 @@ def create_default_config() -> Dict:
             }
         },
         "auto_refunds": False,
+        "fallback_enabled": False,
         "confirm_link": True,
         "messages": {
             "after_payment": """👾 Благодарю за оплату!
@@ -246,93 +253,6 @@ def reindex_lots(cfg: Dict):
     cfg["lot_mapping"] = new_lot_map
     save_config(cfg)
     logger.info("Лоты были переиндексированы после удаления.")
-
-def load_orders_data() -> List[Dict]:
-    if not os.path.exists(ORDERS_DATA_PATH):
-        return []
-    try:
-        with open(ORDERS_DATA_PATH, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except json.JSONDecodeError as e:
-        logger.error(f"Ошибка при чтении orders_data.json: {e}")
-        backup_path = f"{ORDERS_DATA_PATH}.bak.{int(time.time())}"
-        try:
-            shutil.copy2(ORDERS_DATA_PATH, backup_path)
-            logger.info(f"Создана резервная копия поврежденного orders_data.json: {backup_path}")
-        except Exception as ex:
-            logger.error(f"Не удалось создать резервную копию orders_data.json: {ex}")
-        
-        try:
-            with open(ORDERS_DATA_PATH, 'r', encoding='utf-8') as f:
-                content = f.read()
-            last_bracket_pos = content.rstrip().rfind(']')
-            if last_bracket_pos > 0:
-                valid_content = content[:last_bracket_pos+1]
-                json.loads(valid_content)
-                with open(ORDERS_DATA_PATH, 'w', encoding='utf-8') as f:
-                    f.write(valid_content)
-                logger.info("Файл orders_data.json успешно восстановлен")
-                return json.loads(valid_content)
-        except Exception as ex:
-            logger.error(f"Не удалось восстановить orders_data.json: {ex}")
-        
-        return []
-
-def save_orders_data(orders: List[Dict]):
-    temp_path = f"{ORDERS_DATA_PATH}.tmp"
-    try:
-        with open(temp_path, 'w', encoding='utf-8') as f:
-            json.dump(orders, f, indent=4, ensure_ascii=False)
-        
-        if os.path.exists(temp_path):
-            if os.path.exists(ORDERS_DATA_PATH):
-                os.remove(ORDERS_DATA_PATH)
-            os.rename(temp_path, ORDERS_DATA_PATH)
-        else:
-            logger.error("Не удалось создать временный файл для безопасного сохранения orders_data.json")
-    except Exception as e:
-        logger.error(f"Ошибка при сохранении orders_data.json: {e}")
-        if os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except:
-                pass
-
-def save_order_data(
-    chat_id: int,
-    order_id: str,
-    twiboost_id: int,
-    status: str,
-    chistota: float,
-    customer_url: str,
-    quantity: int,
-    service_number: int,
-    is_refunded: bool = False
-):
-    data_ = {
-        "chat_id": chat_id,
-        "order_id": order_id,
-        "id_zakaz": twiboost_id,
-        "status": status,
-        "chistota": 0.0,  # will be updated after charge is known
-        
-        "customer_url": customer_url,
-        "quantity": quantity,
-        "service_number": service_number,
-        "is_refunded": is_refunded,
-        "spent": 0.0,
-        "summa": float(chistota),  # FunPay amount at creation time
-        
-        "currency": "RUB"
-    }
-    
-    orders = load_orders_data()
-    
-    orders.append(data_)
-    
-    save_orders_data(orders)
-    
-    logger.info(f"Данные заказа #{order_id} (twiboost ID: {twiboost_id}) сохранены.")
 
 def save_order_info(order_id: int, order_summa: float, service_name: str, order_chistota: float):
     file_lock = threading.Lock()
@@ -386,38 +306,6 @@ def save_order_info(order_id: int, order_summa: float, service_name: str, order_
     except Exception as e:
         logger.error(f"Общая ошибка при сохранении информации о заказе #{order_id}: {e}")
 
-def update_order_status(order_id_funpay: str, new_status: str):
-    orders = load_orders_data()
-    updated = False
-
-    for order in orders:
-        if str(order["order_id"]) == str(order_id_funpay):
-            order["status"] = new_status
-            updated = True
-            logger.info(f"Статус заказа #{order_id_funpay} обновлён на '{new_status}'.")
-            break
-
-    if updated:
-        save_orders_data(orders)
-    else:
-        logger.warning(f"Заказ #{order_id_funpay} не найден в orders_data.json.")
-
-def update_order_refunded_status(order_id_funpay: str):
-    orders = load_orders_data()
-    updated = False
-    for order in orders:
-        if str(order["order_id"]) == str(order_id_funpay):
-            if not order.get("is_refunded", False):
-                order["is_refunded"] = True
-                updated = True
-                logger.info(f"Статус заказа #{order_id_funpay} обновлён на 'is_refunded': True.")
-            break
-
-    if updated:
-        save_orders_data(orders)
-    else:
-        logger.warning(f"Заказ #{order_id_funpay} не найден или уже отмечен как 'is_refunded'.")
-
 def refund_order(c: Cardinal, order_id_funpay: str, buyer_chat_id: int, reason: str, detailed_reason: str = None):
     """
     Обработка возврата средств с уведомлением клиента и получателя уведомлений.
@@ -429,8 +317,8 @@ def refund_order(c: Cardinal, order_id_funpay: str, buyer_chat_id: int, reason: 
     if detailed_reason is None:
         detailed_reason = reason
 
-    orders = load_orders_data()
-    order_data = next((o for o in orders if str(o["order_id"]) == str(order_id_funpay)), None)
+    orders_data = orders.load_orders_data()
+    order_data = next((o for o in orders_data if str(o["order_id"]) == str(order_id_funpay)), None)
     
     if order_data and order_data.get("is_refunded", False):
         logger.info(f"Заказ #{order_id_funpay} уже был возвращен. Пропуск.")
@@ -477,44 +365,6 @@ def refund_order(c: Cardinal, order_id_funpay: str, buyer_chat_id: int, reason: 
             logger.warning("Notification chat_id не задан для уведомления о возврате.")
 
 
-def update_order_charge_and_net(order_id_funpay: str, spent: float, currency: str = "USD", net_profit: float = None):
-    orders_data = load_orders_data()
-    found_od = False
-    for order in orders_data:
-        if str(order["order_id"]) == str(order_id_funpay):
-            order["spent"] = spent
-            order["currency"] = currency
-            if net_profit is not None:
-                order["chistota"] = net_profit
-            else:
-                net = order["summa"] - spent
-                order["chistota"] = round(net, 2)
-            found_od = True
-            break
-
-    if found_od:
-        save_orders_data(orders_data)
-
-    if os.path.exists(ORDERS_PATH):
-        with open(ORDERS_PATH, 'r', encoding='utf-8') as f:
-            orders_list = json.load(f)
-        updated_a = False
-        for o in orders_list:
-            if str(o["order_id"]) == str(order_id_funpay):
-                o["spent"] = spent
-                o["currency"] = currency
-                if net_profit is not None:
-                    o["chistota"] = net_profit
-                else:
-                    net = o["summa"] - spent
-                    o["chistota"] = round(net, 2)
-                updated_a = True
-                break
-
-        if updated_a:
-            with open(ORDERS_PATH, 'w', encoding='utf-8') as f:
-                json.dump(orders_list, f, indent=4, ensure_ascii=False)
-
 def check_order_status(
     c: Cardinal,
     twiboost_order_id: int,
@@ -553,12 +403,12 @@ def check_order_status(
         return
     
     try:
-        orders = load_orders_data()
+        orders_data = orders.load_orders_data()
     except Exception as e:
         logger.error(f"Ошибка при загрузке данных о заказах: {e}")
-        orders = []
+        orders_data = []
     
-    order_data = next((o for o in orders if str(o["order_id"]) == str(order_id_funpay)), None)
+    order_data = next((o for o in orders_data if str(o["order_id"]) == str(order_id_funpay)), None)
     if not order_data:
         logger.warning(f"Заказ {order_id_funpay} не найден при check_order_status.")
         order_data = {"service_number": 1}
@@ -578,6 +428,20 @@ def check_order_status(
 
     api_url = service_cfg["api_url"]
     api_key = service_cfg["api_key"]
+
+    invalid_key_payload = _validate_api_key_for_action(service_number, "status", api_key)
+    if invalid_key_payload:
+        delay = min(300 * (2 ** (attempt - 1)), 3600)
+        logger.warning(
+            f"{LOGGER_PREFIX} Пропускаю action=status для заказа #{twiboost_order_id}: {invalid_key_payload['detail']}"
+        )
+        logger.info(f"Повторная проверка заказа #{twiboost_order_id} через {delay} сек.")
+        threading.Timer(
+            delay,
+            check_order_status,
+            args=(c, twiboost_order_id, buyer_chat_id, link, order_id_funpay, attempt + 1)
+        ).start()
+        return
 
     url_ = f"{api_url}?action=status&order={twiboost_order_id}&key={api_key}"
     logger.info(f"{LOGGER_PREFIX} Проверка статуса заказа #{twiboost_order_id}, попытка {attempt}...")
@@ -610,7 +474,7 @@ def check_order_status(
             if status_lower in completed_statuses or (remains_ is not None and remains_ == 0):
                 try:
                     order_data["failed_status_checks"] = 0
-                    save_orders_data(orders)
+                    orders.save_orders_data(orders_data)
                 except Exception:
                     pass
                 if order_info:
@@ -643,7 +507,7 @@ def check_order_status(
 
                 order_data["failed_status_checks"] = fail_cnt
                 try:
-                    save_orders_data(orders)
+                    orders.save_orders_data(orders_data)
                 except Exception as _e:
                     logger.error(f"Не удалось сохранить счётчик failed_status_checks для заказа #{order_id_funpay}: {_e}")
 
@@ -670,7 +534,7 @@ def check_order_status(
             else:
                 try:
                     order_data["failed_status_checks"] = 0
-                    save_orders_data(orders)
+                    orders.save_orders_data(orders_data)
                 except Exception:
                     pass
                 logger.info(f"Заказ #{twiboost_order_id} в статусе '{status_}' (осталось: {remains_}).")
@@ -702,7 +566,7 @@ def check_order_status(
 def start_order_checking(c: Cardinal):
     if RUNNING:  
         try:
-            all_data = load_orders_data()
+            all_data = orders.load_orders_data()
         except Exception as e:
             logger.error(f"Ошибка при загрузке данных о заказах в start_order_checking: {e}")
             all_data = []
@@ -789,7 +653,7 @@ def auto_smm_handler(c: Cardinal, e, *args):
         m_check = re.match(r'^чек\s+(\d+)$', msg_text.lower())
         if m_check:
             order_num = m_check.group(1)
-            od_ = load_orders_data()
+            od_ = orders.load_orders_data()
             found = next((o for o in od_ if str(o["id_zakaz"]) == order_num), None)
             if not found:
                 c.send_message(msg_chat_id, "❌ Заказ не найден в базе.")
@@ -801,6 +665,10 @@ def auto_smm_handler(c: Cardinal, e, *args):
                 return
             api_url = service_cfg["api_url"]
             api_key = service_cfg["api_key"]
+            invalid_key_payload = _validate_api_key_for_action(found["service_number"], "status", api_key)
+            if invalid_key_payload:
+                c.send_message(msg_chat_id, "❌ Невозможно выполнить проверку: API-ключ сервиса имеет некорректную длину.")
+                return
             url_ = f"{api_url}?action=status&order={order_num}&key={api_key}"
             try:
                 rr = requests.get(url_)
@@ -819,7 +687,7 @@ def auto_smm_handler(c: Cardinal, e, *args):
         if m_refill:
             order_num = m_refill.group(1)
             c.send_message(msg_chat_id, "Запрашиваю рефилл...")
-            od_ = load_orders_data()
+            od_ = orders.load_orders_data()
             found = next((o for o in od_ if str(o["id_zakaz"]) == order_num), None)
             if not found:
                 c.send_message(msg_chat_id, "❌ Заказ не найден в базе.")
@@ -989,45 +857,36 @@ def stop_smm(message: types.Message):
     bot.send_message(message.chat.id, "✅ Плагин остановлен.")
 
 
-def auto_smm_settings(message: types.Message):
-    if False:  # activation disabled
-        bot.send_message(message.chat.id, f"❌  ")
-        return
 
-    cfg = load_config()
+def build_main_menu_text_and_kb(cfg: Dict) -> Tuple[str, InlineKeyboardMarkup]:
+    """Собирает текст и клавиатуру главного меню настроек AutoSMM."""
     lmap = cfg.get("lot_mapping", {})
     auto_refunds = cfg.get("auto_refunds", True)
     confirm_link = cfg.get("confirm_link", True)
     notif_chat_id = cfg.get("notification_chat_id", "Не задан")
-    send_auto_lots = cfg.get("send_auto_lots", False)
-    send_auto_lots_interval = cfg.get("send_auto_lots_interval", 30)
     auto_start = cfg.get("auto_start", False)
+    status_text = "АКТИВИРОВАН ✅" if RUNNING else "ОСТАНОВЛЕН ❌"
 
-    status_text = "🟢 ВКЛ" if RUNNING else "🔴 ВЫКЛ"
-# --- PANEL (v0.0.3) ---
-    stats = get_statistics()
-    day_profit = stats.get('day_chistota', 0) if stats else 0
+    stats = analytics.get_statistics()
+    day_profit = stats.get("day_chistota", 0) if stats else 0
     try:
         day_profit_fmt = f"{float(day_profit):.2f}"
     except Exception:
         day_profit_fmt = str(day_profit)
 
-
-    txt_ = f"""
-🚀 AUTOSMM v{VERSION}
+    txt_ = f"""🚀 <b>AUTOSMM v{VERSION}</b>
 
 ━━━━━━━━━━━━━━━━━━━━━
 
-📊 Статус: АКТИВИРОВАН ✅
+<b>📊 Статус:</b> {status_text}
+<b>📦 Лоты:</b> {len(lmap)}
 
-📦 Лоты: {len(lmap)}
+<b>Автозапуск:</b> {'✅' if auto_start else '❌'}
+<b>Автовозвраты:</b> {'✅' if auto_refunds else '❌'}
+<b>Подтверждение ссылки:</b> {'✅' if confirm_link else '❌'}
 
-  • Автозапуск: {'✅' if auto_start else '❌'}
-  • Автовозвраты: {'✅' if auto_refunds else '❌'}
-  • Подтверждение ссылки: {'✅' if confirm_link else '❌'}
-
-💰 Профит за 24ч: {day_profit_fmt} ₽
-📩 Уведомления: {notif_chat_id}
+<b>💰 Профит за 24ч:</b> {day_profit_fmt} ₽
+<b>📩 Уведомления:</b> {notif_chat_id}
 
 ━━━━━━━━━━━━━━━━━━━━━
 """.strip()
@@ -1037,11 +896,11 @@ def auto_smm_settings(message: types.Message):
         InlineKeyboardButton("🛍️ Каталог лотов", callback_data="lot_settings"),
         InlineKeyboardButton("➕ Создать новый лот", callback_data="add_new_lot")
     )
-    
+
     kb.add(
         InlineKeyboardButton("🔌 Интеграция API", callback_data="api_settings"),
     )
-    
+
     kb.add(
         InlineKeyboardButton("🌐 Доверенные сайты", callback_data="manage_websites"),
         InlineKeyboardButton("💬 Шаблоны сообщений", callback_data="edit_messages")
@@ -1050,18 +909,58 @@ def auto_smm_settings(message: types.Message):
         InlineKeyboardButton("📊 Аналитика", callback_data="show_orders")
     )
 
-
-    
     kb.add(
         InlineKeyboardButton("📁 Бэкап / файлы", callback_data="files_menu"),
         InlineKeyboardButton("⚙️ Тонкая настройка", callback_data="misc_settings")
     )
-    
+
     kb.add(
         InlineKeyboardButton("📚 Полезные ресурсы", callback_data="links_menu")
     )
-    
-    bot.send_message(message.chat.id, txt_, parse_mode=None, reply_markup=kb)
+
+    return txt_, kb
+
+
+def auto_smm_settings(message: types.Message):
+    if False:  # activation disabled
+        bot.send_message(message.chat.id, f"❌  ")
+        return
+
+    cfg = load_config()
+    txt_, kb = build_main_menu_text_and_kb(cfg)
+    bot.send_message(message.chat.id, txt_, parse_mode="HTML", reply_markup=kb)
+
+
+
+
+def auto_smm_delete(message: types.Message):
+    """Удаляет файлы кеша AutoSMM (конфиг/заказы/валидные ссылки) и останавливает работу."""
+    global RUNNING
+    try:
+        RUNNING = False
+    except Exception:
+        pass
+
+    deleted = []
+    missing = []
+
+    for p in [CONFIG_PATH, ORDERS_PATH, ORDERS_DATA_PATH, VALID_LINKS_PATH]:
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+                deleted.append(p)
+            else:
+                missing.append(p)
+        except Exception as e:
+            logger.error(f"Не удалось удалить файл {p}: {e}")
+
+    txt = "🧹 AutoSMM: очистка выполнена.\n\n"
+    if deleted:
+        txt += "Удалено:\n" + "\n".join(f"• {x}" for x in deleted) + "\n\n"
+    if missing:
+        txt += "Не найдено:\n" + "\n".join(f"• {x}" for x in missing)
+
+    bot.send_message(message.chat.id, txt)
 
 def files_menu(call: types.CallbackQuery):
     if False:  # activation disabled
@@ -1103,6 +1002,7 @@ def misc_settings(call: types.CallbackQuery):
     send_auto_lots = cfg.get("send_auto_lots", False)
     send_auto_lots_interval = cfg.get("send_auto_lots_interval", 30)
     auto_start = cfg.get("auto_start", False)
+    fallback_enabled = cfg.get("fallback_enabled", False)
     
     txt_ = f"""
 <b>⚙️ Дополнительные настройки</b>
@@ -1115,6 +1015,7 @@ def misc_settings(call: types.CallbackQuery):
 • Отправка файла auto_lots.json: <code>{'Включена ✅' if send_auto_lots else 'Выключена ❌'}</code>
 • Интервал отправки (минуты): <code>{send_auto_lots_interval}</code>
 • Автозапуск плагина: <code>{'Включен ✅' if auto_start else 'Выключен ❌'}</code>
+• Fallback: <code>{'Включен ✅' if fallback_enabled else 'Выключен ❌'}</code>
     """.strip()
     
     kb_ = InlineKeyboardMarkup(row_width=1)
@@ -1133,6 +1034,10 @@ def misc_settings(call: types.CallbackQuery):
         InlineKeyboardButton(f"🚀 {'Выключить' if auto_start else 'Включить'} автозапуск плагина", callback_data="toggle_auto_start"),
         InlineKeyboardButton("🔄 Обновить номера лотов", callback_data="update_lot_ids")
     )
+
+    kb_.add(
+        InlineKeyboardButton(f"🔁 {'Выключить' if fallback_enabled else 'Включить'} fallback", callback_data="toggle_fallback")
+    )
     
     kb_.add(
         InlineKeyboardButton("🗑 Удалить все лоты", callback_data="delete_all_lots"),
@@ -1143,7 +1048,27 @@ def misc_settings(call: types.CallbackQuery):
         InlineKeyboardButton("🔙 Вернуться в настройки", callback_data="return_to_settings")
     )
     
-    bot.edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode=None, reply_markup=kb_)
+    bot.edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb_)
+
+def toggle_fallback(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.answer_callback_query(call.id)
+        return
+
+    bot.answer_callback_query(call.id)
+
+    cfg = load_config()
+    current = bool(cfg.get("fallback_enabled", False))
+    cfg["fallback_enabled"] = not current
+    save_config(cfg)
+
+    try:
+        config["fallback_enabled"] = cfg["fallback_enabled"]
+    except Exception:
+        pass
+
+    misc_settings(call)
+
 
 def links_menu(call: types.CallbackQuery):
 
@@ -1163,47 +1088,6 @@ def links_menu(call: types.CallbackQuery):
     bot.edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode=None, reply_markup=kb_)
 
 
-
-def get_statistics():
-    if not os.path.exists(ORDERS_PATH):
-        return None
-    with open(ORDERS_PATH, 'r', encoding='utf-8') as f:
-        orders = json.load(f)
-
-    now_ = datetime.now()
-    day_ago = now_ - timedelta(days=1)
-    week_ago = now_ - timedelta(days=7)
-    month_ago = now_ - timedelta(days=30)
-
-    day_orders = [o for o in orders if datetime.strptime(o["date"], "%Y-%m-%d %H:%M:%S") >= day_ago]
-    week_orders = [o for o in orders if datetime.strptime(o["date"], "%Y-%m-%d %H:%M:%S") >= week_ago]
-    month_orders = [o for o in orders if datetime.strptime(o["date"], "%Y-%m-%d %H:%M:%S") >= month_ago]
-    all_orders = orders
-
-    day_total = sum(o["summa"] for o in day_orders)
-    week_total = sum(o["summa"] for o in week_orders)
-    month_total = sum(o["summa"] for o in month_orders)
-    all_total = sum(o["summa"] for o in all_orders)
-
-    day_chistota = sum(o.get("chistota", o["summa"] - o.get("spent", 0)) for o in day_orders)
-    week_chistota = sum(o.get("chistota", o["summa"] - o.get("spent", 0)) for o in week_orders)
-    month_chistota = sum(o.get("chistota", o["summa"] - o.get("spent", 0)) for o in month_orders)
-    all_chistota = sum(o.get("chistota", o["summa"] - o.get("spent", 0)) for o in all_orders)
-
-    return {
-        "day_orders": len(day_orders),
-        "day_total": day_total,
-        "day_chistota": round(day_chistota, 2),
-        "week_orders": len(week_orders),
-        "week_total": week_total,
-        "week_chistota": round(week_chistota, 2),
-        "month_orders": len(month_orders),
-        "month_total": month_total,
-        "month_chistota": round(month_chistota, 2),
-        "all_time_orders": len(all_orders),
-        "all_time_total": all_total,
-        "all_time_chistota": round(all_chistota, 2),
-    }
 
 def generate_lots_keyboard(page: int = 0) -> InlineKeyboardMarkup:
     cfg = load_config()
@@ -1254,6 +1138,8 @@ def edit_lot(call: types.CallbackQuery, lot_key: str):
 ID услуги: <code>{ld_['service_id']}</code>
 Кол-во: <code>{ld_['quantity']}</code>
 S#: <code>{ld_.get('service_number', 1)}</code>
+Fallback S#: <code>{ld_.get('fallback_service_number')}</code>
+Fallback ID: <code>{ld_.get('fallback_service_id')}</code>
 """.strip()
 
     kb_ = InlineKeyboardMarkup(row_width=1)
@@ -1262,6 +1148,8 @@ S#: <code>{ld_.get('service_number', 1)}</code>
         InlineKeyboardButton("Изменить ID услуги", callback_data=f"change_id_{lot_key}"),
         InlineKeyboardButton("Изменить количество", callback_data=f"change_quantity_{lot_key}"),
         InlineKeyboardButton("Изменить сервис#", callback_data=f"change_snum_{lot_key}"),
+        InlineKeyboardButton("Изменить Fallback S#", callback_data=f"change_fallback_snum_{lot_key}"),
+        InlineKeyboardButton("Изменить Fallback ID", callback_data=f"change_fallback_id_{lot_key}"),
     )
     kb_.add(InlineKeyboardButton("❌ Удалить лот", callback_data=f"delete_one_lot_{lot_key}"))
     kb_.add(InlineKeyboardButton("◀️ К списку", callback_data="return_to_lots"))
@@ -1413,7 +1301,9 @@ def process_new_lot_id_step(message: types.Message):
         "name": name,
         "service_id": 1,
         "quantity": 1,
-        "service_number": 1
+        "service_number": 1,
+        "fallback_service_number": None,
+        "fallback_service_id": None
     }
 
     cfg["lot_mapping"] = lot_map
@@ -1422,6 +1312,61 @@ def process_new_lot_id_step(message: types.Message):
     kb_ = InlineKeyboardMarkup()
     kb_.add(InlineKeyboardButton("🔙 К настройкам", callback_data="return_to_settings"))
     bot.send_message(message.chat.id, f"✅ Добавлен новый лот {new_lot_key} с названием: {name}", reply_markup=kb_)
+
+
+
+def process_fallback_snum_change(message: types.Message, lot_key: str):
+    if False:  # activation disabled
+        bot.send_message(message.chat.id, f"❌  ")
+        return
+    try:
+        new_snum = int(message.text.strip())
+    except ValueError:
+        bot.send_message(message.chat.id, "❌ Ошибка: Введите номер fallback сервиса (число).")
+        return
+
+    cfg = load_config()
+    if str(new_snum) not in cfg.get("services", {}):
+        bot.send_message(message.chat.id, f"❌ Ошибка: Сервис #{new_snum} не существует.")
+        return
+
+    lot_map = cfg.get("lot_mapping", {})
+    if lot_key not in lot_map:
+        bot.send_message(message.chat.id, f"❌ Лот {lot_key} не найден.")
+        return
+
+    lot_map[lot_key]["fallback_service_number"] = new_snum
+    cfg["lot_mapping"] = lot_map
+    save_config(cfg)
+
+    kb_ = InlineKeyboardMarkup()
+    kb_.add(InlineKeyboardButton("◀️ К лотам", callback_data="return_to_lots"))
+    bot.send_message(message.chat.id, f"✅ Fallback S# для {lot_key} изменён на {new_snum}.", reply_markup=kb_)
+
+
+def process_fallback_id_change(message: types.Message, lot_key: str):
+    if False:  # activation disabled
+        bot.send_message(message.chat.id, f"❌  ")
+        return
+    try:
+        new_id = int(message.text.strip())
+    except ValueError:
+        bot.send_message(message.chat.id, "❌ Ошибка: ID fallback услуги должно быть числом.")
+        return
+
+    cfg = load_config()
+    lot_map = cfg.get("lot_mapping", {})
+    if lot_key not in lot_map:
+        bot.send_message(message.chat.id, f"❌ Лот {lot_key} не найден.")
+        return
+
+    lot_map[lot_key]["fallback_service_id"] = new_id
+    cfg["lot_mapping"] = lot_map
+    save_config(cfg)
+
+    kb_ = InlineKeyboardMarkup()
+    kb_.add(InlineKeyboardButton("◀️ К лотам", callback_data="return_to_lots"))
+    bot.send_message(message.chat.id, f"✅ Fallback ID для {lot_key} изменён на {new_id}.", reply_markup=kb_)
 
 def api_settings_menu(call):
     if False:  # activation disabled
@@ -1552,11 +1497,17 @@ def process_apikey_change(message: types.Message, service_idx: int):
         InlineKeyboardButton("🔙 К настройкам API", callback_data="api_settings")
     )
     
+    warning_text = ""
+    if len(new_key) != EXPECTED_API_KEY_LENGTH:
+        warning_text = (
+            "\n\n⚠️ Длина API-ключа отличается от ожидаемой (60 символов). Проверьте корректность ключа."
+        )
+
     text_ = f"""
 ✅ <b>API-ключ сервиса #{service_idx} успешно обновлен!</b>
 
 • <b>Было:</b> <code>{old_key_masked}</code>
-• <b>Стало:</b> <code>{new_key_masked}</code>
+• <b>Стало:</b> <code>{new_key_masked}</code>{warning_text}
 
 Вы можете сразу проверить баланс сервиса для проверки работоспособности.
     """.strip()
@@ -1628,7 +1579,6 @@ def init_commands(c_: Cardinal):
     if auto_started:
         logger.info("Плагин был автоматически запущен при инициализации")
 
-    @bot.message_handler(content_types=['document'])
     def handle_document_upload(message: types.Message):
         if False:  # activation disabled
             bot.send_message(message.chat.id, f"❌  ")
@@ -1672,598 +1622,644 @@ def init_commands(c_: Cardinal):
         ("auto_smm_settings", "Настройки автопродажи", True),
             ])
 
-    @bot.callback_query_handler(func=lambda call: call.data == "manage_websites")
-    def manage_websites(call: types.CallbackQuery):
-        if False:  # activation disabled
-            bot.edit_message_text(f"❌  ", 
-                                  call.message.chat.id, call.message.message_id)
-            return
-        valid_links = load_valid_links()
-        if valid_links:
-            kb_ = InlineKeyboardMarkup(row_width=2)
-            for site in valid_links:
-                kb_.add(
-                    InlineKeyboardButton(site, callback_data=f"delete_website_{site}"),
-                    InlineKeyboardButton("Удалить", callback_data=f"delete_website_{site}")
-                )
-        else:
-            kb_ = InlineKeyboardMarkup(row_width=1)
+
+
+    # --- Telegram handlers registration (NO decorators; Cardinal-safe) ---
+    def _add_cb(_fn, **_kw):
+        try:
+            bot.add_callback_query_handler(_fn, **_kw)
+        except Exception:
+            try:
+                bot.register_callback_query_handler(_fn, **_kw)
+            except Exception:
+                pass
+
+    def _add_msg(_fn, **_kw):
+        try:
+            bot.add_message_handler(_fn, **_kw)
+        except Exception:
+            try:
+                bot.register_message_handler(_fn, **_kw)
+            except Exception:
+                pass
+
+    _add_msg(handle_document_upload, content_types=['document'])
+
+    _add_cb(change_fallback_snum_prompt, func=lambda call: call.data.startswith("change_fallback_snum_"))
+    _add_cb(change_fallback_id_prompt, func=lambda call: call.data.startswith("change_fallback_id_"))
+    _add_cb(manage_websites, func=lambda call: call.data == "manage_websites")
+    _add_cb(add_website_prompt, func=lambda call: call.data == "add_website")
+    _add_cb(remove_website_prompt, func=lambda call: call.data.startswith("delete_website_"))
+    _add_cb(delete_all_lots_prompt, func=lambda call: call.data == "delete_all_lots")
+    _add_cb(confirm_delete_all_lots, func=lambda call: call.data == "confirm_delete_all_lots")
+    _add_cb(lot_settings, func=lambda call: call.data == "lot_settings")
+    _add_cb(show_lots_list, func=lambda call: call.data == "show_lots_list")
+    _add_cb(search_lot_prompt, func=lambda call: call.data == "search_lot")
+    _add_cb(edit_lot_callback, func=lambda call: call.data.startswith("edit_lot_"))
+    _add_cb(page_navigation, func=lambda call: call.data.startswith("prev_page_") or call.data.startswith("next_page_"))
+    _add_cb(show_orders, func=lambda call: call.data == "show_orders")
+    _add_cb(analytics_period, func=lambda call: call.data.startswith("analytics_period_"))
+    _add_cb(upload_lots_json, func=lambda call: call.data == "upload_lots_json")
+    _add_cb(export_files, func=lambda call: call.data == "export_files")
+    _add_cb(export_errors, func=lambda call: call.data == "export_errors")
+    _add_cb(confirm_delete_orders, func=lambda call: call.data == "delete_orders")
+    _add_cb(delete_orders_yes, func=lambda call: call.data == "delete_orders_yes")
+    _add_cb(toggle_auto_refunds, func=lambda call: call.data == "toggle_auto_refunds")
+    _add_cb(toggle_confirm_link, func=lambda call: call.data == "toggle_confirm_link")
+    _add_cb(toggle_send_auto_lots, func=lambda call: call.data == "toggle_send_auto_lots")
+    _add_cb(toggle_auto_start, func=lambda call: call.data == "toggle_auto_start")
+    _add_cb(change_send_interval, func=lambda call: call.data == "change_send_interval")
+    _add_cb(cancel_interval_change, func=lambda call: call.data == "cancel_interval_change")
+    _add_cb(return_to_settings, func=lambda call: call.data == "return_to_settings")
+    _add_cb(return_to_lots, func=lambda call: call.data == "return_to_lots")
+    _add_cb(change_name, func=lambda call: call.data.startswith("change_name_"))
+    _add_cb(change_id, func=lambda call: call.data.startswith("change_id_"))
+    _add_cb(change_quantity, func=lambda call: call.data.startswith("change_quantity_"))
+    _add_cb(change_snum, func=lambda call: call.data.startswith("change_snum_"))
+    _add_cb(delete_one_lot_callback, func=lambda call: call.data.startswith("delete_one_lot_"))
+    _add_cb(api_settings_callback, func=lambda call: call.data == "api_settings")
+    _add_cb(edit_apiurl, func=lambda call: call.data.startswith("edit_apiurl_"))
+    _add_cb(edit_apikey, func=lambda call: call.data.startswith("edit_apikey_"))
+    _add_cb(check_balance, func=lambda call: call.data.startswith("check_balance_"))
+    _add_cb(add_new_lot, func=lambda call: call.data == "add_new_lot")
+    _add_cb(update_lot_ids, func=lambda call: call.data == "update_lot_ids")
+    _add_cb(edit_messages_menu, func=lambda call: call.data == "edit_messages")
+    _add_cb(edit_msg_payment, func=lambda call: call.data == "edit_msg_payment")
+    _add_cb(edit_msg_confirmation, func=lambda call: call.data == "edit_msg_confirmation")
+    _add_cb(add_service, func=lambda call: call.data == "add_service")
+    _add_cb(delete_service, func=lambda call: call.data == "delete_service")
+    _add_cb(set_notification_chat_id, func=lambda call: call.data == "set_notification_chat_id")
+    _add_cb(files_menu_callback, func=lambda call: call.data == "files_menu")
+    _add_cb(misc_settings_callback, func=lambda call: call.data == "misc_settings")
+    _add_cb(toggle_fallback, func=lambda call: call.data == "toggle_fallback")
+    _add_cb(links_menu_callback, func=lambda call: call.data == "links_menu")
+
+    # Telegram commands (Cardinal)
+    c_.telegram.msg_handler(start_smm, commands=["start_smm"])
+    c_.telegram.msg_handler(stop_smm, commands=["stop_smm"])
+    c_.telegram.msg_handler(auto_smm_settings, commands=["auto_smm_settings"])
+    c_.telegram.msg_handler(auto_smm_delete, commands=["auto_smm_delete"])
+
+def change_fallback_snum_prompt(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.answer_callback_query(call.id)
+        return
+    bot.answer_callback_query(call.id)
+    lot_key = call.data.split("change_fallback_snum_", 1)[1]
+    msg_ = bot.edit_message_text(
+        f"Введите номер fallback сервиса (S#) для {lot_key}:",
+        call.message.chat.id,
+        call.message.message_id
+    )
+    bot.register_next_step_handler(msg_, process_fallback_snum_change, lot_key)
+
+
+
+def change_fallback_id_prompt(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.answer_callback_query(call.id)
+        return
+    bot.answer_callback_query(call.id)
+    lot_key = call.data.split("change_fallback_id_", 1)[1]
+    msg_ = bot.edit_message_text(
+        f"Введите fallback ID услуги для {lot_key}:",
+        call.message.chat.id,
+        call.message.message_id
+    )
+    bot.register_next_step_handler(msg_, process_fallback_id_change, lot_key)
+
+
+def manage_websites(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌  ", 
+                              call.message.chat.id, call.message.message_id)
+        return
+    valid_links = load_valid_links()
+    if valid_links:
+        kb_ = InlineKeyboardMarkup(row_width=2)
+        for site in valid_links:
+            kb_.add(
+                InlineKeyboardButton(site, callback_data=f"delete_website_{site}"),
+                InlineKeyboardButton("Удалить", callback_data=f"delete_website_{site}")
+            )
+    else:
+        kb_ = InlineKeyboardMarkup(row_width=1)
+    
+    kb_.add(InlineKeyboardButton("➕ Добавить сайт", callback_data="add_website"))
+    kb_.add(InlineKeyboardButton("🔙 Назад", callback_data="return_to_settings"))
+
+    bot.edit_message_text("Список разрешённых сайтов:", call.message.chat.id, call.message.message_id, reply_markup=kb_)
+
+def add_website_prompt(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌  ", 
+                              call.message.chat.id, call.message.message_id)
+        return
+    msg_ = bot.edit_message_text("Введите ссылку для добавления (например, example.com):", call.message.chat.id, call.message.message_id)
+    bot.register_next_step_handler(msg_, process_add_website)
+
+def process_add_website(message: types.Message):
+    if False:  # activation disabled
+        bot.send_message(message.chat.id, f"❌  ")
+        return
+    new_site = message.text.strip()
+    add_website(message, new_site)
+    kb_ = InlineKeyboardMarkup()
+    kb_.add(InlineKeyboardButton("🔙 Вернуться в настройки", callback_data="return_to_settings"))
+    bot.send_message(message.chat.id, "Вернитесь в настройки для продолжения.", reply_markup=kb_)
+
+def remove_website_prompt(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌  ", 
+                              call.message.chat.id, call.message.message_id)
+        return
+    site_to_remove = call.data.split("_", 2)[2]
+    valid_links = load_valid_links()
+    if site_to_remove in valid_links:
+        valid_links.remove(site_to_remove)
+        save_valid_links(valid_links)
+        bot.edit_message_text(f"✅ Сайт {site_to_remove} удалён из списка.", call.message.chat.id, call.message.message_id)
+    else:
+        bot.edit_message_text(f"❌ Сайт {site_to_remove} не найден в списке.", call.message.chat.id, call.message.message_id)
+    manage_websites(call)
+
+def delete_all_lots_prompt(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌  ", 
+                              call.message.chat.id, call.message.message_id)
+        return
+    kb = InlineKeyboardMarkup()
+    kb.add(
+        InlineKeyboardButton("Да, удалить", callback_data="confirm_delete_all_lots"),
+        InlineKeyboardButton("Нет, отменить", callback_data="return_to_settings")
+    )
+    bot.edit_message_text("Вы уверены, что хотите удалить все лоты?", call.message.chat.id, call.message.message_id, reply_markup=kb)
+
+def confirm_delete_all_lots(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌  ", 
+                              call.message.chat.id, call.message.message_id)
+        return
+    delete_all_lots_func(call)
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("🔙 Назад", callback_data="return_to_settings"))
+    bot.edit_message_text("Все лоты удалены.", call.message.chat.id, call.message.message_id, reply_markup=kb)
+
+def lot_settings(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌  ", 
+                              call.message.chat.id, call.message.message_id)
+        return
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("🔍 Поиск лота", callback_data="search_lot"))
+    kb.add(InlineKeyboardButton("📋 Список лотов", callback_data="show_lots_list"))
+    kb.add(InlineKeyboardButton("🔙 Назад", callback_data="return_to_settings"))
+    bot.edit_message_text("Управление лотами:", call.message.chat.id, call.message.message_id, reply_markup=kb)
+
+def show_lots_list(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌  ", 
+                              call.message.chat.id, call.message.message_id)
+        return
+    bot.edit_message_text("Выберите лот:", call.message.chat.id, call.message.message_id, reply_markup=generate_lots_keyboard(0))
+
+def search_lot_prompt(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌  ", 
+                              call.message.chat.id, call.message.message_id)
+        return
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("🔙 Назад", callback_data="lot_settings"))
+    msg = bot.edit_message_text("Введите название или часть названия лота для поиска:", 
+                                call.message.chat.id, call.message.message_id, reply_markup=kb)
+    bot.register_next_step_handler(msg, process_lot_search)
+
+def process_lot_search(message: types.Message):
+    if False:  # activation disabled
+        bot.send_message(message.chat.id, f"❌  ")
+        return
+    search_term = message.text.strip().lower()
+    if not search_term:
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("🔙 К настройкам лотов", callback_data="lot_settings"))
+        bot.send_message(message.chat.id, "❌ Поисковый запрос не может быть пустым.", reply_markup=kb)
+        return
         
-        kb_.add(InlineKeyboardButton("➕ Добавить сайт", callback_data="add_website"))
-        kb_.add(InlineKeyboardButton("🔙 Назад", callback_data="return_to_settings"))
-
-        bot.edit_message_text("Список разрешённых сайтов:", call.message.chat.id, call.message.message_id, reply_markup=kb_)
-
-    @bot.callback_query_handler(func=lambda call: call.data == "add_website")
-    def add_website_prompt(call: types.CallbackQuery):
-        if False:  # activation disabled
-            bot.edit_message_text(f"❌  ", 
-                                  call.message.chat.id, call.message.message_id)
-            return
-        msg_ = bot.edit_message_text("Введите ссылку для добавления (например, example.com):", call.message.chat.id, call.message.message_id)
-        bot.register_next_step_handler(msg_, process_add_website)
-
-    def process_add_website(message: types.Message):
-        if False:  # activation disabled
-            bot.send_message(message.chat.id, f"❌  ")
-            return
-        new_site = message.text.strip()
-        add_website(message, new_site)
-        kb_ = InlineKeyboardMarkup()
-        kb_.add(InlineKeyboardButton("🔙 Вернуться в настройки", callback_data="return_to_settings"))
-        bot.send_message(message.chat.id, "Вернитесь в настройки для продолжения.", reply_markup=kb_)
-
-    @bot.callback_query_handler(func=lambda call: call.data.startswith("delete_website_"))
-    def remove_website_prompt(call: types.CallbackQuery):
-        if False:  # activation disabled
-            bot.edit_message_text(f"❌  ", 
-                                  call.message.chat.id, call.message.message_id)
-            return
-        site_to_remove = call.data.split("_", 2)[2]
-        valid_links = load_valid_links()
-        if site_to_remove in valid_links:
-            valid_links.remove(site_to_remove)
-            save_valid_links(valid_links)
-            bot.edit_message_text(f"✅ Сайт {site_to_remove} удалён из списка.", call.message.chat.id, call.message.message_id)
-        else:
-            bot.edit_message_text(f"❌ Сайт {site_to_remove} не найден в списке.", call.message.chat.id, call.message.message_id)
-        manage_websites(call)
-
-    @bot.callback_query_handler(func=lambda call: call.data == "delete_all_lots")
-    def delete_all_lots_prompt(call: types.CallbackQuery):
-        if False:  # activation disabled
-            bot.edit_message_text(f"❌  ", 
-                                  call.message.chat.id, call.message.message_id)
-            return
-        kb = InlineKeyboardMarkup()
-        kb.add(
-            InlineKeyboardButton("Да, удалить", callback_data="confirm_delete_all_lots"),
-            InlineKeyboardButton("Нет, отменить", callback_data="return_to_settings")
-        )
-        bot.edit_message_text("Вы уверены, что хотите удалить все лоты?", call.message.chat.id, call.message.message_id, reply_markup=kb)
-
-    @bot.callback_query_handler(func=lambda call: call.data == "confirm_delete_all_lots")
-    def confirm_delete_all_lots(call: types.CallbackQuery):
-        if False:  # activation disabled
-            bot.edit_message_text(f"❌  ", 
-                                  call.message.chat.id, call.message.message_id)
-            return
-        delete_all_lots_func(call)
-        kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton("🔙 Назад", callback_data="return_to_settings"))
-        bot.edit_message_text("Все лоты удалены.", call.message.chat.id, call.message.message_id, reply_markup=kb)
-
-    @bot.callback_query_handler(func=lambda call: call.data == "lot_settings")
-    def lot_settings(call: types.CallbackQuery):
-        if False:  # activation disabled
-            bot.edit_message_text(f"❌  ", 
-                                  call.message.chat.id, call.message.message_id)
-            return
-        kb = InlineKeyboardMarkup(row_width=1)
-        kb.add(InlineKeyboardButton("🔍 Поиск лота", callback_data="search_lot"))
-        kb.add(InlineKeyboardButton("📋 Список лотов", callback_data="show_lots_list"))
-        kb.add(InlineKeyboardButton("🔙 Назад", callback_data="return_to_settings"))
-        bot.edit_message_text("Управление лотами:", call.message.chat.id, call.message.message_id, reply_markup=kb)
-
-    @bot.callback_query_handler(func=lambda call: call.data == "show_lots_list")
-    def show_lots_list(call: types.CallbackQuery):
-        if False:  # activation disabled
-            bot.edit_message_text(f"❌  ", 
-                                  call.message.chat.id, call.message.message_id)
-            return
-        bot.edit_message_text("Выберите лот:", call.message.chat.id, call.message.message_id, reply_markup=generate_lots_keyboard(0))
-
-    @bot.callback_query_handler(func=lambda call: call.data == "search_lot")
-    def search_lot_prompt(call: types.CallbackQuery):
-        if False:  # activation disabled
-            bot.edit_message_text(f"❌  ", 
-                                  call.message.chat.id, call.message.message_id)
-            return
-        kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton("🔙 Назад", callback_data="lot_settings"))
-        msg = bot.edit_message_text("Введите название или часть названия лота для поиска:", 
-                                    call.message.chat.id, call.message.message_id, reply_markup=kb)
-        bot.register_next_step_handler(msg, process_lot_search)
-
-    def process_lot_search(message: types.Message):
-        if False:  # activation disabled
-            bot.send_message(message.chat.id, f"❌  ")
-            return
-        search_term = message.text.strip().lower()
-        if not search_term:
-            kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("🔙 К настройкам лотов", callback_data="lot_settings"))
-            bot.send_message(message.chat.id, "❌ Поисковый запрос не может быть пустым.", reply_markup=kb)
-            return
+    cfg = load_config()
+    lot_map = cfg.get("lot_mapping", {})
+    
+    found_lots = {}
+    for lot_key, lot_data in lot_map.items():
+        lot_name = lot_data["name"].lower()
+        if search_term in lot_name:
+            found_lots[lot_key] = lot_data
             
-        cfg = load_config()
-        lot_map = cfg.get("lot_mapping", {})
-        
-        found_lots = {}
-        for lot_key, lot_data in lot_map.items():
-            lot_name = lot_data["name"].lower()
-            if search_term in lot_name:
-                found_lots[lot_key] = lot_data
-                
-        if not found_lots:
-            kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("🔍 Новый поиск", callback_data="search_lot"))
-            kb.add(InlineKeyboardButton("🔙 К настройкам лотов", callback_data="lot_settings"))
-            bot.send_message(message.chat.id, f"❌ Лоты с названием '{search_term}' не найдены.", reply_markup=kb)
-            return
-            
-        kb = InlineKeyboardMarkup(row_width=1)
-        for lot_key, lot_data in found_lots.items():
-            name_ = lot_data["name"]
-            sid_ = lot_data["service_id"]
-            qty_ = lot_data["quantity"]
-            snum_ = lot_data.get("service_number", 1)
-            btn_text = f"{name_} [ID={sid_}, Q={qty_}, S={snum_}]"
-            cd_ = f"edit_lot_{lot_key}"
-            kb.add(InlineKeyboardButton(btn_text, callback_data=cd_))
-            
+    if not found_lots:
+        kb = InlineKeyboardMarkup()
         kb.add(InlineKeyboardButton("🔍 Новый поиск", callback_data="search_lot"))
         kb.add(InlineKeyboardButton("🔙 К настройкам лотов", callback_data="lot_settings"))
-        bot.send_message(message.chat.id, f"🔍 Результаты поиска для '{search_term}':", reply_markup=kb)
-
-    @bot.callback_query_handler(func=lambda call: call.data.startswith("edit_lot_"))
-    def edit_lot_callback(call: types.CallbackQuery):
-        if False:  # activation disabled
-            bot.edit_message_text(f"❌  ", 
-                                  call.message.chat.id, call.message.message_id)
-            return
-        lot_key = call.data.split("_", 2)[2]
-        edit_lot(call, lot_key)
-
-    @bot.callback_query_handler(func=lambda call: call.data.startswith("prev_page_") or call.data.startswith("next_page_"))
-    def page_navigation(call: types.CallbackQuery):
-        if False:  # activation disabled
-            bot.edit_message_text(f"❌  ", 
-                                  call.message.chat.id, call.message.message_id)
-            return
-        try:
-            page_ = int(call.data.split("_")[-1])
-        except ValueError:
-            page_ = 0
-        bot.edit_message_text("Выберите лот:", call.message.chat.id, call.message.message_id, reply_markup=generate_lots_keyboard(page_))
-
-    @bot.callback_query_handler(func=lambda call: call.data == "show_orders")
-    def show_orders(call: types.CallbackQuery):
-        if False:  # activation disabled
-            bot.edit_message_text(f"❌  ", 
-                                  call.message.chat.id, call.message.message_id)
-            return
-        stats = get_statistics()
-        if not stats:
-            kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("🔙 Назад", callback_data="return_to_settings"))
-            bot.edit_message_text("❌ Нет данных о заказах.", call.message.chat.id, call.message.message_id, reply_markup=kb)
-            return
-
-        kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton("🔙 Назад", callback_data="return_to_settings"))
-
-        text = (
-    "📊 Информация о заказах SMM\n\n"
-    f"За 24 часа: {stats['day_orders']} заказов (чистая прибыль: {float(stats.get('day_chistota', 0) or 0):.2f} ₽)\n"
-    f"За неделю: {stats['week_orders']} заказов (чистая прибыль: {float(stats.get('week_chistota', 0) or 0):.2f} ₽)\n"
-    f"За месяц: {stats['month_orders']} заказов (чистая прибыль: {float(stats.get('month_chistota', 0) or 0):.2f} ₽)\n"
-    f"За всё время: {stats['all_time_orders']} заказов (чистая прибыль: {float(stats.get('all_time_chistota', 0) or 0):.2f} ₽)"
-)
-
-        try:
-            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode=None, reply_markup=kb)
-        except Exception as e:
-            logger.error(f"Ошибка при редактировании сообщения: {e}")
-            bot.send_message(call.message.chat.id, text, parse_mode=None, reply_markup=kb)
+        bot.send_message(message.chat.id, f"❌ Лоты с названием '{search_term}' не найдены.", reply_markup=kb)
+        return
         
+    kb = InlineKeyboardMarkup(row_width=1)
+    for lot_key, lot_data in found_lots.items():
+        name_ = lot_data["name"]
+        sid_ = lot_data["service_id"]
+        qty_ = lot_data["quantity"]
+        snum_ = lot_data.get("service_number", 1)
+        btn_text = f"{name_} [ID={sid_}, Q={qty_}, S={snum_}]"
+        cd_ = f"edit_lot_{lot_key}"
+        kb.add(InlineKeyboardButton(btn_text, callback_data=cd_))
+        
+    kb.add(InlineKeyboardButton("🔍 Новый поиск", callback_data="search_lot"))
+    kb.add(InlineKeyboardButton("🔙 К настройкам лотов", callback_data="lot_settings"))
+    bot.send_message(message.chat.id, f"🔍 Результаты поиска для '{search_term}':", reply_markup=kb)
+
+def edit_lot_callback(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌  ", 
+                              call.message.chat.id, call.message.message_id)
+        return
+    lot_key = call.data.split("_", 2)[2]
+    edit_lot(call, lot_key)
+
+def page_navigation(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌  ", 
+                              call.message.chat.id, call.message.message_id)
+        return
+    try:
+        page_ = int(call.data.split("_")[-1])
+    except ValueError:
+        page_ = 0
+    bot.edit_message_text("Выберите лот:", call.message.chat.id, call.message.message_id, reply_markup=generate_lots_keyboard(page_))
+
+def _render_analytics(call: types.CallbackQuery, period: str = "day"):
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌  ", 
+                              call.message.chat.id, call.message.message_id)
+        return
+
+    # period: day | week | month | all
+    try:
+        txt = analytics.format_analytics(period=period, top_n=5, last_n=8)
+    except Exception as e:
+        logger.error(f"Ошибка формирования аналитики: {e}")
+        txt = "❌ Ошибка формирования аналитики."
+
+    kb = InlineKeyboardMarkup(row_width=4)
+    kb.row(
+        InlineKeyboardButton("🕒 24ч", callback_data="analytics_period_day"),
+        InlineKeyboardButton("📅 7д", callback_data="analytics_period_week"),
+        InlineKeyboardButton("🗓 30д", callback_data="analytics_period_month"),
+        InlineKeyboardButton("♾ Всё", callback_data="analytics_period_all"),
+    )
+    kb.row(
+        InlineKeyboardButton("🔄 Обновить", callback_data=f"analytics_period_{period}"),
+        InlineKeyboardButton("🔙 Назад", callback_data="return_to_settings"),
+    )
+
+    try:
+        bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb)
+    except Exception as e:
+        logger.error(f"Ошибка при редактировании сообщения аналитики: {e}")
+        try:
+            bot.send_message(call.message.chat.id, txt, parse_mode="HTML", reply_markup=kb)
+        except Exception as e2:
+            logger.error(f"Ошибка при отправке сообщения аналитики: {e2}")
+
+    try:
         bot.answer_callback_query(call.id)
+    except Exception:
+        pass
 
-    @bot.callback_query_handler(func=lambda call: call.data == "upload_lots_json")
-    def upload_lots_json(call: types.CallbackQuery):
-        if False:  # activation disabled
-            bot.edit_message_text(f"❌  ", 
-                                  call.message.chat.id, call.message.message_id)
-            return
-        user_id = call.from_user.id
-        waiting_for_lots_upload.add(user_id)
-        logger.info(f"Добавлен пользователь {user_id} в waiting_for_lots_upload: {waiting_for_lots_upload}")
-        bot.edit_message_text("Пришлите файл JSON (можно любым названием).", call.message.chat.id, call.message.message_id)
+def show_orders(call: types.CallbackQuery):
+    _render_analytics(call, period="day")
 
-    @bot.callback_query_handler(func=lambda call: call.data == "export_files")
-    def export_files(call: types.CallbackQuery):
-        if False:  # activation disabled
-            bot.edit_message_text(f"❌  ", 
-                                  call.message.chat.id, call.message.message_id)
-            return
-        chat_id_ = call.message.chat.id
-        files_to_send = [CONFIG_PATH, ORDERS_PATH, ORDERS_DATA_PATH]
-        for f_ in files_to_send:
-            if os.path.exists(f_):
-                try:
-                    with open(f_, 'rb') as ff:
-                        bot.send_document(chat_id_, ff, caption=f"Файл: {os.path.basename(f_)}")
-                except Exception as e:
-                    bot.edit_message_text(f"Ошибка отправки {f_}: {e}", chat_id_, call.message.message_id)
-            else:
-                bot.edit_message_text(f"Файл не найден: {f_}", chat_id_, call.message.message_id)
+def analytics_period(call: types.CallbackQuery):
+    try:
+        period = call.data.split("analytics_period_", 1)[1].strip()
+    except Exception:
+        period = "day"
+    if period not in ("day", "week", "month", "all"):
+        period = "day"
+    _render_analytics(call, period=period)
 
-    @bot.callback_query_handler(func=lambda call: call.data == "export_errors")
-    def export_errors(call: types.CallbackQuery):
-        if False:  # activation disabled
-            bot.edit_message_text(f"❌  ", 
-                                  call.message.chat.id, call.message.message_id)
-            return
-        chat_id_ = call.message.chat.id
-        if os.path.exists(LOG_PATH):
+
+def upload_lots_json(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌  ", 
+                              call.message.chat.id, call.message.message_id)
+        return
+    user_id = call.from_user.id
+    waiting_for_lots_upload.add(user_id)
+    logger.info(f"Добавлен пользователь {user_id} в waiting_for_lots_upload: {waiting_for_lots_upload}")
+    bot.edit_message_text("Пришлите файл JSON (можно любым названием).", call.message.chat.id, call.message.message_id)
+
+def export_files(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌  ", 
+                              call.message.chat.id, call.message.message_id)
+        return
+    chat_id_ = call.message.chat.id
+    files_to_send = [CONFIG_PATH, ORDERS_PATH, ORDERS_DATA_PATH]
+    for f_ in files_to_send:
+        if os.path.exists(f_):
             try:
-                with open(LOG_PATH, 'rb') as f:
-                    bot.send_document(chat_id_, f, caption="Лог ошибок")
-                bot.edit_message_text("Логи выгружены.", chat_id_, call.message.message_id)
+                with open(f_, 'rb') as ff:
+                    bot.send_document(chat_id_, ff, caption=f"Файл: {os.path.basename(f_)}")
             except Exception as e:
-                bot.edit_message_text(f"Ошибка отправки лог-файла: {e}", chat_id_, call.message.message_id)
+                bot.edit_message_text(f"Ошибка отправки {f_}: {e}", chat_id_, call.message.message_id)
         else:
-            bot.edit_message_text("Лог-файл не найден.", chat_id_, call.message.message_id)
+            bot.edit_message_text(f"Файл не найден: {f_}", chat_id_, call.message.message_id)
 
-    @bot.callback_query_handler(func=lambda call: call.data == "delete_orders")
-    def confirm_delete_orders(call: types.CallbackQuery):
-        """Просит подтверждение перед удалением истории заказов."""
-        kb2 = InlineKeyboardMarkup(row_width=2)
-        kb2.row(
-            InlineKeyboardButton("✅ Да, удалить", callback_data="delete_orders_yes"),
-            InlineKeyboardButton("❌ Отмена", callback_data="files_menu")
-        )
-        bot.edit_message_text(
-            "⚠️ <b>Вы действительно хотите удалить ВСЮ историю заказов?</b>\n\n"
-            "Это действие необратимо.",
-            call.message.chat.id,
-            call.message.message_id,
-            parse_mode="HTML",
-            reply_markup=kb2
-        )
-
-    @bot.callback_query_handler(func=lambda call: call.data == "delete_orders_yes")
-    def delete_orders_yes(call: types.CallbackQuery):
-        """Удаляет файлы истории заказов после подтверждения."""
+def export_errors(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌  ", 
+                              call.message.chat.id, call.message.message_id)
+        return
+    chat_id_ = call.message.chat.id
+    if os.path.exists(LOG_PATH):
         try:
-            delete_orders_file()
-            bot.answer_callback_query(call.id, "✅ История заказов удалена.")
+            with open(LOG_PATH, 'rb') as f:
+                bot.send_document(chat_id_, f, caption="Лог ошибок")
+            bot.edit_message_text("Логи выгружены.", chat_id_, call.message.message_id)
         except Exception as e:
-            bot.answer_callback_query(call.id, "❌ Ошибка удаления.")
-            try:
-                send_debug(f"delete_orders_yes error: {e}")
-            except Exception:
-                pass
+            bot.edit_message_text(f"Ошибка отправки лог-файла: {e}", chat_id_, call.message.message_id)
+    else:
+        bot.edit_message_text("Лог-файл не найден.", chat_id_, call.message.message_id)
 
-        # Возвращаемся в меню файлов
+def confirm_delete_orders(call: types.CallbackQuery):
+    """Просит подтверждение перед удалением истории заказов."""
+    kb2 = InlineKeyboardMarkup(row_width=2)
+    kb2.row(
+        InlineKeyboardButton("✅ Да, удалить", callback_data="delete_orders_yes"),
+        InlineKeyboardButton("❌ Отмена", callback_data="files_menu")
+    )
+    bot.edit_message_text(
+        "⚠️ <b>Вы действительно хотите удалить ВСЮ историю заказов?</b>\n\n"
+        "Это действие необратимо.",
+        call.message.chat.id,
+        call.message.message_id,
+        parse_mode="HTML",
+        reply_markup=kb2
+    )
+
+def delete_orders_yes(call: types.CallbackQuery):
+    """Удаляет файлы истории заказов после подтверждения."""
+    try:
+        delete_orders_file()
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        bot.answer_callback_query(call.id)
         try:
-            # переиспользуем существующий обработчик меню файлов
-            files_menu_callback(call)
+            send_debug(f"delete_orders_yes error: {e}")
         except Exception:
-            # фолбэк: просто скажем, что ок
-            try:
-                bot.edit_message_text(
-                    "✅ Готово.",
-                    call.message.chat.id,
-                    call.message.message_id,
-                    parse_mode="HTML"
-                )
-            except Exception:
-                pass
+            pass
 
-    @bot.callback_query_handler(func=lambda call: call.data == "toggle_auto_refunds")
-    def toggle_auto_refunds(call: types.CallbackQuery):
-        if False:  # activation disabled
-            bot.edit_message_text(f"❌  ", 
-                                  call.message.chat.id, call.message.message_id)
-            return
-        cfg = load_config()
-        ar_ = cfg.get("auto_refunds", True)
-        cfg["auto_refunds"] = not ar_
-        save_config(cfg)
-        bot.answer_callback_query(call.id, f"✅ Автовозвраты: {'ВКЛ' if cfg['auto_refunds'] else 'ВЫКЛ'}")
-        misc_settings(call)
-
-    @bot.callback_query_handler(func=lambda call: call.data == "toggle_confirm_link")
-    def toggle_confirm_link(call: types.CallbackQuery):
-        if False:  # activation disabled
-            bot.edit_message_text(f"❌  ", 
-                                  call.message.chat.id, call.message.message_id)
-            return
-        cfg = load_config()
-        confirm_link = cfg.get("confirm_link", True)
-        cfg["confirm_link"] = not confirm_link
-        save_config(cfg)
-        bot.answer_callback_query(call.id, f"✅ Подтверждение ссылки: {'ВКЛ' if cfg['confirm_link'] else 'ВЫКЛ'}")
-        misc_settings(call)
-
-    @bot.callback_query_handler(func=lambda call: call.data == "toggle_send_auto_lots")
-    def toggle_send_auto_lots(call: types.CallbackQuery):
-        if False:  # activation disabled
-            bot.edit_message_text(f"❌  ", 
-                              call.message.chat.id, call.message.message_id)
-            return
-        cfg = load_config()
-        current_value = cfg.get("send_auto_lots", True)
-        cfg["send_auto_lots"] = not current_value
-        save_config(cfg)
-        bot.answer_callback_query(call.id, f"Отправка auto_lots.json {'отключена' if current_value else 'включена'}!")
-        misc_settings(call)
-        
-    @bot.callback_query_handler(func=lambda call: call.data == "toggle_auto_start")
-    def toggle_auto_start(call: types.CallbackQuery):
-        if False:  # activation disabled
-            bot.edit_message_text(f"❌  ", 
-                              call.message.chat.id, call.message.message_id)
-            return
-        cfg = load_config()
-        current_value = cfg.get("auto_start", False)
-        cfg["auto_start"] = not current_value
-        save_config(cfg)
-        bot.answer_callback_query(call.id, f"Автозапуск плагина {'отключен' if current_value else 'включен'}!")
-        misc_settings(call)
-
-    @bot.callback_query_handler(func=lambda call: call.data == "change_send_interval")
-    def change_send_interval(call: types.CallbackQuery):
-        if False:  # activation disabled
-            bot.edit_message_text(f"❌  ", 
-                                call.message.chat.id, call.message.message_id)
-            return
-        cfg = load_config()
-        current_interval = cfg.get("send_auto_lots_interval", 30)
-        
-        kb_ = InlineKeyboardMarkup()
-        kb_.add(InlineKeyboardButton("🔙 Вернуться назад", callback_data="cancel_interval_change"))
-        
-        msg_ = bot.edit_message_text(f"Текущий интервал отправки: {current_interval} минут\n\nВведите новый интервал отправки auto_lots.json в минутах (от 5 до 1440):", 
-                                call.message.chat.id, call.message.message_id, reply_markup=kb_)
-        bot.register_next_step_handler(msg_, process_send_interval_change)
-
-    @bot.callback_query_handler(func=lambda call: call.data == "cancel_interval_change")
-    def cancel_interval_change(call: types.CallbackQuery):
-        if False:  # activation disabled
-            bot.edit_message_text(f"❌  ", 
-                                call.message.chat.id, call.message.message_id)
-            return
-        bot.clear_step_handler_by_chat_id(call.message.chat.id)
-        misc_settings(call)
-    
-    def process_send_interval_change(message: types.Message):
-        if False:  # activation disabled
-            bot.send_message(message.chat.id, f"❌  ")
-            return
+    # Возвращаемся в меню файлов
+    try:
+        # переиспользуем существующий обработчик меню файлов
+        files_menu_callback(call)
+    except Exception:
+        # фолбэк: просто скажем, что ок
         try:
-            new_interval = int(message.text.strip())
-            if new_interval < 5:
-                bot.send_message(message.chat.id, "❌ Интервал не может быть меньше 5 минут")
-                return
-            if new_interval > 1440:
-                bot.send_message(message.chat.id, "❌ Интервал не может быть больше 1440 минут (24 часа)")
-                return
-                
-            cfg = load_config()
-            cfg["send_auto_lots_interval"] = new_interval
-            save_config(cfg)
-            
-            kb_ = InlineKeyboardMarkup()
-            kb_.add(InlineKeyboardButton("🔙 К настройкам", callback_data="misc_settings"))
-            bot.send_message(message.chat.id, f"✅ Интервал отправки auto_lots.json установлен: {new_interval} минут", reply_markup=kb_)
-        except ValueError:
-            bot.send_message(message.chat.id, "❌ Ошибка: Введите корректное число минут.")
-            
-    @bot.callback_query_handler(func=lambda call: call.data == "return_to_settings")
-    def return_to_settings(call: types.CallbackQuery):
-        if False:  # activation disabled
             bot.edit_message_text(
-                f"❌  ",
+                "✅ Готово.",
                 call.message.chat.id,
                 call.message.message_id,
+                parse_mode="HTML"
             )
-            return
-
-        cfg = load_config()
-        lmap = cfg.get("lot_mapping", {})
-        auto_refunds = cfg.get("auto_refunds", True)
-        confirm_link = cfg.get("confirm_link", True)
-        notif_chat_id = cfg.get("notification_chat_id", "Не задан")
-        send_auto_lots = cfg.get("send_auto_lots", False)
-        send_auto_lots_interval = cfg.get("send_auto_lots_interval", 30)
-        auto_start = cfg.get("auto_start", False)
-
-        status_text = "🟢 ВКЛ" if RUNNING else "🔴 ВЫКЛ"
-        stats = get_statistics()
-        day_profit = stats.get("day_chistota", 0) if stats else 0
-        try:
-            day_profit_fmt = f"{float(day_profit):.2f}"
         except Exception:
-            day_profit_fmt = str(day_profit)
+            pass
 
-        txt_ = f"""
-🚀 <b>AUTOSMM v{VERSION}</b>
+def toggle_auto_refunds(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌  ", 
+                              call.message.chat.id, call.message.message_id)
+        return
+    cfg = load_config()
+    ar_ = cfg.get("auto_refunds", True)
+    cfg["auto_refunds"] = not ar_
+    save_config(cfg)
+    bot.answer_callback_query(call.id)
+    misc_settings(call)
 
-━━━━━━━━━━━━━━━━━━━━━
+def toggle_confirm_link(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌  ", 
+                              call.message.chat.id, call.message.message_id)
+        return
+    cfg = load_config()
+    confirm_link = cfg.get("confirm_link", True)
+    cfg["confirm_link"] = not confirm_link
+    save_config(cfg)
+    bot.answer_callback_query(call.id)
+    misc_settings(call)
 
-📊 <b>Статус:</b> {status_text}
+def toggle_send_auto_lots(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌  ", 
+                          call.message.chat.id, call.message.message_id)
+        return
+    cfg = load_config()
+    current_value = cfg.get("send_auto_lots", True)
+    cfg["send_auto_lots"] = not current_value
+    save_config(cfg)
+    bot.answer_callback_query(call.id)
+    misc_settings(call)
+    
+def toggle_auto_start(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌  ", 
+                          call.message.chat.id, call.message.message_id)
+        return
+    cfg = load_config()
+    current_value = cfg.get("auto_start", False)
+    cfg["auto_start"] = not current_value
+    save_config(cfg)
+    bot.answer_callback_query(call.id)
+    misc_settings(call)
 
-📦 <b>Лоты:</b> <code>{len(lmap)}</code>
+def change_send_interval(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌  ", 
+                            call.message.chat.id, call.message.message_id)
+        return
+    cfg = load_config()
+    current_interval = cfg.get("send_auto_lots_interval", 30)
+    
+    kb_ = InlineKeyboardMarkup()
+    kb_.add(InlineKeyboardButton("🔙 Вернуться назад", callback_data="cancel_interval_change"))
+    
+    msg_ = bot.edit_message_text(f"Текущий интервал отправки: {current_interval} минут\n\nВведите новый интервал отправки auto_lots.json в минутах (от 5 до 1440):", 
+                            call.message.chat.id, call.message.message_id, reply_markup=kb_)
+    bot.register_next_step_handler(msg_, process_send_interval_change)
 
-  • <b>Автозапуск:</b> {'✅' if auto_start else '❌'}
-  • <b>Автовозвраты:</b> {'✅' if auto_refunds else '❌'}
-  • <b>Подтверждение ссылки:</b> {'✅' if confirm_link else '❌'}
+def cancel_interval_change(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌  ", 
+                            call.message.chat.id, call.message.message_id)
+        return
+    bot.clear_step_handler_by_chat_id(call.message.chat.id)
+    misc_settings(call)
 
-💰 <b>Профит за 24ч:</b> <code>{day_profit_fmt} ₽</code>
-📩 <b>Уведомления:</b> <code>{notif_chat_id}</code>
-
-━━━━━━━━━━━━━━━━━━━━━
-        """.strip()
-
-        kb = InlineKeyboardMarkup(row_width=2)
-        kb.add(
-            InlineKeyboardButton("🛍️ Каталог лотов", callback_data="lot_settings"),
-            InlineKeyboardButton("➕ Создать новый лот", callback_data="add_new_lot"),
-        )
-        kb.add(
-            InlineKeyboardButton("🔌 Интеграция API", callback_data="api_settings"),
-        )
-        kb.add(
-            InlineKeyboardButton("🌐 Доверенные сайты", callback_data="manage_websites"),
-            InlineKeyboardButton("💬 Шаблоны сообщений", callback_data="edit_messages"),
-        )
-        kb.add(
-            InlineKeyboardButton("📊 Аналитика", callback_data="show_orders"),
-        )
-        kb.add(
-            InlineKeyboardButton("📁 Бэкап / файлы", callback_data="files_menu"),
-            InlineKeyboardButton("⚙️ Тонкая настройка", callback_data="misc_settings"),
-        )
-        kb.add(
-            InlineKeyboardButton("📚 Полезные ресурсы", callback_data="links_menu"),
-        )
-
-        bot.edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode=None, reply_markup=kb)
-
-    @bot.callback_query_handler(func=lambda call: call.data == "return_to_lots")
-    def return_to_lots(call: types.CallbackQuery):
-        if False:  # activation disabled
-            bot.edit_message_text(f"❌  ", 
-                                  call.message.chat.id, call.message.message_id)
+def process_send_interval_change(message: types.Message):
+    if False:  # activation disabled
+        bot.send_message(message.chat.id, f"❌  ")
+        return
+    try:
+        new_interval = int(message.text.strip())
+        if new_interval < 5:
+            bot.send_message(message.chat.id, "❌ Интервал не может быть меньше 5 минут")
             return
-        bot.edit_message_text("Выберите лот:", call.message.chat.id, call.message.message_id, reply_markup=generate_lots_keyboard(0))
-
-    @bot.callback_query_handler(func=lambda call: call.data.startswith("change_name_"))
-    def change_name(call: types.CallbackQuery):
-        if False:  # activation disabled
-            bot.edit_message_text(f"❌  ", 
-                                  call.message.chat.id, call.message.message_id)
+        if new_interval > 1440:
+            bot.send_message(message.chat.id, "❌ Интервал не может быть больше 1440 минут (24 часа)")
             return
-        lot_key = call.data.split("_", 2)[2]
-        msg_ = bot.edit_message_text(f"Введите новое название для {lot_key}:", call.message.chat.id, call.message.message_id)
-        bot.register_next_step_handler(msg_, process_name_change, lot_key)
-
-    @bot.callback_query_handler(func=lambda call: call.data.startswith("change_id_"))
-    def change_id(call: types.CallbackQuery):
-        if False:  # activation disabled
-            bot.edit_message_text(f"❌  ", 
-                                  call.message.chat.id, call.message.message_id)
-            return
-        lot_key = call.data.split("_", 2)[2]
-        msg_ = bot.edit_message_text(f"Введите новый ID услуги для {lot_key}:", call.message.chat.id, call.message.message_id)
-        bot.register_next_step_handler(msg_, process_id_change, lot_key)
-
-    @bot.callback_query_handler(func=lambda call: call.data.startswith("change_quantity_"))
-    def change_quantity(call: types.CallbackQuery):
-        if False:  # activation disabled
-            bot.edit_message_text(f"❌  ", 
-                                  call.message.chat.id, call.message.message_id)
-            return
-        lot_key = call.data.split("_", 2)[2]
-        msg_ = bot.edit_message_text(f"Введите новое количество для {lot_key}:", call.message.chat.id, call.message.message_id)
-        bot.register_next_step_handler(msg_, process_quantity_change, lot_key)
-
-    @bot.callback_query_handler(func=lambda call: call.data.startswith("change_snum_"))
-    def change_snum(call: types.CallbackQuery):
-        if False:  # activation disabled
-            bot.edit_message_text(f"❌  ", 
-                                  call.message.chat.id, call.message.message_id)
-            return
-        lot_key = call.data.split("_", 2)[2]
-        msg_ = bot.edit_message_text(f"Введите номер сервиса для {lot_key}:", call.message.chat.id, call.message.message_id)
-        bot.register_next_step_handler(msg_, process_service_num_change, lot_key)
-
-    @bot.callback_query_handler(func=lambda call: call.data.startswith("delete_one_lot_"))
-    def delete_one_lot_callback(call: types.CallbackQuery):
-        if False:  # activation disabled
-            bot.edit_message_text(f"❌  ", 
-                                  call.message.chat.id, call.message.message_id)
-            return
-        lot_key = call.data.split("_", 3)[3]
-        delete_one_lot(call, lot_key)
-
-    @bot.callback_query_handler(func=lambda call: call.data == "api_settings")
-    def api_settings_callback(call: types.CallbackQuery):
-        api_settings_menu(call)
-
-    @bot.callback_query_handler(func=lambda call: call.data.startswith("edit_apiurl_"))
-    def edit_apiurl(call: types.CallbackQuery):
-        if False:  # activation disabled
-            bot.edit_message_text(f"❌  ", 
-                                  call.message.chat.id, call.message.message_id)
-            return
-        idx_ = int(call.data.split("_")[-1])
-        msg_ = bot.edit_message_text(f"Введите новый URL для сервиса #{idx_}:", call.message.chat.id, call.message.message_id)
-        bot.register_next_step_handler(msg_, process_apiurl_change, idx_)
-
-    @bot.callback_query_handler(func=lambda call: call.data.startswith("edit_apikey_"))
-    def edit_apikey(call: types.CallbackQuery):
-        if False:  # activation disabled
-            bot.edit_message_text(f"❌  ", 
-                                  call.message.chat.id, call.message.message_id)
-            return
-        idx_ = int(call.data.split("_")[-1])
-        msg_ = bot.edit_message_text(f"Введите новый ключ для сервиса #{idx_}:", call.message.chat.id, call.message.message_id)
-        bot.register_next_step_handler(msg_, process_apikey_change, idx_)
-
-    @bot.callback_query_handler(func=lambda call: call.data.startswith("check_balance_"))
-    def check_balance(call: types.CallbackQuery):
-        if False:  # activation disabled
-            bot.edit_message_text(f"❌  ", 
-                                  call.message.chat.id, call.message.message_id)
-            return
-        idx_ = int(call.data.split("_")[-1])
-        check_balance_func(call, idx_)
-
-    @bot.callback_query_handler(func=lambda call: call.data == "add_new_lot")
-    def add_new_lot(call: types.CallbackQuery):
-        if False:  # activation disabled
-            bot.edit_message_text(f"❌  ", 
-                                  call.message.chat.id, call.message.message_id)
-            return
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-        msg_ = bot.send_message(call.message.chat.id, "Введите ID лота для добавления:")
-        bot.register_next_step_handler(msg_, process_new_lot_id_step)
-
-    @bot.callback_query_handler(func=lambda call: call.data == "update_lot_ids")
-    def update_lot_ids(call: types.CallbackQuery):
-        if False:  # activation disabled
-            bot.edit_message_text(f"❌  ", 
-                                  call.message.chat.id, call.message.message_id)
-            return
+            
         cfg = load_config()
-        reindex_lots(cfg)
-        bot.answer_callback_query(call.id, "Номера лотов обновлены.")
-        misc_settings(call)
+        cfg["send_auto_lots_interval"] = new_interval
+        save_config(cfg)
+        
+        kb_ = InlineKeyboardMarkup()
+        kb_.add(InlineKeyboardButton("🔙 К настройкам", callback_data="misc_settings"))
+        bot.send_message(message.chat.id, f"✅ Интервал отправки auto_lots.json установлен: {new_interval} минут", reply_markup=kb_)
+    except ValueError:
+        bot.send_message(message.chat.id, "❌ Ошибка: Введите корректное число минут.")
 
-    @bot.callback_query_handler(func=lambda call: call.data == "edit_messages")
-    def edit_messages_menu(call: types.CallbackQuery):
-        if False:  # activation disabled
-            bot.edit_message_text(f"❌  ", 
-                                  call.message.chat.id, call.message.message_id)
-            return
-        cfg = load_config()
-        msg_payment = cfg["messages"]["after_payment"]
-        msg_confirmation = cfg["messages"]["after_confirmation"]
+        
+        
+def return_to_settings(call: types.CallbackQuery):
+    bot.answer_callback_query(call.id)
+    if False:  # activation disabled
+        bot.edit_message_text(
+            f"❌  ",
+            call.message.chat.id,
+            call.message.message_id,
+        )
+        return
 
-        text_ = f"""
+    cfg = load_config()
+    txt_, kb = build_main_menu_text_and_kb(cfg)
+    bot.edit_message_text(
+        txt_,
+        call.message.chat.id,
+        call.message.message_id,
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+
+
+
+def return_to_lots(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌  ", 
+                              call.message.chat.id, call.message.message_id)
+        return
+    bot.edit_message_text("Выберите лот:", call.message.chat.id, call.message.message_id, reply_markup=generate_lots_keyboard(0))
+
+def change_name(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌  ", 
+                              call.message.chat.id, call.message.message_id)
+        return
+    lot_key = call.data.split("_", 2)[2]
+    msg_ = bot.edit_message_text(f"Введите новое название для {lot_key}:", call.message.chat.id, call.message.message_id)
+    bot.register_next_step_handler(msg_, process_name_change, lot_key)
+
+def change_id(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌  ", 
+                              call.message.chat.id, call.message.message_id)
+        return
+    lot_key = call.data.split("_", 2)[2]
+    msg_ = bot.edit_message_text(f"Введите новый ID услуги для {lot_key}:", call.message.chat.id, call.message.message_id)
+    bot.register_next_step_handler(msg_, process_id_change, lot_key)
+
+def change_quantity(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌  ", 
+                              call.message.chat.id, call.message.message_id)
+        return
+    lot_key = call.data.split("_", 2)[2]
+    msg_ = bot.edit_message_text(f"Введите новое количество для {lot_key}:", call.message.chat.id, call.message.message_id)
+    bot.register_next_step_handler(msg_, process_quantity_change, lot_key)
+
+def change_snum(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌  ", 
+                              call.message.chat.id, call.message.message_id)
+        return
+    lot_key = call.data.split("_", 2)[2]
+    msg_ = bot.edit_message_text(f"Введите номер сервиса для {lot_key}:", call.message.chat.id, call.message.message_id)
+    bot.register_next_step_handler(msg_, process_service_num_change, lot_key)
+
+def delete_one_lot_callback(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌  ", 
+                              call.message.chat.id, call.message.message_id)
+        return
+    lot_key = call.data.split("_", 3)[3]
+    delete_one_lot(call, lot_key)
+
+def api_settings_callback(call: types.CallbackQuery):
+    api_settings_menu(call)
+
+def edit_apiurl(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌  ", 
+                              call.message.chat.id, call.message.message_id)
+        return
+    idx_ = int(call.data.split("_")[-1])
+    msg_ = bot.edit_message_text(f"Введите новый URL для сервиса #{idx_}:", call.message.chat.id, call.message.message_id)
+    bot.register_next_step_handler(msg_, process_apiurl_change, idx_)
+
+def edit_apikey(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌  ", 
+                              call.message.chat.id, call.message.message_id)
+        return
+    idx_ = int(call.data.split("_")[-1])
+    msg_ = bot.edit_message_text(f"Введите новый ключ для сервиса #{idx_}:", call.message.chat.id, call.message.message_id)
+    bot.register_next_step_handler(msg_, process_apikey_change, idx_)
+
+def check_balance(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌  ", 
+                              call.message.chat.id, call.message.message_id)
+        return
+    idx_ = int(call.data.split("_")[-1])
+    check_balance_func(call, idx_)
+
+def add_new_lot(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌  ", 
+                              call.message.chat.id, call.message.message_id)
+        return
+    bot.delete_message(call.message.chat.id, call.message.message_id)
+    msg_ = bot.send_message(call.message.chat.id, "Введите ID лота для добавления:")
+    bot.register_next_step_handler(msg_, process_new_lot_id_step)
+
+def update_lot_ids(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌  ", 
+                              call.message.chat.id, call.message.message_id)
+        return
+    cfg = load_config()
+    reindex_lots(cfg)
+    bot.answer_callback_query(call.id)
+    misc_settings(call)
+
+def edit_messages_menu(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌  ", 
+                              call.message.chat.id, call.message.message_id)
+        return
+    cfg = load_config()
+    msg_payment = cfg["messages"]["after_payment"]
+    msg_confirmation = cfg["messages"]["after_confirmation"]
+
+    text_ = f"""
 ⚙ <b>Редактирование текстов сообщений</b>
 
 <b>После оплаты:</b>
@@ -2277,165 +2273,153 @@ def init_commands(c_: Cardinal):
 Переменные: https://teletype.in/@w1bbex/kT9IpmDNovR
 
 <code>{msg_confirmation}</code>
-        """.strip()
+    """.strip()
 
-        kb = InlineKeyboardMarkup(row_width=1)
-        kb.add(
-            InlineKeyboardButton("Изменить текст после оплаты", callback_data="edit_msg_payment"),
-            InlineKeyboardButton("Изменить текст после подтверждения", callback_data="edit_msg_confirmation")
-        )
-        kb.add(InlineKeyboardButton("🔙 Назад", callback_data="return_to_settings"))
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        InlineKeyboardButton("Изменить текст после оплаты", callback_data="edit_msg_payment"),
+        InlineKeyboardButton("Изменить текст после подтверждения", callback_data="edit_msg_confirmation")
+    )
+    kb.add(InlineKeyboardButton("🔙 Назад", callback_data="return_to_settings"))
 
-        bot.edit_message_text(text_, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb)
+    bot.edit_message_text(text_, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb)
 
-    @bot.callback_query_handler(func=lambda call: call.data == "edit_msg_payment")
-    def edit_msg_payment(call: types.CallbackQuery):
-        if False:  # activation disabled
-            bot.edit_message_text(f"❌  ", 
-                                  call.message.chat.id, call.message.message_id)
-            return
-        msg_ = bot.edit_message_text("Введите новый текст после оплаты:", call.message.chat.id, call.message.message_id)
-        bot.register_next_step_handler(msg_, process_message_payment_change)
+def edit_msg_payment(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌  ", 
+                              call.message.chat.id, call.message.message_id)
+        return
+    msg_ = bot.edit_message_text("Введите новый текст после оплаты:", call.message.chat.id, call.message.message_id)
+    bot.register_next_step_handler(msg_, process_message_payment_change)
 
-    @bot.callback_query_handler(func=lambda call: call.data == "edit_msg_confirmation")
-    def edit_msg_confirmation(call: types.CallbackQuery):
-        if False:  # activation disabled
-            bot.edit_message_text(f"❌  ", 
-                                  call.message.chat.id, call.message.message_id)
-            return
-        msg_ = bot.edit_message_text("Введите новый текст после подтверждения:", call.message.chat.id, call.message.message_id)
-        bot.register_next_step_handler(msg_, process_message_confirmation_change)
+def edit_msg_confirmation(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌  ", 
+                              call.message.chat.id, call.message.message_id)
+        return
+    msg_ = bot.edit_message_text("Введите новый текст после подтверждения:", call.message.chat.id, call.message.message_id)
+    bot.register_next_step_handler(msg_, process_message_confirmation_change)
 
-    def process_message_payment_change(message: types.Message):
-        if False:  # activation disabled
-            bot.send_message(message.chat.id, f"❌  ")
-            return
-        new_text = message.text.strip()
+def process_message_payment_change(message: types.Message):
+    if False:  # activation disabled
+        bot.send_message(message.chat.id, f"❌  ")
+        return
+    new_text = message.text.strip()
+    cfg = load_config()
+    cfg["messages"]["after_payment"] = new_text
+    save_config(cfg)
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("🔙 Назад", callback_data="return_to_settings"))
+    bot.send_message(message.chat.id, "Текст после оплаты обновлен.", reply_markup=kb)
+
+def process_message_confirmation_change(message: types.Message):
+    if False:  # activation disabled
+        bot.send_message(message.chat.id, f"❌  ")
+        return
+    new_text = message.text.strip()
+    cfg = load_config()
+    cfg["messages"]["after_confirmation"] = new_text
+    save_config(cfg)
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("🔙 Назад", callback_data="return_to_settings"))
+    bot.send_message(message.chat.id, "Текст после подтверждения обновлен.", reply_markup=kb)
+
+def add_service(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌  ", 
+                              call.message.chat.id, call.message.message_id)
+        return
+    msg_ = bot.edit_message_text("Введите номер нового сервиса (число):", call.message.chat.id, call.message.message_id)
+    bot.register_next_step_handler(msg_, process_add_service)
+
+def delete_service(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌  ", 
+                              call.message.chat.id, call.message.message_id)
+        return
+    msg_ = bot.edit_message_text("Введите номер сервиса для удаления:", call.message.chat.id, call.message.message_id)
+    bot.register_next_step_handler(msg_, process_delete_service)
+
+def process_add_service(message: types.Message):
+    if False:  # activation disabled
+        bot.send_message(message.chat.id, f"❌  ")
+        return
+    try:
+        srv_num = int(message.text.strip())
+        if srv_num < 1:
+            raise ValueError
+    except ValueError:
+        bot.send_message(message.chat.id, "❌ Ошибка: Номер сервиса должен быть положительным числом.")
+        return
+
+    cfg = load_config()
+    if str(srv_num) in cfg["services"]:
+        bot.send_message(message.chat.id, f"❌ Сервис #{srv_num} уже существует.")
+        return
+
+    cfg["services"][str(srv_num)] = {
+        "api_url": "https://example.com/api/v2",
+        "api_key": "YOUR_API_KEY"
+    }
+    save_config(cfg)
+    kb_ = InlineKeyboardMarkup()
+    kb_.add(InlineKeyboardButton("🔙 К настройкам API", callback_data="api_settings"))
+    bot.send_message(message.chat.id, f"✅ Сервис #{srv_num} добавлен. Настройте его URL и ключ.", reply_markup=kb_)
+
+def process_delete_service(message: types.Message):
+    if False:  # activation disabled
+        bot.send_message(message.chat.id, f"❌  ")
+        return
+    try:
+        srv_num = int(message.text.strip())
+    except ValueError:
+        bot.send_message(message.chat.id, "❌ Ошибка: Номер сервиса должен быть числом.")
+        return
+
+    cfg = load_config()
+    if str(srv_num) not in cfg["services"]:
+        bot.send_message(message.chat.id, f"❌ Сервис #{srv_num} не существует.")
+        return
+
+    del cfg["services"][str(srv_num)]
+    save_config(cfg)
+    kb_ = InlineKeyboardMarkup()
+    kb_.add(InlineKeyboardButton("🔙 К настройкам API", callback_data="api_settings"))
+    bot.send_message(message.chat.id, f"✅ Сервис #{srv_num} удален.", reply_markup=kb_)
+
+def set_notification_chat_id(call: types.CallbackQuery):
+    if False:  # activation disabled
+        bot.edit_message_text(f"❌  ", 
+                              call.message.chat.id, call.message.message_id)
+        return
+    msg_ = bot.edit_message_text(f"Введите Chat ID для уведомлений (например, -1001234567890 для группы или ваш ID, ваш id: {call.message.chat.id}):", 
+                                call.message.chat.id, call.message.message_id)
+    bot.register_next_step_handler(msg_, process_notification_chat_id)
+
+def process_notification_chat_id(message: types.Message):
+    if False:  # activation disabled
+        bot.send_message(message.chat.id, f"❌  ")
+        return
+    try:
+        new_chat_id = int(message.text.strip())
         cfg = load_config()
-        cfg["messages"]["after_payment"] = new_text
-        save_config(cfg)
-        kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton("🔙 Назад", callback_data="return_to_settings"))
-        bot.send_message(message.chat.id, "Текст после оплаты обновлен.", reply_markup=kb)
-
-    def process_message_confirmation_change(message: types.Message):
-        if False:  # activation disabled
-            bot.send_message(message.chat.id, f"❌  ")
-            return
-        new_text = message.text.strip()
-        cfg = load_config()
-        cfg["messages"]["after_confirmation"] = new_text
-        save_config(cfg)
-        kb = InlineKeyboardMarkup()
-        kb.add(InlineKeyboardButton("🔙 Назад", callback_data="return_to_settings"))
-        bot.send_message(message.chat.id, "Текст после подтверждения обновлен.", reply_markup=kb)
-
-    @bot.callback_query_handler(func=lambda call: call.data == "add_service")
-    def add_service(call: types.CallbackQuery):
-        if False:  # activation disabled
-            bot.edit_message_text(f"❌  ", 
-                                  call.message.chat.id, call.message.message_id)
-            return
-        msg_ = bot.edit_message_text("Введите номер нового сервиса (число):", call.message.chat.id, call.message.message_id)
-        bot.register_next_step_handler(msg_, process_add_service)
-
-    @bot.callback_query_handler(func=lambda call: call.data == "delete_service")
-    def delete_service(call: types.CallbackQuery):
-        if False:  # activation disabled
-            bot.edit_message_text(f"❌  ", 
-                                  call.message.chat.id, call.message.message_id)
-            return
-        msg_ = bot.edit_message_text("Введите номер сервиса для удаления:", call.message.chat.id, call.message.message_id)
-        bot.register_next_step_handler(msg_, process_delete_service)
-
-    def process_add_service(message: types.Message):
-        if False:  # activation disabled
-            bot.send_message(message.chat.id, f"❌  ")
-            return
-        try:
-            srv_num = int(message.text.strip())
-            if srv_num < 1:
-                raise ValueError
-        except ValueError:
-            bot.send_message(message.chat.id, "❌ Ошибка: Номер сервиса должен быть положительным числом.")
-            return
-
-        cfg = load_config()
-        if str(srv_num) in cfg["services"]:
-            bot.send_message(message.chat.id, f"❌ Сервис #{srv_num} уже существует.")
-            return
-
-        cfg["services"][str(srv_num)] = {
-            "api_url": "https://example.com/api/v2",
-            "api_key": "YOUR_API_KEY"
-        }
+        cfg["notification_chat_id"] = new_chat_id
         save_config(cfg)
         kb_ = InlineKeyboardMarkup()
-        kb_.add(InlineKeyboardButton("🔙 К настройкам API", callback_data="api_settings"))
-        bot.send_message(message.chat.id, f"✅ Сервис #{srv_num} добавлен. Настройте его URL и ключ.", reply_markup=kb_)
+        kb_.add(InlineKeyboardButton("🔙 К настройкам", callback_data="return_to_settings"))
+        bot.send_message(message.chat.id, f"✅ Chat ID для уведомлений установлен: {new_chat_id}", reply_markup=kb_)
+    except ValueError:
+        bot.send_message(message.chat.id, "❌ Ошибка: Введите корректный Chat ID (целое число).")
 
-    def process_delete_service(message: types.Message):
-        if False:  # activation disabled
-            bot.send_message(message.chat.id, f"❌  ")
-            return
-        try:
-            srv_num = int(message.text.strip())
-        except ValueError:
-            bot.send_message(message.chat.id, "❌ Ошибка: Номер сервиса должен быть числом.")
-            return
+def files_menu_callback(call: types.CallbackQuery):
+    files_menu(call)
 
-        cfg = load_config()
-        if str(srv_num) not in cfg["services"]:
-            bot.send_message(message.chat.id, f"❌ Сервис #{srv_num} не существует.")
-            return
+def misc_settings_callback(call: types.CallbackQuery):
+    misc_settings(call)
 
-        del cfg["services"][str(srv_num)]
-        save_config(cfg)
-        kb_ = InlineKeyboardMarkup()
-        kb_.add(InlineKeyboardButton("🔙 К настройкам API", callback_data="api_settings"))
-        bot.send_message(message.chat.id, f"✅ Сервис #{srv_num} удален.", reply_markup=kb_)
+def links_menu_callback(call: types.CallbackQuery):
+    links_menu(call)
 
-    @bot.callback_query_handler(func=lambda call: call.data == "set_notification_chat_id")
-    def set_notification_chat_id(call: types.CallbackQuery):
-        if False:  # activation disabled
-            bot.edit_message_text(f"❌  ", 
-                                  call.message.chat.id, call.message.message_id)
-            return
-        msg_ = bot.edit_message_text(f"Введите Chat ID для уведомлений (например, -1001234567890 для группы или ваш ID, ваш id: {call.message.chat.id}):", 
-                                    call.message.chat.id, call.message.message_id)
-        bot.register_next_step_handler(msg_, process_notification_chat_id)
-
-    def process_notification_chat_id(message: types.Message):
-        if False:  # activation disabled
-            bot.send_message(message.chat.id, f"❌  ")
-            return
-        try:
-            new_chat_id = int(message.text.strip())
-            cfg = load_config()
-            cfg["notification_chat_id"] = new_chat_id
-            save_config(cfg)
-            kb_ = InlineKeyboardMarkup()
-            kb_.add(InlineKeyboardButton("🔙 К настройкам", callback_data="return_to_settings"))
-            bot.send_message(message.chat.id, f"✅ Chat ID для уведомлений установлен: {new_chat_id}", reply_markup=kb_)
-        except ValueError:
-            bot.send_message(message.chat.id, "❌ Ошибка: Введите корректный Chat ID (целое число).")
-
-    @bot.callback_query_handler(func=lambda call: call.data == "files_menu")
-    def files_menu_callback(call: types.CallbackQuery):
-        files_menu(call)
-
-    @bot.callback_query_handler(func=lambda call: call.data == "misc_settings")
-    def misc_settings_callback(call: types.CallbackQuery):
-        misc_settings(call)
-
-    @bot.callback_query_handler(func=lambda call: call.data == "links_menu")
-    def links_menu_callback(call: types.CallbackQuery):
-        links_menu(call)
-
-    c_.telegram.msg_handler(start_smm, commands=["start_smm"])
-    c_.telegram.msg_handler(stop_smm, commands=["stop_smm"])
-    c_.telegram.msg_handler(auto_smm_settings, commands=["auto_smm_settings"])
-    c_.telegram.msg_handler(auto_smm_delete, commands=["auto_smm_delete"])
 
 BIND_TO_PRE_INIT = [init_commands]
 BIND_TO_NEW_MESSAGE = [auto_smm_handler]
@@ -2446,7 +2430,7 @@ def start_order_checking_if_needed(c: Cardinal):
     if RUNNING:  
         start_order_checking(c)
 
-def send_order_started_notification(c: Cardinal, order_id_funpay: str, twiboost_id: int, link: str, api_url: str, api_key: str, lot_price: float, real_amount: int):
+def send_order_started_notification(c: Cardinal, order_id_funpay: str, twiboost_id: int, link: str, api_url: str, api_key: str, lot_price: float, real_amount: int, service_number: Optional[int] = None):
     """
     Отправляет уведомление о начале заказа с информацией о чистой прибыли
     """
@@ -2457,6 +2441,14 @@ def send_order_started_notification(c: Cardinal, order_id_funpay: str, twiboost_
         return
         
     try:
+        if service_number is not None:
+            invalid_key_payload = _validate_api_key_for_action(service_number, "status", api_key)
+            if invalid_key_payload:
+                logger.warning(
+                    f"{LOGGER_PREFIX} Пропускаю action=status для уведомления о старте заказа #{order_id_funpay}: {invalid_key_payload['detail']}"
+                )
+                return
+
         status_url = f"{api_url}?action=status&order={twiboost_id}&key={api_key}"
         status_resp = requests.get(status_url, timeout=10)
         status_resp.raise_for_status()
@@ -2469,7 +2461,7 @@ def send_order_started_notification(c: Cardinal, order_id_funpay: str, twiboost_
 
         # Сохраняем фактические траты/прибыль в файлы статистики
         try:
-            update_order_charge_and_net(order_id, charge, net_profit)
+            analytics.update_order_charge_and_net(order_id_funpay, charge, currency=currency, net_profit=net_profit)
         except Exception:
             pass
 
@@ -2500,9 +2492,354 @@ def send_order_started_notification(c: Cardinal, order_id_funpay: str, twiboost_
     except Exception as ex:
         logger.error(f"Ошибка при отправке уведомления о начале заказа: {ex}")
 
+
+
+def _normalize_api_key(api_key: Any) -> str:
+    return str(api_key or "").strip()
+
+
+def _build_invalid_api_key_payload(service_number: int, action: str, api_key: Any) -> Dict:
+    key_len = len(_normalize_api_key(api_key))
+    detail = (
+        f"Некорректная длина API-ключа для service_number={service_number} перед action={action}: "
+        f"{key_len} символов (ожидается {EXPECTED_API_KEY_LENGTH})."
+    )
+    logger.warning(f"{LOGGER_PREFIX} {detail}")
+    return {
+        "error": "invalid_api_key",
+        "detail": detail,
+        "expected_length": EXPECTED_API_KEY_LENGTH,
+        "actual_length": key_len,
+    }
+
+
+def _validate_api_key_for_action(service_number: int, action: str, api_key: Any) -> Optional[Dict]:
+    if len(_normalize_api_key(api_key)) == EXPECTED_API_KEY_LENGTH:
+        return None
+    return _build_invalid_api_key_payload(service_number, action, api_key)
+
+
+def send_order_to_service(
+    c: Cardinal,
+    service_number: int,
+    service_id: int,
+    link: str,
+    quantity: int,
+    api_timeout: int = 20
+) -> Tuple[bool, int | None, Dict]:
+    """
+    Отправляет заказ в выбранный SMM-сервис.
+
+    Возвращает:
+    - ok: bool
+    - twiboost_order_id: int | None
+    - payload: dict (сырой ответ API или данные об ошибке)
+    """
+    cfg = load_config()
+    service_cfg = cfg["services"].get(str(service_number))
+    if not service_cfg:
+        return False, None, {"error": "config", "detail": f"Нет настроек для service_number={service_number}"}
+
+    api_url = service_cfg["api_url"]
+    api_key = service_cfg["api_key"]
+
+    invalid_key_payload = _validate_api_key_for_action(service_number, "add", api_key)
+    if invalid_key_payload:
+        return False, None, invalid_key_payload
+
+    encoded_link = quote(link, safe="")
+    url_req = f"{api_url}?action=add&service={service_id}&link={encoded_link}&quantity={quantity}&key={api_key}"
+
+    try:
+        resp_ = requests.get(url_req, timeout=api_timeout)
+        try:
+            j_ = resp_.json()
+        except Exception:
+            j_ = {"raw_text": resp_.text}
+
+        if resp_.status_code == 429:
+            return False, None, {"error": "429", "detail": "Too Many Requests", "response": j_}
+
+        resp_.raise_for_status()
+
+        if isinstance(j_, dict) and "order" in j_:
+            try:
+                return True, int(j_["order"]), j_
+            except Exception:
+                return False, None, {"error": "bad_order_id", "detail": f"Не удалось распарсить order из ответа: {j_}", "response": j_}
+
+        return False, None, {"error": "no_order", "detail": f"Нет 'order' в ответе API: {j_}", "response": j_}
+
+    except requests.exceptions.Timeout as ex:
+        return False, None, {"error": "timeout", "detail": str(ex)}
+    except requests.exceptions.ConnectionError as ex:
+        return False, None, {"error": "network_error", "detail": str(ex)}
+    except requests.exceptions.RequestException as ex:
+        return False, None, {"error": "network_error", "detail": str(ex)}
+    except Exception as ex:
+        return False, None, {"error": "unknown", "detail": str(ex)}
+
+
+def _safe_int(value: Any) -> Optional[int]:
+    try:
+        if value is None or value == "":
+            return None
+        if isinstance(value, bool):
+            return None
+        return int(float(value))
+    except Exception:
+        return None
+
+
+def _normalize_url(value: Any) -> str:
+    return str(value or "").strip().rstrip("/")
+
+
+def _extract_order_id_from_obj(obj: Any) -> Optional[int]:
+    if isinstance(obj, dict):
+        for key in ("order", "id", "order_id"):
+            order_id = _safe_int(obj.get(key))
+            if order_id is not None:
+                return order_id
+    return None
+
+
+def _iter_dicts(payload: Any):
+    if isinstance(payload, dict):
+        yield payload
+        for value in payload.values():
+            yield from _iter_dicts(value)
+    elif isinstance(payload, list):
+        for item in payload:
+            yield from _iter_dicts(item)
+
+
+def _get_lot_fallback_targets(cfg: Dict, service_id: int, service_number: int) -> Tuple[Optional[int], Optional[int]]:
+    lot_mapping_local = cfg.get("lot_mapping", {})
+    for _, lot_data in lot_mapping_local.items():
+        if lot_data.get("service_id") == service_id and lot_data.get("service_number") == service_number:
+            return lot_data.get("fallback_service_id"), lot_data.get("fallback_service_number")
+    return None, None
+
+
+def _detect_fallback_reason(err: str, payload: Dict) -> str:
+    err_l = str(err or "").lower()
+    detail_l = str(payload.get("detail", "") or "").lower()
+    response_l = str(payload.get("response", "") or "").lower()
+    haystack = f"{err_l} {detail_l} {response_l}"
+
+    if err_l == "timeout":
+        return "timeout"
+    if err_l == "network_error":
+        return "network_error"
+    if err_l == "invalid_api_key":
+        return "invalid_api_key"
+    if "balance" in haystack or "insufficient funds" in haystack or "not enough funds" in haystack or "no balance" in haystack:
+        return "no_balance"
+    return "api_error"
+
+
+def _finalize_created_order(
+    c: Cardinal,
+    cfg: Dict,
+    buyer_chat_id: int,
+    order_id_funpay: str,
+    twiboost_id: int,
+    link_: str,
+    real_amount: int,
+    service_number: int,
+    lot_price: float,
+    fallback_used: bool = False,
+    fallback_reason: Optional[str] = None,
+):
+    chistota = float(lot_price)
+
+    orders.upsert_order_data(
+        buyer_chat_id,
+        order_id_funpay,
+        twiboost_id,
+        "pending",
+        chistota,
+        link_,
+        real_amount,
+        service_number,
+        fallback_used=fallback_used,
+        fallback_reason=fallback_reason,
+    )
+
+    service_cfg = cfg["services"].get(str(service_number))
+    if not service_cfg:
+        raise ValueError(f"Не найден config.services[{service_number}]")
+
+    api_url = service_cfg["api_url"]
+    api_key = service_cfg["api_key"]
+
+    send_order_started_notification(
+        c,
+        order_id_funpay,
+        twiboost_id,
+        link_,
+        api_url,
+        api_key,
+        lot_price,
+        real_amount,
+        service_number=service_number,
+    )
+
+    check_order_status(c, twiboost_id, buyer_chat_id, link_, order_id_funpay)
+
+    try:
+        msg_confirmation = cfg["messages"]["after_confirmation"].format(
+            twiboost_id=twiboost_id,
+            link=link_,
+        )
+    except Exception:
+        msg_confirmation = f"🎉 Заказ успешно оформлен!\n\n🔢 ID заказа в сервисе: {twiboost_id}\n🔗 {link_}"
+
+    c.send_message(buyer_chat_id, msg_confirmation)
+    waiting_for_link.pop(str(order_id_funpay), None)
+
+
+def _probe_order_after_uncertain_error(
+    service_number: int,
+    service_id: int,
+    link: str,
+    quantity: int,
+    delay_seconds: int = 3,
+) -> Tuple[str, Optional[int], Dict]:
+    time.sleep(delay_seconds)
+
+    cfg = load_config()
+    service_cfg = cfg["services"].get(str(service_number))
+    if not service_cfg:
+        return "unknown", None, {"error": "config", "detail": f"Нет настроек для service_number={service_number}"}
+
+    api_url = service_cfg["api_url"]
+    api_key = service_cfg["api_key"]
+
+    invalid_key_payload = _validate_api_key_for_action(service_number, "orders", api_key)
+    if invalid_key_payload:
+        return "invalid_api_key", None, invalid_key_payload
+
+    normalized_link = _normalize_url(link)
+    lookup_urls = [
+        f"{api_url}?action=orders&key={api_key}",
+        f"{api_url}?action=orders&limit=100&key={api_key}",
+    ]
+
+    had_successful_lookup = False
+    lookup_errors: List[str] = []
+
+    for lookup_url in lookup_urls:
+        try:
+            response = requests.get(lookup_url, timeout=15)
+            if response.status_code != 200:
+                lookup_errors.append(f"{lookup_url} -> HTTP {response.status_code}")
+                continue
+
+            try:
+                payload = response.json()
+            except Exception:
+                payload = {"raw_text": response.text}
+
+            had_successful_lookup = True
+            candidates: List[Tuple[int, int, Dict]] = []
+            for item in _iter_dicts(payload):
+                order_id = _extract_order_id_from_obj(item)
+                if order_id is None:
+                    continue
+
+                service_match = False
+                for key in ("service", "service_id", "serviceid"):
+                    item_service = _safe_int(item.get(key))
+                    if item_service is not None and item_service == int(service_id):
+                        service_match = True
+                        break
+
+                link_match = False
+                for key in ("link", "url", "target", "customer_url", "username"):
+                    if key in item and _normalize_url(item.get(key)) == normalized_link:
+                        link_match = True
+                        break
+
+                qty_match = False
+                for key in ("quantity", "qty", "count", "amount"):
+                    item_qty = _safe_int(item.get(key))
+                    if item_qty is not None and item_qty == int(quantity):
+                        qty_match = True
+                        break
+
+                score = int(service_match) + int(link_match) + int(qty_match)
+                if score >= 2:
+                    candidates.append((score, order_id, item))
+
+            if candidates:
+                candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+                _, found_order_id, found_item = candidates[0]
+                return "found", found_order_id, {"source": "orders_lookup", "entry": found_item}
+        except requests.exceptions.RequestException as ex:
+            lookup_errors.append(str(ex))
+        except Exception as ex:
+            lookup_errors.append(str(ex))
+
+    if had_successful_lookup:
+        return "not_found", None, {"source": "orders_lookup", "detail": "Заказ не найден в recent orders."}
+
+    return "unknown", None, {"error": "lookup_unavailable", "detail": "; ".join(lookup_errors) or "Не удалось выполнить проверку recent orders."}
+
+
+def _probe_order_after_uncertain_error_with_retries(
+    service_number: int,
+    service_id: int,
+    link: str,
+    quantity: int,
+    initial_delay_seconds: int = 3,
+    retry_delay_seconds: int = 4,
+    retry_attempts_for_unknown: int = 2,
+) -> Tuple[str, Optional[int], Dict]:
+    """
+    Сначала делает базовый lookup после timeout/network_error.
+    Если состояние unknown, повторяет lookup ещё retry_attempts_for_unknown раз.
+
+    Итого по умолчанию:
+    - 1 первичная проверка после ~3 сек
+    - 2 повторных lookup при unknown с паузой ~4 сек
+    """
+    last_payload: Dict = {}
+    state, order_id, payload = _probe_order_after_uncertain_error(
+        service_number=service_number,
+        service_id=service_id,
+        link=link,
+        quantity=quantity,
+        delay_seconds=initial_delay_seconds,
+    )
+    last_payload = payload
+
+    if state in ("found", "not_found", "invalid_api_key"):
+        return state, order_id, payload
+
+    for retry_no in range(1, retry_attempts_for_unknown + 1):
+        logger.warning(
+            f"Lookup recent orders для service #{service_number} вернул unknown. Повторная попытка {retry_no}/{retry_attempts_for_unknown} через {retry_delay_seconds} сек."
+        )
+        state, order_id, payload = _probe_order_after_uncertain_error(
+            service_number=service_number,
+            service_id=service_id,
+            link=link,
+            quantity=quantity,
+            delay_seconds=retry_delay_seconds,
+        )
+        last_payload = payload
+        if state != "unknown":
+            return state, order_id, payload
+
+    return "unknown", None, last_payload
+
+
 def process_link_without_confirmation(c: Cardinal, data: Dict):
     """
     Обрабатывает ссылку без подтверждения или после получения подтверждения.
+    С поддержкой fallback-логики и защитой от двойных заказов после timeout/network_error.
     """
     link_ = data["link"]
     service_id = data["service_id"]
@@ -2511,96 +2848,192 @@ def process_link_without_confirmation(c: Cardinal, data: Dict):
     buyer_chat_id = data["chat_id"]
     service_number = data["service_number"]
     lot_price = data["price"]
-    
+
     cfg = load_config()
-    service_cfg = cfg["services"].get(str(service_number))
-    if not service_cfg:
-        logger.error(f"Нет настроек для service_number={service_number}")
-        c.send_message(buyer_chat_id, f"❌ Ошибка: нет настроек для service_number={service_number}.")
-        refund_order(c, order_id_funpay, buyer_chat_id, 
-                    reason="Ошибка конфигурации.",
-                    detailed_reason=f"Нет настроек для service_number={service_number}.")
+    existing_order = orders.get_order_data(order_id_funpay)
+
+    ok, twiboost_id, payload = send_order_to_service(
+        c=c,
+        service_number=service_number,
+        service_id=service_id,
+        link=link_,
+        quantity=real_amount,
+    )
+
+    if ok and twiboost_id is not None:
+        _finalize_created_order(
+            c=c,
+            cfg=cfg,
+            buyer_chat_id=buyer_chat_id,
+            order_id_funpay=order_id_funpay,
+            twiboost_id=twiboost_id,
+            link_=link_,
+            real_amount=real_amount,
+            service_number=service_number,
+            lot_price=lot_price,
+            fallback_used=bool(existing_order.get("fallback_used", False)) if existing_order else False,
+            fallback_reason=existing_order.get("fallback_reason") if existing_order else None,
+        )
         return
-    api_url = service_cfg["api_url"]
-    api_key = service_cfg["api_key"]
-    encoded_link = quote(link_, safe="")
-    url_req = f"{api_url}?action=add&service={service_id}&link={encoded_link}&quantity={real_amount}&key={api_key}"
 
-    try:
-        resp_ = requests.get(url_req)
-        resp_.raise_for_status()
-        j_ = resp_.json()
-        if "order" in j_:
-            twiboost_id = j_["order"]
-            chistota = float(lot_price)
-            
-            save_order_data(
-                buyer_chat_id,
-                order_id_funpay,
-                twiboost_id,
-                "pending",
-                chistota,
-                link_,
-                real_amount,
-                service_number
-            )
-            
-            send_order_started_notification(
-                c, 
-                order_id_funpay, 
-                twiboost_id, 
-                link_, 
-                api_url, 
-                api_key, 
-                lot_price, 
-                real_amount
-            )
-            
-            check_order_status(c, twiboost_id, buyer_chat_id, link_, order_id_funpay)
+    err = payload.get("error", "unknown")
+    detail = payload.get("detail", str(payload))
+    fallback_reason = _detect_fallback_reason(err, payload)
 
-            msg_confirmation = cfg["messages"]["after_confirmation"].format(
-                twiboost_id=twiboost_id,
-                link=link_
+    if err == "invalid_api_key":
+        logger.warning(
+            f"Primary add для заказа #{order_id_funpay} заблокирован из-за invalid_api_key. Перехожу к fallback без retry lookup."
+        )
+
+    if err in ("timeout", "network_error"):
+        logger.warning(
+            f"Неопределённый результат primary add для заказа #{order_id_funpay}: {err}. Жду 3 сек и проверяю recent orders..."
+        )
+        probe_state, probed_order_id, probe_payload = _probe_order_after_uncertain_error_with_retries(
+            service_number=service_number,
+            service_id=service_id,
+            link=link_,
+            quantity=real_amount,
+            initial_delay_seconds=3,
+            retry_delay_seconds=4,
+            retry_attempts_for_unknown=2,
+        )
+
+        if probe_state == "found" and probed_order_id is not None:
+            logger.warning(
+                f"Заказ #{order_id_funpay} найден на primary после {err}. Fallback отменён, продолжаю мониторинг #{probed_order_id}."
             )
-            c.send_message(buyer_chat_id, msg_confirmation)
-            waiting_for_link.pop(str(order_id_funpay), None)
-        else:
-            logger.error(f"Нет 'order' в ответе: {j_}")
+            _finalize_created_order(
+                c=c,
+                cfg=cfg,
+                buyer_chat_id=buyer_chat_id,
+                order_id_funpay=order_id_funpay,
+                twiboost_id=probed_order_id,
+                link_=link_,
+                real_amount=real_amount,
+                service_number=service_number,
+                lot_price=lot_price,
+                fallback_used=False,
+                fallback_reason=None,
+            )
+            return
+
+        if probe_state == "invalid_api_key":
+            logger.warning(
+                f"Lookup recent orders для заказа #{order_id_funpay} остановлен из-за invalid_api_key. Перехожу к fallback без дополнительных retry."
+            )
+        elif probe_state == "unknown":
+            logger.error(
+                f"Не удалось подтвердить существование заказа #{order_id_funpay} после {err} даже после retry lookup. Fallback заблокирован: {probe_payload}"
+            )
             refund_order(
                 c,
                 order_id_funpay,
                 buyer_chat_id,
                 reason="Ошибка при создании заказа.",
-                detailed_reason=f"Ошибка при создании заказа: нет 'order' в ответе API. Ответ: {j_}"
+                detailed_reason=(
+                    f"Primary вернул {err}. Проверка существования заказа осталась в состоянии unknown даже после повторных lookup, "
+                    f"поэтому fallback не запущен во избежание двойного заказа. "
+                    f"Детали: {probe_payload.get('detail', probe_payload)}"
+                ),
             )
+            return
 
-    except requests.exceptions.RequestException as req_ex:
-        logger.error(f"Ошибка сети при создании заказа #{order_id_funpay}: {req_ex}")
+        logger.warning(
+            f"Заказ #{order_id_funpay} не найден на primary после {err}. Разрешаю fallback по ТЗ."
+        )
+
+    fallback_enabled = cfg.get("fallback_enabled", False)
+    if not fallback_enabled:
+        logger.error(f"Fallback отключён. Выполняю refund для заказа #{order_id_funpay}. Причина: {err} | {detail}")
         refund_order(
             c,
             order_id_funpay,
             buyer_chat_id,
-            reason="Сетевая ошибка.",
-            detailed_reason=f"Сетевая ошибка при создании заказа: {req_ex}"
+            reason="Ошибка при создании заказа.",
+            detailed_reason=f"Fallback отключён. Primary ошибка: {err} | {detail}",
         )
-    except ValueError as val_ex:
-        logger.error(f"ValueError при обработке ответа заказа #{order_id_funpay}: {val_ex}")
+        return
+
+    existing_order = orders.get_order_data(order_id_funpay)
+    if existing_order and existing_order.get("fallback_used", False):
+        logger.error(f"Повторный fallback для заказа #{order_id_funpay} запрещён (fallback_used=True).")
         refund_order(
             c,
             order_id_funpay,
             buyer_chat_id,
-            reason="Неверный формат данных.",
-            detailed_reason=f"Неверный формат данных от API: {val_ex}"
+            reason="Ошибка при создании заказа.",
+            detailed_reason=f"Повторный fallback запрещён. Primary ошибка: {err} | {detail}",
         )
-    except Exception as ex:
-        logger.error(f"Неизвестная ошибка при создании заказа #{order_id_funpay}: {ex}")
+        return
+
+    fallback_service_id, fallback_service_number = _get_lot_fallback_targets(cfg, service_id, service_number)
+    if not fallback_service_id or not fallback_service_number:
+        logger.error(f"Fallback не настроен для service_id={service_id}, service_number={service_number}.")
         refund_order(
             c,
             order_id_funpay,
             buyer_chat_id,
-            reason="Неизвестная ошибка.",
-            detailed_reason=f"Неизвестная ошибка при создании заказа: {ex}"
+            reason="Ошибка при создании заказа.",
+            detailed_reason=f"Fallback не настроен. Primary ошибка: {err} | {detail}",
         )
+        return
+
+    if int(fallback_service_number) == int(service_number):
+        logger.error(
+            f"Fallback для заказа #{order_id_funpay} запрещён: primary_service_number == fallback_service_number == {service_number}."
+        )
+        refund_order(
+            c,
+            order_id_funpay,
+            buyer_chat_id,
+            reason="Ошибка при создании заказа.",
+            detailed_reason=(
+                f"Fallback заблокирован: primary и fallback указывают на один и тот же сервис #{service_number}."
+            ),
+        )
+        return
+
+    logger.warning(
+        f"Primary попытка для заказа #{order_id_funpay} провалена ({err}). Запускаю fallback: service #{fallback_service_number}, id {fallback_service_id}."
+    )
+    ok2, twiboost_id2, payload2 = send_order_to_service(
+        c=c,
+        service_number=fallback_service_number,
+        service_id=fallback_service_id,
+        link=link_,
+        quantity=real_amount,
+    )
+
+    if ok2 and twiboost_id2 is not None:
+        _finalize_created_order(
+            c=c,
+            cfg=cfg,
+            buyer_chat_id=buyer_chat_id,
+            order_id_funpay=order_id_funpay,
+            twiboost_id=twiboost_id2,
+            link_=link_,
+            real_amount=real_amount,
+            service_number=fallback_service_number,
+            lot_price=lot_price,
+            fallback_used=True,
+            fallback_reason=fallback_reason,
+        )
+        return
+
+    err2 = payload2.get("error", "unknown")
+    detail2 = payload2.get("detail", str(payload2))
+    logger.error(f"Fallback попытка тоже провалена ({err2}) | {detail2}")
+
+    refund_order(
+        c,
+        order_id_funpay,
+        buyer_chat_id,
+        reason="Ошибка при создании заказа.",
+        detailed_reason=(
+            f"Primary ошибка: {err} | {detail}. Fallback ошибка: {err2} | {detail2}."
+        ),
+    )
 
 def start_auto_lots_sender(c: Cardinal):
     """
