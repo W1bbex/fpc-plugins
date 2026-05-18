@@ -33,7 +33,7 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 # =========================================================
 
 NAME = "AutoSMM"
-VERSION = "0.0.6"
+VERSION = "0.0.7.1"
 DESCRIPTION = "Плагин для автоматической накрутки через 2+ сервис"
 CREDITS = "@w1bbex"
 UUID = "a6ccb3f1-3e7b-4984-9e4c-01d3ea7e0ad8"
@@ -102,9 +102,11 @@ VALID_LINKS_PATH = os.path.join("storage", "cache", "valid_link.json")
 ORDERS_PATH = os.path.join("storage", "cache", "auto_smm_orders.json")
 ORDERS_DATA_PATH = os.path.join("storage", "cache", "orders_data.json")
 ORDERS_RUNTIME_PATH = os.path.join("storage", "cache", "orders_runtime.json")
+AUTOSMM_STATE_PATH = os.path.join("storage", "cache", "auto_smm_state.json")
 os.makedirs(os.path.dirname(ORDERS_PATH), exist_ok=True)
 os.makedirs(os.path.dirname(ORDERS_DATA_PATH), exist_ok=True)
 os.makedirs(os.path.dirname(ORDERS_RUNTIME_PATH), exist_ok=True)
+os.makedirs(os.path.dirname(AUTOSMM_STATE_PATH), exist_ok=True)
 
 PLUGIN_FILE_PATH = Path(__file__).resolve()
 PLUGIN_DIR = PLUGIN_FILE_PATH.parent
@@ -118,9 +120,42 @@ REFUND_SYNC_PATTERNS = [
     re.compile(r"возврат.*?по\s+заказу\s+#?([A-Z0-9]+)", re.IGNORECASE | re.DOTALL),
     re.compile(r"returned\s+money.*?order\s+#?([A-Z0-9]+)", re.IGNORECASE | re.DOTALL),
 ]
+FUNPAY_STATUS_ALLOWED = {"open", "closed", "refunded", "partially_refunded"}
+FUNPAY_STATUS_SYNC_INTERVAL_SECONDS = 1800
+FUNPAY_STATUS_RECENT_CHECK_SECONDS = 1800
+FUNPAY_STATUS_RECOVERY_CLOSED_SECONDS = 43200
+FUNPAY_STATUS_RECOVERY_MAX_ORDERS = 120
+PANEL_BALANCE_CACHE_TTL_SECONDS = 120
+FUNPAY_LIVE_STATUS_PATTERNS = [
+    (
+        "partially_refunded",
+        [
+            re.compile(r"часть\s+средств.*?по\s+заказу\s+#?([A-Z0-9]+).*?возвращен[аоы]?\s+покупателю", re.IGNORECASE | re.DOTALL),
+            re.compile(r"partial\s+refund.*?order\s+#?([A-Z0-9]+)", re.IGNORECASE | re.DOTALL),
+        ],
+    ),
+    (
+        "refunded",
+        [
+            re.compile(r"вернул[аи]?\s+деньги.*?по\s+заказу\s+#?([A-Z0-9]+)", re.IGNORECASE | re.DOTALL),
+            re.compile(r"возврат.*?по\s+заказу\s+#?([A-Z0-9]+)", re.IGNORECASE | re.DOTALL),
+            re.compile(r"returned\s+money.*?order\s+#?([A-Z0-9]+)", re.IGNORECASE | re.DOTALL),
+        ],
+    ),
+    (
+        "closed",
+        [
+            re.compile(r"покупатель.*?подтвердил[аи]?\s+успешное\s+выполнение\s+заказа\s+#?([A-Z0-9]+)", re.IGNORECASE | re.DOTALL),
+            re.compile(r"администратор.*?подтвердил[аи]?\s+успешное\s+выполнение\s+заказа\s+#?([A-Z0-9]+)", re.IGNORECASE | re.DOTALL),
+            re.compile(r"buyer.*?confirmed.*?order\s+#?([A-Z0-9]+)", re.IGNORECASE | re.DOTALL),
+            re.compile(r"administrator.*?confirmed.*?order\s+#?([A-Z0-9]+)", re.IGNORECASE | re.DOTALL),
+        ],
+    ),
+]
 STATUS_BATCH_SIZE = 50
 STATUS_BATCH_INTERVAL_SECONDS = 300
 INCORRECT_ORDER_ID_MAX_ATTEMPTS = 3
+_PANEL_BALANCE_CACHE = {"timestamp": 0.0, "text": "недоступно"}
 
 # =========================================================
 # STORAGE
@@ -132,6 +167,11 @@ RUNTIME_FIELDS = {
     "incorrect_order_id_attempts",
     "status_stop_reason",
     "manual_check_alert_sent",
+    "funpay_status_checked_at",
+    "refund_detected_at",
+    "refund_source",
+    "panel_refund_cancel_attempted_at",
+    "panel_refund_cancel_result",
 }
 
 LEGACY_COMPLETED_NOTIFICATION_RUNTIME_FIELD = "completed_notification_sent"
@@ -493,7 +533,96 @@ def _safe_write_json(path: str, data) -> None:
 def _load_orders_data_raw() -> List[Dict]:
     data = _safe_load_json(ORDERS_DATA_PATH, [])
     raw_orders = data if isinstance(data, list) else []
-    return _migrate_legacy_completed_notification_flags(raw_orders)
+    raw_orders = _migrate_legacy_completed_notification_flags(raw_orders)
+    return _migrate_legacy_funpay_statuses(raw_orders)
+
+
+def _normalize_funpay_status(value: Any) -> Optional[str]:
+    raw_value = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    mapping = {
+        "": None,
+        "paid": "open",
+        "open": "open",
+        "opened": "open",
+        "closed": "closed",
+        "close": "closed",
+        "refunded": "refunded",
+        "refund": "refunded",
+        "partially_refunded": "partially_refunded",
+        "partial_refund": "partially_refunded",
+        "partial": "partially_refunded",
+        "partiallyrefund": "partially_refunded",
+    }
+    normalized = mapping.get(raw_value, raw_value if raw_value in FUNPAY_STATUS_ALLOWED else None)
+    return normalized if normalized in FUNPAY_STATUS_ALLOWED else None
+
+
+def _is_refunded_funpay_status(funpay_status: Any) -> bool:
+    return _normalize_funpay_status(funpay_status) in ("refunded", "partially_refunded")
+
+
+def _get_effective_funpay_status(order_record: Optional[Dict]) -> Optional[str]:
+    if not isinstance(order_record, dict):
+        return None
+    normalized = _normalize_funpay_status(order_record.get("funpay_status"))
+    if normalized:
+        return normalized
+    if bool(order_record.get("is_refunded", False)):
+        return "refunded"
+    return None
+
+
+def _is_order_refundedish(order_record: Optional[Dict]) -> bool:
+    return _is_refunded_funpay_status(_get_effective_funpay_status(order_record))
+
+
+def _migrate_legacy_funpay_statuses(raw_orders: List[Dict]) -> List[Dict]:
+    updated = False
+    runtime_data = load_orders_runtime()
+    if not isinstance(runtime_data, dict):
+        runtime_data = {}
+    runtime_updated = False
+
+    for order in raw_orders:
+        if not isinstance(order, dict):
+            continue
+
+        order_id = str(order.get("order_id") or "")
+        runtime_entry = dict(runtime_data.get(order_id, {})) if order_id else {}
+
+        current_status = _normalize_funpay_status(order.get("funpay_status"))
+        if current_status:
+            if order.get("funpay_status") != current_status:
+                order["funpay_status"] = current_status
+                updated = True
+        elif bool(order.get("is_refunded", False)):
+            order["funpay_status"] = "refunded"
+            current_status = "refunded"
+            updated = True
+
+        for field_name in ("refund_detected_at", "refund_source"):
+            field_value = order.pop(field_name, None)
+            if field_value not in (None, "") and runtime_entry.get(field_name) != field_value:
+                runtime_entry[field_name] = field_value
+                runtime_updated = True
+                updated = True
+
+        if "is_refunded" in order:
+            order.pop("is_refunded", None)
+            updated = True
+
+        if order_id:
+            if runtime_entry:
+                runtime_data[order_id] = runtime_entry
+            elif order_id in runtime_data:
+                runtime_data.pop(order_id, None)
+                runtime_updated = True
+
+    if updated:
+        _safe_write_json(ORDERS_DATA_PATH, raw_orders)
+    if runtime_updated:
+        save_orders_runtime(runtime_data)
+    return raw_orders
 
 
 def _migrate_legacy_completed_notification_flags(raw_orders: List[Dict]) -> List[Dict]:
@@ -564,6 +693,10 @@ def _strip_runtime_and_empty_fallback(order: Dict) -> Dict:
         if key in RUNTIME_FIELDS:
             clean.pop(key, None)
 
+    clean.pop("is_refunded", None)
+    clean.pop("refund_detected_at", None)
+    clean.pop("refund_source", None)
+
     fallback_used = clean.get("fallback_used")
     fallback_reason = clean.get("fallback_reason")
     if fallback_used is True:
@@ -620,7 +753,12 @@ def _build_order_record(
     fallback_used: bool = False,
     fallback_reason: str | None = None,
     created_at: int | None = None,
+    funpay_status: str | None = None,
 ) -> Dict:
+    normalized_funpay_status = _normalize_funpay_status(funpay_status)
+    if not normalized_funpay_status:
+        normalized_funpay_status = "refunded" if is_refunded else "open"
+
     record = {
         "chat_id": chat_id,
         "order_id": order_id,
@@ -630,7 +768,7 @@ def _build_order_record(
         "customer_url": customer_url,
         "quantity": quantity,
         "service_number": service_number,
-        "is_refunded": is_refunded,
+        "funpay_status": normalized_funpay_status,
         "spent": 0.0,
         "summa": float(chistota),
         "currency": "RUB",
@@ -659,6 +797,7 @@ def upsert_order_data(
     is_refunded: bool = False,
     fallback_used: bool = False,
     fallback_reason: str | None = None,
+    funpay_status: str | None = None,
 ):
     orders = _load_orders_data_raw()
     updated = False
@@ -670,6 +809,8 @@ def upsert_order_data(
             currency = order.get("currency", "RUB")
             summa = order.get("summa", float(chistota))
             completed_notification_sent = bool(order.get("completed_notification_sent", False))
+            current_funpay_status = _normalize_funpay_status(order.get("funpay_status"))
+            normalized_funpay_status = _normalize_funpay_status(funpay_status) or current_funpay_status or ("refunded" if is_refunded else "open")
             order.update(
                 {
                     "chat_id": chat_id,
@@ -679,7 +820,7 @@ def upsert_order_data(
                     "customer_url": customer_url,
                     "quantity": quantity,
                     "service_number": service_number,
-                    "is_refunded": is_refunded,
+                    "funpay_status": normalized_funpay_status,
                     "summa": float(summa),
                     "spent": float(spent or 0.0),
                     "currency": str(currency or "RUB"),
@@ -713,6 +854,7 @@ def upsert_order_data(
                 is_refunded=is_refunded,
                 fallback_used=fallback_used,
                 fallback_reason=fallback_reason,
+                funpay_status=funpay_status,
             )
         )
 
@@ -734,6 +876,7 @@ def save_order_data(
     quantity: int,
     service_number: int,
     is_refunded: bool = False,
+    funpay_status: str | None = None,
 ):
     upsert_order_data(
         chat_id=chat_id,
@@ -747,6 +890,7 @@ def save_order_data(
         is_refunded=is_refunded,
         fallback_used=False,
         fallback_reason=None,
+        funpay_status=funpay_status,
     )
 
 
@@ -763,10 +907,18 @@ def update_order_fields(order_id_funpay: str, **fields) -> bool:
         for key, value in business_fields.items():
             if key in ("fallback_used", "fallback_reason"):
                 continue
-            if value is None and key not in ("is_refunded",):
+            if key == "funpay_status":
+                value = _normalize_funpay_status(value)
+            if key in ("is_refunded",):
+                continue
+            if value is None:
                 order.pop(key, None)
             else:
                 order[key] = value
+
+        normalized_funpay_status = _normalize_funpay_status(order.get("funpay_status"))
+        if normalized_funpay_status:
+            order["funpay_status"] = normalized_funpay_status
 
         if "fallback_used" in business_fields or "fallback_reason" in business_fields:
             fallback_used = business_fields.get("fallback_used")
@@ -812,18 +964,22 @@ def mark_order_refunded(order_id_funpay: str, detected_at: str | None = None, so
     for order in orders:
         if str(order.get("order_id")) != str(order_id_funpay):
             continue
-        if bool(order.get("is_refunded", False)):
+        if _is_refunded_funpay_status(order.get("funpay_status")):
             return False
-        order["is_refunded"] = True
-        if detected_at not in (None, ""):
-            order["refund_detected_at"] = detected_at
-        if source not in (None, ""):
-            order["refund_source"] = source
+        order["funpay_status"] = "refunded"
         updated = True
         break
 
     if updated:
         save_orders_data(orders)
+        runtime_updates = {}
+        if detected_at not in (None, ""):
+            runtime_updates["refund_detected_at"] = detected_at
+        if source not in (None, ""):
+            runtime_updates["refund_source"] = source
+        if runtime_updates:
+            update_order_fields(order_id_funpay, **runtime_updates)
+        _attempt_panel_cancel_after_funpay_refund(orders.get_order_data(order_id_funpay), source=source or "refund_mark")
         return True
 
     logger.warning(f"Заказ #{order_id_funpay} не найден в orders_data.json.")
@@ -838,9 +994,9 @@ def update_order_status(order_id_funpay: str, new_status: str):
 def update_order_refunded_status(order_id_funpay: str):
     updated = mark_order_refunded(order_id_funpay)
     if updated:
-        logger.info(f"Статус заказа #{order_id_funpay} обновлён на 'is_refunded': True.")
+        logger.info(f"Статус заказа #{order_id_funpay} обновлён на 'funpay_status': refunded.")
     else:
-        logger.warning(f"Заказ #{order_id_funpay} не найден или уже отмечен как 'is_refunded'.")
+        logger.warning(f"Заказ #{order_id_funpay} не найден или уже отмечен как refunded.")
 
 
 orders = SimpleNamespace(
@@ -1496,6 +1652,272 @@ def _now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _parse_dt_or_none(value: Any) -> Optional[datetime]:
+    raw_value = str(value or "").strip()
+    if not raw_value:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f"):
+        try:
+            return datetime.strptime(raw_value, fmt)
+        except Exception:
+            continue
+    try:
+        return datetime.fromisoformat(raw_value)
+    except Exception:
+        return None
+
+
+def _seconds_since_checked_at(value: Any) -> Optional[float]:
+    dt_value = _parse_dt_or_none(value)
+    if not dt_value:
+        return None
+    return max(0.0, (datetime.now() - dt_value).total_seconds())
+
+
+def _extract_funpay_status_from_message(message_text: str) -> Tuple[Optional[str], Optional[str]]:
+    text_ = normalize_incoming_text(message_text)
+    if not text_:
+        return None, None
+
+    for funpay_status, patterns in FUNPAY_LIVE_STATUS_PATTERNS:
+        for pattern in patterns:
+            match = pattern.search(text_)
+            if match:
+                return funpay_status, match.group(1)
+    return None, None
+
+
+def _sync_funpay_status_from_message(message_text: str) -> bool:
+    funpay_status, order_id = _extract_funpay_status_from_message(message_text)
+    if not funpay_status or not order_id:
+        return False
+
+    order_data = orders.get_order_data(order_id)
+    if not order_data:
+        logger.info(f"FUNPAY STATUS LIVE: заказ #{order_id} не найден в orders_data.json (status={funpay_status})")
+        return True
+
+    previous_funpay_status = _get_effective_funpay_status(order_data)
+    update_fields: Dict[str, Any] = {
+        "funpay_status": funpay_status,
+        "funpay_status_checked_at": _now_str(),
+    }
+    if funpay_status in ("refunded", "partially_refunded"):
+        update_fields["refund_detected_at"] = _now_str()
+        update_fields["refund_source"] = "funpay_message"
+
+    orders.update_order_fields(order_id, **update_fields)
+    updated_order = orders.get_order_data(order_id) or order_data
+    if funpay_status == "refunded" and previous_funpay_status != "refunded":
+        _attempt_panel_cancel_after_funpay_refund(updated_order, source="funpay_live")
+    logger.info(f"FUNPAY STATUS LIVE: заказ #{order_id} обновлён до '{funpay_status}'")
+    return True
+
+
+def _map_cardinal_order_status_to_funpay_status(order_status: Any) -> Optional[str]:
+    order_statuses = getattr(enums, "OrderStatuses", None)
+    if order_statuses is not None:
+        status_mapping = {
+            getattr(order_statuses, "PAID", None): "open",
+            getattr(order_statuses, "CLOSED", None): "closed",
+            getattr(order_statuses, "REFUNDED", None): "refunded",
+            getattr(order_statuses, "PARTIALLY_REFUNDED", None): "partially_refunded",
+        }
+        for candidate, normalized in status_mapping.items():
+            if candidate is not None and order_status == candidate:
+                return normalized
+
+    raw_status = str(order_status or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if raw_status.endswith(".paid") or raw_status == "paid":
+        return "open"
+    if raw_status.endswith(".closed") or raw_status == "closed":
+        return "closed"
+    if raw_status.endswith(".refunded") or raw_status == "refunded":
+        return "refunded"
+    if "partially_refunded" in raw_status:
+        return "partially_refunded"
+    return None
+
+
+def _fetch_funpay_status_via_cardinal(c: Cardinal, order_id_funpay: str) -> Dict[str, Any]:
+    try:
+        order_data = c.account.get_order(order_id_funpay)
+        normalized_status = _map_cardinal_order_status_to_funpay_status(getattr(order_data, "status", None))
+        if not normalized_status:
+            return {
+                "ok": False,
+                "error": "unknown_funpay_status",
+                "detail": f"Не удалось сопоставить order.status для заказа #{order_id_funpay}",
+            }
+        return {"ok": True, "funpay_status": normalized_status}
+    except Exception as ex:
+        return {"ok": False, "error": "cardinal_error", "detail": str(ex)}
+
+
+def _attempt_panel_cancel_after_funpay_refund(order_record: Optional[Dict], source: str = "funpay_refund") -> bool:
+    if not isinstance(order_record, dict):
+        return False
+
+    order_id_funpay = str(order_record.get("order_id") or "")
+    if not order_id_funpay:
+        return False
+    if _get_effective_funpay_status(order_record) != "refunded":
+        return False
+    if order_record.get("panel_refund_cancel_attempted_at"):
+        return False
+
+    twiboost_order_id = order_record.get("id_zakaz")
+    service_number = order_record.get("service_number")
+    if not twiboost_order_id or service_number in (None, ""):
+        logger.info(
+            f"PANEL CANCEL SKIPPED: order=#{order_id_funpay}, source={source}, reason=missing_order_or_service"
+        )
+        return False
+
+    cfg = load_config()
+    service_cfg = (cfg.get("services") or {}).get(str(service_number))
+    if not isinstance(service_cfg, dict):
+        logger.info(
+            f"PANEL CANCEL SKIPPED: order=#{order_id_funpay}, source={source}, reason=service_not_found, service=#{service_number}"
+        )
+        return False
+
+    api_url = str(service_cfg.get("api_url") or "").strip()
+    api_key = str(service_cfg.get("api_key") or "").strip()
+    if not api_url or not api_key:
+        logger.info(
+            f"PANEL CANCEL SKIPPED: order=#{order_id_funpay}, source={source}, reason=service_credentials_missing, service=#{service_number}"
+        )
+        return False
+
+    attempted_at = _now_str()
+    orders.update_order_fields(order_id_funpay, panel_refund_cancel_attempted_at=attempted_at)
+
+    try:
+        response = requests.get(
+            api_url,
+            params={"action": "cancel", "order": twiboost_order_id, "key": api_key},
+            timeout=10,
+        )
+        response_text = (response.text or "").strip()
+        if len(response_text) > 300:
+            response_text = response_text[:300] + "…"
+        try:
+            payload = response.json()
+        except Exception:
+            payload = response_text or f"HTTP {response.status_code}"
+        orders.update_order_fields(
+            order_id_funpay,
+            panel_refund_cancel_result=f"HTTP {response.status_code}: {payload}",
+        )
+        logger.info(
+            f"PANEL CANCEL ATTEMPT: order=#{order_id_funpay}, source={source}, service=#{service_number}, "
+            f"panel_order={twiboost_order_id}, http_status={response.status_code}, result={payload}"
+        )
+        return True
+    except Exception as ex:
+        orders.update_order_fields(order_id_funpay, panel_refund_cancel_result=f"error: {ex}")
+        logger.warning(
+            f"PANEL CANCEL FAILED: order=#{order_id_funpay}, source={source}, service=#{service_number}, "
+            f"panel_order={twiboost_order_id}, error={ex}"
+        )
+        return False
+
+
+def _record_plugin_start_state():
+    state = _safe_load_json(AUTOSMM_STATE_PATH, {})
+    if not isinstance(state, dict):
+        state = {}
+    state["last_plugin_start_at"] = _now_str()
+    _safe_write_json(AUTOSMM_STATE_PATH, state)
+
+
+def _funpay_status_needs_recheck(order_record: Dict, min_age_seconds: int) -> bool:
+    checked_age = _seconds_since_checked_at(order_record.get("funpay_status_checked_at"))
+    if checked_age is None:
+        return True
+    return checked_age >= int(min_age_seconds)
+
+
+def _collect_funpay_status_candidates(all_orders: List[Dict], recovery: bool = False) -> List[Dict]:
+    open_candidates: List[Dict] = []
+    closed_candidates: List[Dict] = []
+
+    for order_record in all_orders:
+        order_id = str(order_record.get("order_id") or "")
+        if not order_id:
+            continue
+
+        effective_funpay_status = _get_effective_funpay_status(order_record)
+        if effective_funpay_status in ("refunded", "partially_refunded"):
+            continue
+
+        if effective_funpay_status in (None, "open"):
+            if _funpay_status_needs_recheck(order_record, FUNPAY_STATUS_RECENT_CHECK_SECONDS):
+                open_candidates.append(order_record)
+            continue
+
+        if recovery and effective_funpay_status == "closed":
+            if _funpay_status_needs_recheck(order_record, FUNPAY_STATUS_RECOVERY_CLOSED_SECONDS):
+                closed_candidates.append(order_record)
+
+    def _sort_key(order_record: Dict):
+        checked_dt = _parse_dt_or_none(order_record.get("funpay_status_checked_at"))
+        created_at = int(order_record.get("created_at") or 0)
+        return (checked_dt is not None, checked_dt or datetime.min, created_at)
+
+    open_candidates = sorted(open_candidates, key=_sort_key)
+    if not recovery:
+        return open_candidates
+
+    closed_candidates = sorted(closed_candidates, key=_sort_key)
+    combined = open_candidates + closed_candidates
+    return combined[:FUNPAY_STATUS_RECOVERY_MAX_ORDERS]
+
+
+def _run_funpay_status_sync(c: Cardinal, recovery: bool = False):
+    try:
+        all_orders = orders.load_orders_data()
+    except Exception as ex:
+        logger.error(f"Ошибка при загрузке orders_data.json для funpay status sync: {ex}")
+        return
+
+    candidates = _collect_funpay_status_candidates(all_orders, recovery=recovery)
+    if not candidates:
+        return
+
+    sync_type = "recovery-check" if recovery else "background funpay sync"
+    logger.info(f"FUNPAY STATUS SYNC: {sync_type}, orders={len(candidates)}")
+
+    for order_record in candidates:
+        if not RUNNING:
+            break
+
+        order_id_funpay = str(order_record.get("order_id"))
+        result = _fetch_funpay_status_via_cardinal(c, order_id_funpay)
+        checked_at = _now_str()
+
+        if result.get("ok"):
+            new_funpay_status = result.get("funpay_status")
+            previous_funpay_status = _get_effective_funpay_status(order_record)
+            update_fields: Dict[str, Any] = {
+                "funpay_status": new_funpay_status,
+                "funpay_status_checked_at": checked_at,
+            }
+            orders.update_order_fields(order_id_funpay, **update_fields)
+            updated_order = orders.get_order_data(order_id_funpay) or order_record
+            if new_funpay_status == "refunded" and previous_funpay_status != "refunded":
+                _attempt_panel_cancel_after_funpay_refund(updated_order, source=sync_type)
+            logger.info(f"FUNPAY STATUS SYNC: order=#{order_id_funpay}, status={new_funpay_status}, source={sync_type}")
+            continue
+
+        orders.update_order_fields(order_id_funpay, funpay_status_checked_at=checked_at)
+        logger.warning(
+            f"FUNPAY STATUS SYNC FAILED: order=#{order_id_funpay}, source={sync_type}, "
+            f"error={result.get('error')}, detail={result.get('detail')}"
+        )
+
+
 def _extract_refund_order_id_from_message(message_text: str) -> Optional[str]:
     text_ = normalize_incoming_text(message_text)
     if not text_:
@@ -1509,27 +1931,7 @@ def _extract_refund_order_id_from_message(message_text: str) -> Optional[str]:
 
 
 def _sync_refund_from_funpay_message(message_text: str) -> bool:
-    order_id = _extract_refund_order_id_from_message(message_text)
-    if not order_id:
-        return False
-
-    order_data = orders.get_order_data(order_id)
-    if not order_data:
-        logger.info(f"REFUND SYNC: заказ #{order_id} не найден в orders_data.json")
-        return True
-
-    if order_data.get("is_refunded", False):
-        logger.info(f"REFUND SYNC: заказ #{order_id} уже помечен как refunded")
-        return True
-
-    updated = orders.mark_order_refunded(
-        order_id_funpay=order_id,
-        detected_at=_now_str(),
-        source="funpay_message",
-    )
-    if updated:
-        logger.info(f"REFUND SYNC: заказ #{order_id} помечен как refunded из сообщения FunPay")
-    return True
+    return _sync_funpay_status_from_message(message_text)
 
 
 def _mark_order_unknown(order_record: Dict, stop_reason: str, log_detail: str, alert_reason: str = "не удалось подтвердить состояние заказа"):
@@ -1659,7 +2061,7 @@ def _try_rebind_order_panel(c: Cardinal, order_record: Dict, background_sync: bo
 def _sync_single_order_status(c: Cardinal, order_record: Dict, background_sync: bool = False):
     if not order_record:
         return
-    if bool(order_record.get("is_refunded", False)):
+    if _is_order_refundedish(order_record):
         return
     if str(order_record.get("status", "unknown") or "unknown").lower() != "pending":
         return
@@ -1702,7 +2104,7 @@ def _check_pending_orders_batch(c: Cardinal):
     pending_orders = []
     for order_record in all_orders:
         status_ = str(order_record.get("status", "unknown") or "unknown").lower()
-        if status_ == "pending" and not bool(order_record.get("is_refunded", False)):
+        if status_ == "pending" and not _is_order_refundedish(order_record):
             pending_orders.append(order_record)
 
     if not pending_orders:
@@ -1786,7 +2188,7 @@ def refund_order(
         detailed_reason = reason
 
     order_data = orders.get_order_data(order_id_funpay)
-    if order_data and order_data.get("is_refunded", False):
+    if order_data and _is_order_refundedish(order_data):
         logger.info(f"Заказ #{order_id_funpay} уже был возвращен. Пропуск.")
         return
 
@@ -1857,11 +2259,27 @@ def check_order_status(
 
 def start_order_checking(c: Cardinal):
     logger.info("Запуск batch status мониторинга pending-заказов")
+    _record_plugin_start_state()
+
+    try:
+        _run_funpay_status_sync(c, recovery=True)
+    except Exception as ex:
+        logger.error(f"Ошибка в recovery-check funpay status: {ex}")
+
+    last_funpay_status_sync_ts = time.time()
+
     while RUNNING:
         try:
             _check_pending_orders_batch(c)
         except Exception as ex:
             logger.error(f"Ошибка в batch status мониторинге: {ex}")
+
+        try:
+            if time.time() - last_funpay_status_sync_ts >= FUNPAY_STATUS_SYNC_INTERVAL_SECONDS:
+                _run_funpay_status_sync(c, recovery=False)
+                last_funpay_status_sync_ts = time.time()
+        except Exception as ex:
+            logger.error(f"Ошибка в background funpay status sync: {ex}")
 
         for _ in range(STATUS_BATCH_INTERVAL_SECONDS):
             if not RUNNING:
@@ -1956,6 +2374,7 @@ def _finalize_created_order(
         service_number,
         fallback_used=fallback_used,
         fallback_reason=fallback_reason,
+        funpay_status="open",
     )
 
     service_cfg = cfg["services"].get(str(service_number))
@@ -2364,7 +2783,8 @@ def _merged_orders() -> List[Dict]:
                 "date_str": log_rec.get("date"),
                 "service_name": log_rec.get("service_name") or rec.get("service_name") or "—",
                 "status": str(rec.get("status", "unknown")),
-                "is_refunded": bool(rec.get("is_refunded", False)),
+                "is_refunded": _is_refunded_funpay_status(_get_effective_funpay_status(rec)),
+                "funpay_status": _get_effective_funpay_status(rec),
                 "summa": float(rec.get("summa", log_rec.get("summa", 0)) or 0),
                 "spent": float(rec.get("spent", log_rec.get("spent", 0)) or 0),
                 "currency": str(rec.get("currency", log_rec.get("currency", "RUB")) or "RUB"),
@@ -2388,6 +2808,7 @@ def _merged_orders() -> List[Dict]:
                 "service_name": rec.get("service_name") or "—",
                 "status": "unknown",
                 "is_refunded": False,
+                "funpay_status": None,
                 "summa": float(rec.get("summa", 0) or 0),
                 "spent": float(rec.get("spent", 0) or 0),
                 "currency": str(rec.get("currency", "RUB") or "RUB"),
@@ -2408,7 +2829,7 @@ def get_statistics():
     def calc(p: str) -> Dict:
         _, lst = _filter_by_period(items, p)
         total = sum(float(o.get("summa", 0) or 0) for o in lst)
-        ch = sum(float(o.get("chistota", 0) or 0) for o in lst if not o.get("is_refunded", False))
+        ch = sum(float(o.get("chistota", 0) or 0) for o in lst if not _is_order_refundedish(o))
         return {"orders": len(lst), "total": total, "chistota": round(ch, 2)}
 
     day = calc("24h")
@@ -2524,7 +2945,7 @@ def get_period_analytics(period: str = "24h") -> Dict:
 
     for o in lst:
         st = str(o.get("status", "unknown") or "unknown").lower()
-        refunded = bool(o.get("is_refunded", False))
+        refunded = _is_order_refundedish(o)
 
         if refunded:
             # в UX нет отдельной метрики refunded -> считаем как "ошибка" по смыслу
@@ -2894,6 +3315,12 @@ def _send_completion_notification_if_needed(c: Cardinal, order_record: Dict):
     if str(order_record.get("status", "") or "").lower() != "completed":
         return
     if bool(order_record.get("completed_notification_sent", False)):
+        return
+    if _get_effective_funpay_status(order_record) != "open":
+        logger.info(
+            f"Completion-уведомление пропущено для заказа #{order_record.get('order_id')}: "
+            f"funpay_status={_get_effective_funpay_status(order_record)}"
+        )
         return
 
     buyer_chat_id = order_record.get("chat_id")
@@ -3400,7 +3827,7 @@ def process_name_change(message: types.Message, lot_key: str):
         return
     lot_map[lot_key]["name"] = new_name
     cfg["lot_mapping"] = lot_map
-    save_config(cfg)
+    reindex_lots(cfg)
     _finish_lot_edit(message, lot_key, f"✅ Название лота {lot_key} изменено на {new_name}.")
 
 
@@ -3418,7 +3845,7 @@ def process_id_change(message: types.Message, lot_key: str):
         return
     lot_map[lot_key]["service_id"] = new_id
     cfg["lot_mapping"] = lot_map
-    save_config(cfg)
+    reindex_lots(cfg)
     _finish_lot_edit(message, lot_key, f"✅ ID услуги для {lot_key} изменён на {new_id}.")
 
 
@@ -3436,7 +3863,7 @@ def process_quantity_change(message: types.Message, lot_key: str):
         return
     lot_map[lot_key]["quantity"] = new_q
     cfg["lot_mapping"] = lot_map
-    save_config(cfg)
+    reindex_lots(cfg)
     _finish_lot_edit(message, lot_key, f"✅ Количество для {lot_key} изменено на {new_q}.")
 
 
@@ -3460,7 +3887,7 @@ def process_service_num_change(message: types.Message, lot_key: str):
 
     lot_map[lot_key]["service_number"] = new_snum
     cfg["lot_mapping"] = lot_map
-    save_config(cfg)
+    reindex_lots(cfg)
     _finish_lot_edit(message, lot_key, f"✅ Номер сервиса для {lot_key} изменён на {new_snum}.")
 
 
@@ -3480,9 +3907,18 @@ def process_new_lot_id_step(message: types.Message):
         return
 
     cfg = load_config()
+    reindex_lots(cfg)
+    cfg = load_config()
     lot_map = cfg.get("lot_mapping", {})
 
-    new_lot_key = f"lot_{len(lot_map) + 1}"
+    lot_indices = []
+    for lot_key in lot_map.keys():
+        if str(lot_key).startswith("lot_"):
+            try:
+                lot_indices.append(int(str(lot_key).split("_", 1)[1]))
+            except Exception:
+                continue
+    new_lot_key = f"lot_{max(lot_indices, default=0) + 1}"
 
     lot_map[new_lot_key] = {
         "name": name,
@@ -3494,7 +3930,7 @@ def process_new_lot_id_step(message: types.Message):
     }
 
     cfg["lot_mapping"] = lot_map
-    save_config(cfg)
+    reindex_lots(cfg)
     _clear_ui_input_state(message.chat.id)
 
     page_ = max(0, ((len(lot_map) - 1) // 10))
@@ -3528,7 +3964,7 @@ def process_fallback_snum_change(message: types.Message, lot_key: str):
 
     lot_map[lot_key]["fallback_service_number"] = new_snum
     cfg["lot_mapping"] = lot_map
-    save_config(cfg)
+    reindex_lots(cfg)
     _finish_lot_edit(message, lot_key, f"✅ Fallback S# для {lot_key} изменён на {new_snum}.")
 
 
@@ -3548,7 +3984,7 @@ def process_fallback_id_change(message: types.Message, lot_key: str):
 
     lot_map[lot_key]["fallback_service_id"] = new_id
     cfg["lot_mapping"] = lot_map
-    save_config(cfg)
+    reindex_lots(cfg)
     _finish_lot_edit(message, lot_key, f"✅ Fallback ID для {lot_key} изменён на {new_id}.")
 
 
@@ -3778,12 +4214,74 @@ def open_old_files_warning_screen(chat_id: int, message_id: Optional[int] = None
     _send_or_edit_text(chat_id, txt_, kb, message_id=message_id)
 
 
+def _format_currency_for_main_menu(currency: str) -> str:
+    currency_upper = str(currency or "").upper()
+    if currency_upper == "RUB":
+        return "₽"
+    return currency_upper or ""
+
+
+def _get_total_panel_balance_text(cfg: Dict) -> str:
+    global _PANEL_BALANCE_CACHE
+
+    now_ts = time.time()
+    if now_ts - float(_PANEL_BALANCE_CACHE.get("timestamp", 0.0) or 0.0) < PANEL_BALANCE_CACHE_TTL_SECONDS:
+        return str(_PANEL_BALANCE_CACHE.get("text", "недоступно"))
+
+    services_cfg = cfg.get("services", {}) or {}
+    if not services_cfg:
+        _PANEL_BALANCE_CACHE = {"timestamp": now_ts, "text": "недоступно"}
+        return "недоступно"
+
+    totals_by_currency: Dict[str, float] = {}
+    successful_services = 0
+    failed_services = 0
+
+    for srv_num, srv_data in services_cfg.items():
+        api_url = str((srv_data or {}).get("api_url", "") or "").strip()
+        api_key = str((srv_data or {}).get("api_key", "") or "").strip()
+        try:
+            service_number = int(srv_num)
+        except Exception:
+            service_number = 0
+
+        invalid_key_payload = _validate_api_key_for_action(service_number, "balance", api_key)
+        if invalid_key_payload or not api_url:
+            failed_services += 1
+            continue
+
+        try:
+            rr = requests.get(f"{api_url}?action=balance&key={api_key}", timeout=6)
+            rr.raise_for_status()
+            balance_data = rr.json()
+            balance_value = float(balance_data.get("balance", 0) or 0)
+            currency_value = str(balance_data.get("currency", "") or "").upper().strip() or "UNKNOWN"
+            totals_by_currency[currency_value] = totals_by_currency.get(currency_value, 0.0) + balance_value
+            successful_services += 1
+        except Exception as ex:
+            failed_services += 1
+            logger.warning(f"MAIN MENU BALANCE: не удалось получить баланс для сервиса #{srv_num}: {ex}")
+
+    if not totals_by_currency:
+        balance_text = "недоступно"
+    elif len(totals_by_currency) > 1:
+        balance_text = "mixed currencies"
+    elif failed_services > 0:
+        balance_text = "частично недоступно"
+    else:
+        currency_value, total_value = next(iter(totals_by_currency.items()))
+        currency_label = _format_currency_for_main_menu(currency_value)
+        balance_text = f"{float(total_value):.2f} {currency_label}".strip()
+
+    _PANEL_BALANCE_CACHE = {"timestamp": now_ts, "text": balance_text}
+    return balance_text
+
+
 def build_main_menu_text_and_kb(cfg: Dict) -> Tuple[str, InlineKeyboardMarkup]:
     """Собирает текст и клавиатуру главного меню настроек AutoSMM."""
     lmap = cfg.get("lot_mapping", {})
     auto_refunds = cfg.get("auto_refunds", True)
     confirm_link = cfg.get("confirm_link", True)
-    notif_chat_id = cfg.get("notification_chat_id", "Не задан")
     auto_start = cfg.get("auto_start", False)
     status_text = "АКТИВИРОВАН ✅" if RUNNING else "ОСТАНОВЛЕН ❌"
 
@@ -3794,19 +4292,21 @@ def build_main_menu_text_and_kb(cfg: Dict) -> Tuple[str, InlineKeyboardMarkup]:
     except Exception:
         day_profit_fmt = str(day_profit)
 
-    txt_ = f"""🚀 <b>AUTOSMM v{VERSION}</b>
+    total_balance_text = _get_total_panel_balance_text(cfg)
+
+    txt_ = f"""🚀 AUTOSMM v{VERSION}
 
 ━━━━━━━━━━━━━━━━━━━━━
 
-<b>📊 Статус:</b> {status_text}
-<b>📦 Лоты:</b> {len(lmap)}
+📊 Статус: {status_text}
+📦 Лоты: {len(lmap)}
 
-<b>Автозапуск:</b> {'✅' if auto_start else '❌'}
-<b>Автовозвраты:</b> {'✅' if auto_refunds else '❌'}
-<b>Подтверждение ссылки:</b> {'✅' if confirm_link else '❌'}
+Автозапуск: {'✅' if auto_start else '❌'}
+Автовозвраты: {'✅' if auto_refunds else '❌'}
+Подтверждение ссылки: {'✅' if confirm_link else '❌'}
 
-<b>💰 Профит за 24ч:</b> {day_profit_fmt} ₽
-<b>📩 Уведомления:</b> {notif_chat_id}
+💰 Профит за 24ч: {day_profit_fmt} ₽
+💳 Баланс панелей: {total_balance_text}
 
 ━━━━━━━━━━━━━━━━━━━━━
 """.strip()
@@ -3816,27 +4316,13 @@ def build_main_menu_text_and_kb(cfg: Dict) -> Tuple[str, InlineKeyboardMarkup]:
         InlineKeyboardButton("🛍️ Каталог лотов", callback_data="lot_settings"),
         InlineKeyboardButton("➕ Создать новый лот", callback_data="add_new_lot")
     )
-
-    kb.add(
-        InlineKeyboardButton("🔌 Интеграция API", callback_data="api_settings"),
-    )
-
-    kb.add(
-        InlineKeyboardButton("🌐 Доверенные сайты", callback_data="manage_websites"),
-        InlineKeyboardButton("💬 Шаблоны сообщений", callback_data="edit_messages")
-    )
-    kb.add(
-        InlineKeyboardButton("📊 Аналитика", callback_data="show_orders")
-    )
-
+    kb.add(InlineKeyboardButton("🔌 Интеграция API", callback_data="api_settings"))
+    kb.add(InlineKeyboardButton("📊 Аналитика", callback_data="show_orders"))
     kb.add(
         InlineKeyboardButton("📁 Бэкап / файлы", callback_data="files_menu"),
-        InlineKeyboardButton("⚙️ Тонкая настройка", callback_data="misc_settings")
+        InlineKeyboardButton("⚙️ Настройки", callback_data="misc_settings")
     )
-
-    kb.add(
-        InlineKeyboardButton("📚 Полезные ресурсы", callback_data="links_menu")
-    )
+    kb.add(InlineKeyboardButton("📚 Полезные ресурсы", callback_data="links_menu"))
 
     return txt_, kb
 
@@ -3884,22 +4370,21 @@ def files_menu(call: types.CallbackQuery):
     _clear_navigation_states(call.message.chat.id)
 
     txt_ = """
-<b>📁 Работа с файлами</b>
+<b>📁 Бэкап / файлы</b>
 
-Здесь вы можете управлять файлами плагина, экспортировать данные и очищать историю заказов.
+Здесь находятся экспорт, загрузка JSON, логи и опасные действия с подтверждением.
     """.strip()
 
     kb_ = InlineKeyboardMarkup(row_width=2)
     kb_.row(
         InlineKeyboardButton("📤 Экспорт файлов", callback_data="export_files"),
-        InlineKeyboardButton("📥 Загрузить JSON", callback_data="upload_lots_json")
+        InlineKeyboardButton("🗑 Удалить лоты", callback_data="delete_all_lots")
     )
-
     kb_.row(
-        InlineKeyboardButton("📝 Логи ошибок", callback_data="export_errors"),
+        InlineKeyboardButton("📥 Загрузка JSON", callback_data="upload_lots_json"),
         InlineKeyboardButton("🗑 Удалить заказы", callback_data="delete_orders")
     )
-
+    kb_.add(InlineKeyboardButton("📝 Логи ошибок", callback_data="export_errors"))
     kb_.add(InlineKeyboardButton("🧹 Очистка старых файлов AutoSMM", callback_data="cleanup_old_files_manual"))
     kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="return_to_settings"))
 
@@ -3917,49 +4402,31 @@ def misc_settings(call: types.CallbackQuery):
     send_auto_lots_interval = cfg.get("send_auto_lots_interval", 30)
     auto_start = cfg.get("auto_start", False)
     fallback_enabled = cfg.get("fallback_enabled", False)
+    notif_chat_id = cfg.get("notification_chat_id")
 
     txt_ = f"""
-<b>⚙️ Дополнительные настройки</b>
+<b>⚙️ Настройки</b>
 
-Здесь вы можете настроить дополнительные параметры работы плагина.
-
-<b>Текущие настройки:</b>
 • Автовозвраты: <code>{'Включены ✅' if auto_refunds else 'Выключены ❌'}</code>
 • Подтверждение ссылки: <code>{'Включено ✅' if confirm_link else 'Выключено ❌'}</code>
 • Отправка файла auto_lots.json: <code>{'Включена ✅' if send_auto_lots else 'Выключена ❌'}</code>
-• Интервал отправки (минуты): <code>{send_auto_lots_interval}</code>
-• Автозапуск плагина: <code>{'Включен ✅' if auto_start else 'Выключен ❌'}</code>
+• Интервал отправки: <code>{send_auto_lots_interval} мин.</code>
+• Автозапуск: <code>{'Включен ✅' if auto_start else 'Выключен ❌'}</code>
 • Fallback: <code>{'Включен ✅' if fallback_enabled else 'Выключен ❌'}</code>
+• Chat ID: <code>{notif_chat_id if notif_chat_id else 'не задан'}</code>
     """.strip()
 
     kb_ = InlineKeyboardMarkup(row_width=1)
-    kb_.add(
-        InlineKeyboardButton(f"🔄 {'Выключить' if auto_refunds else 'Включить'} автовозвраты", callback_data="toggle_auto_refunds"),
-        InlineKeyboardButton(f"✅ {'Выключить' if confirm_link else 'Включить'} подтверждение ссылки", callback_data="toggle_confirm_link")
-    )
-
-    kb_.add(
-        InlineKeyboardButton(f"📤 {'Выключить' if send_auto_lots else 'Включить'} отправку auto_lots.json", callback_data="toggle_send_auto_lots"),
-        InlineKeyboardButton("⏱️ Изменить интервал отправки", callback_data="change_send_interval")
-    )
-
-    kb_.add(
-        InlineKeyboardButton(f"🚀 {'Выключить' if auto_start else 'Включить'} автозапуск плагина", callback_data="toggle_auto_start"),
-        InlineKeyboardButton("🔄 Обновить номера лотов", callback_data="update_lot_ids")
-    )
-
-    kb_.add(
-        InlineKeyboardButton(f"🔁 {'Выключить' if fallback_enabled else 'Включить'} fallback", callback_data="toggle_fallback")
-    )
-
-    kb_.add(
-        InlineKeyboardButton("🗑 Удалить все лоты", callback_data="delete_all_lots"),
-        InlineKeyboardButton("📩 Указать Chat ID для уведомлений", callback_data="set_notification_chat_id")
-    )
-
-    kb_.add(
-        InlineKeyboardButton("◀️ Назад", callback_data="return_to_settings")
-    )
+    kb_.add(InlineKeyboardButton(f"🔄 {'Выключить' if auto_refunds else 'Включить'} автовозвраты", callback_data="toggle_auto_refunds"))
+    kb_.add(InlineKeyboardButton(f"✅ {'Выключить' if confirm_link else 'Включить'} подтверждение ссылки", callback_data="toggle_confirm_link"))
+    kb_.add(InlineKeyboardButton(f"📤 {'Выключить' if send_auto_lots else 'Включить'} отправку файла auto_lots.json", callback_data="toggle_send_auto_lots"))
+    kb_.add(InlineKeyboardButton("⏱️ Интервал отправки", callback_data="change_send_interval"))
+    kb_.add(InlineKeyboardButton(f"🚀 {'Выключить' if auto_start else 'Включить'} автозапуск плагина", callback_data="toggle_auto_start"))
+    kb_.add(InlineKeyboardButton(f"🔁 {'Выключить' if fallback_enabled else 'Включить'} Fallback", callback_data="toggle_fallback"))
+    kb_.add(InlineKeyboardButton("🌐 Доверенные сайты", callback_data="manage_websites"))
+    kb_.add(InlineKeyboardButton("💬 Шаблоны сообщений", callback_data="edit_messages"))
+    kb_.add(InlineKeyboardButton("📩 Указать Chat ID", callback_data="set_notification_chat_id"))
+    kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="return_to_settings"))
 
     bot.edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb_)
 
@@ -4223,7 +4690,7 @@ def manage_websites(call: types.CallbackQuery):
         kb_.add(InlineKeyboardButton(f"🗑 {site}", callback_data=f"delete_website_{site}"))
 
     kb_.add(InlineKeyboardButton("➕ Добавить сайт", callback_data="add_website"))
-    kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="return_to_settings"))
+    kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="misc_settings"))
 
     bot.edit_message_text("Список разрешённых сайтов:", call.message.chat.id, call.message.message_id, reply_markup=kb_)
 
@@ -4262,29 +4729,24 @@ def delete_all_lots_prompt(call: types.CallbackQuery):
     kb = InlineKeyboardMarkup(row_width=2)
     kb.row(
         InlineKeyboardButton("✅ Да, удалить", callback_data="confirm_delete_all_lots"),
-        InlineKeyboardButton("◀️ Назад", callback_data="misc_settings")
+        InlineKeyboardButton("◀️ Назад", callback_data="files_menu")
     )
-    bot.edit_message_text("Вы уверены, что хотите удалить все лоты?", call.message.chat.id, call.message.message_id, reply_markup=kb)
+    bot.edit_message_text(
+        "⚠️ Вы уверены, что хотите удалить все лоты?\n\nЭто действие необратимо.",
+        call.message.chat.id,
+        call.message.message_id,
+        reply_markup=kb,
+    )
 
 
 def confirm_delete_all_lots(call: types.CallbackQuery):
     cfg = load_config()
-    preserved_notification_chat_id = cfg.get("notification_chat_id")
-    preserved_services = cfg.get("services", {})
-
-    new_config = {
-        "lot_mapping": {},
-        "services": preserved_services,
-        "auto_refunds": cfg.get("auto_refunds", True),
-        "messages": cfg.get("messages", {}),
-        "notification_chat_id": preserved_notification_chat_id
-    }
-
-    save_config(new_config)
+    cfg["lot_mapping"] = {}
+    save_config(cfg)
     _set_lot_page_context(call.message.chat.id, 0)
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("◀️ Назад", callback_data="misc_settings"))
-    bot.edit_message_text("✅ Все лоты успешно удалены. Chat ID и сервисы сохранены.", call.message.chat.id, call.message.message_id, reply_markup=kb)
+    kb.add(InlineKeyboardButton("◀️ Назад", callback_data="files_menu"))
+    bot.edit_message_text("✅ Все лоты успешно удалены.", call.message.chat.id, call.message.message_id, reply_markup=kb)
 
 
 def upload_lots_json(call: types.CallbackQuery):
@@ -4343,7 +4805,7 @@ def confirm_delete_orders(call: types.CallbackQuery):
         InlineKeyboardButton("❌ Отмена", callback_data="files_menu")
     )
     bot.edit_message_text(
-        "⚠️ <b>Вы действительно хотите удалить ВСЮ историю заказов?</b>\n\n"
+        "⚠️ <b>Вы уверены, что хотите удалить всю историю заказов?</b>\n\n"
         "Это действие необратимо.",
         call.message.chat.id,
         call.message.message_id,
@@ -4559,7 +5021,7 @@ def edit_messages_menu(call: types.CallbackQuery):
             InlineKeyboardButton("Изменить текст после оплаты", callback_data="edit_msg_payment"),
             InlineKeyboardButton("Изменить текст после подтверждения", callback_data="edit_msg_confirmation")
         )
-        kb.add(InlineKeyboardButton("◀️ Назад", callback_data="return_to_settings"))
+        kb.add(InlineKeyboardButton("◀️ Назад", callback_data="misc_settings"))
 
         try:
             bot.edit_message_text(
@@ -4586,7 +5048,7 @@ def edit_messages_menu(call: types.CallbackQuery):
         logger.exception("Ошибка при открытии экрана шаблонов сообщений")
         error_text = "❌ Не удалось открыть раздел шаблонов сообщений."
         kb = InlineKeyboardMarkup(row_width=1)
-        kb.add(InlineKeyboardButton("◀️ Назад", callback_data="return_to_settings"))
+        kb.add(InlineKeyboardButton("◀️ Назад", callback_data="misc_settings"))
         try:
             bot.edit_message_text(
                 error_text,
@@ -4849,7 +5311,7 @@ def auto_smm_handler(c: Cardinal, e, *args):
 
         logger.info(f"Новое сообщение от {e.message.author}: {msg_text}")
 
-        if _sync_refund_from_funpay_message(msg_text):
+        if _sync_funpay_status_from_message(msg_text):
             return
 
         m_check = re.match(r'^чек\s+(\d+)$', msg_text.lower())
@@ -5175,7 +5637,6 @@ def init_commands(c_: Cardinal):
     _add_cb(edit_apikey, func=lambda call: call.data.startswith("edit_apikey_"))
     _add_cb(check_balance, func=lambda call: call.data.startswith("check_balance_"))
     _add_cb(add_new_lot, func=lambda call: call.data == "add_new_lot")
-    _add_cb(update_lot_ids, func=lambda call: call.data == "update_lot_ids")
     _add_cb(edit_messages_menu, func=lambda call: call.data == "edit_messages")
     _add_cb(edit_msg_payment, func=lambda call: call.data == "edit_msg_payment")
     _add_cb(edit_msg_confirmation, func=lambda call: call.data == "edit_msg_confirmation")
