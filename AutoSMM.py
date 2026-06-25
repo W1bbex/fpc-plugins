@@ -33,7 +33,7 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 # =========================================================
 
 NAME = "AutoSMM"
-VERSION = "0.0.7.1"
+VERSION = "0.0.8.3"
 DESCRIPTION = "Плагин для автоматической накрутки через 2+ сервис"
 CREDITS = "@w1bbex"
 UUID = "a6ccb3f1-3e7b-4984-9e4c-01d3ea7e0ad8"
@@ -69,6 +69,7 @@ LOT_INPUT_STATES: Dict[int, Dict[str, Any]] = {}
 LOT_CARD_CONTEXT: Dict[int, Dict[str, Any]] = {}
 UI_INPUT_STATES: Dict[int, Dict[str, Any]] = {}
 SEARCH_RESULT_CONTEXT: Dict[int, Dict[str, Any]] = {}
+ANALYTICS_VIEW_MODES: Dict[Tuple[int, int], str] = {}
 
 LOG_DIR = os.path.join("storage", "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -2094,6 +2095,27 @@ def _sync_single_order_status(c: Cardinal, order_record: Dict, background_sync: 
     _mark_order_unknown(order_record, "status_unknown", detail)
 
 
+def _is_batch_transport_error(error_code: Any) -> bool:
+    return str(error_code or "").strip().lower() in ("timeout", "network_error", "invalid_json", "http_error", "unknown")
+
+
+def _save_batch_failure_for_chunk(chunk: List[Dict], error_code: Any, detail: Any):
+    batch_error = f"batch_{str(error_code or 'unknown').strip().lower() or 'unknown'}"
+    checked_at = _now_str()
+    for order_record in chunk:
+        order_id_funpay = str(order_record.get("order_id") or "")
+        if not order_id_funpay:
+            continue
+        orders.update_order_fields(
+            order_id_funpay,
+            status_last_error=batch_error,
+            status_last_checked_at=checked_at,
+        )
+        order_record["status_last_error"] = batch_error
+        order_record["status_last_checked_at"] = checked_at
+    logger.warning(f"BATCH STATUS SOFT FAIL: error={batch_error}, detail={detail}")
+
+
 def _check_pending_orders_batch(c: Cardinal):
     try:
         all_orders = orders.load_orders_data()
@@ -2124,12 +2146,21 @@ def _check_pending_orders_batch(c: Cardinal):
 
             result = _fetch_batch_order_status(service_number, order_ids)
             if not result.get("ok"):
-                logger.warning(
-                    f"BATCH STATUS FALLBACK TO SINGLE: service=#{service_number}, error={result.get('error')}, detail={result.get('detail')}"
-                )
-                for order_record in chunk:
-                    _sync_single_order_status(c, order_record, background_sync=True)
-                continue
+                error_code = result.get("error", "unknown")
+                detail = result.get("detail", "")
+
+                if _is_batch_transport_error(error_code):
+                    logger.warning(
+                        f"BATCH STATUS RETRY: service=#{service_number}, orders={order_ids}, error={error_code}, detail={detail}"
+                    )
+                    retry_result = _fetch_batch_order_status(service_number, order_ids)
+                    if not retry_result.get("ok"):
+                        _save_batch_failure_for_chunk(chunk, retry_result.get("error", error_code), retry_result.get("detail", detail))
+                        continue
+                    result = retry_result
+                else:
+                    _save_batch_failure_for_chunk(chunk, error_code, detail)
+                    continue
 
             entries = result.get("entries", {}) or {}
             for order_record in chunk:
@@ -2922,9 +2953,48 @@ def update_order_charge_and_net(order_id_funpay: str, spent: float, currency: st
 
 
 # --- Analytics v2 (required UX format) ---
-_COMPLETED = ("completed", "done", "success", "partial")
+_COMPLETED = ("completed", "done", "success")
 _ACTIVE = ("pending", "processing", "inprogress", "in_progress", "in progress")
-_FAILED = ("failed", "error", "canceled", "cancelled")
+_FAILED = ("failed", "error", "canceled", "cancelled", "unknown", "fail")
+_PARTIAL = ("partial",)
+
+
+def _analytics_view_key(chat_id: Any, message_id: Any) -> Tuple[int, int]:
+    try:
+        return int(chat_id), int(message_id)
+    except Exception:
+        return 0, 0
+
+
+def _set_analytics_view_mode(chat_id: Any, message_id: Any, mode: str):
+    ANALYTICS_VIEW_MODES[_analytics_view_key(chat_id, message_id)] = "more" if str(mode or "").strip().lower() == "more" else "main"
+
+
+def _get_analytics_view_mode(chat_id: Any, message_id: Any) -> str:
+    return ANALYTICS_VIEW_MODES.get(_analytics_view_key(chat_id, message_id), "main")
+
+
+def _normalize_analytics_status(status_value: Any) -> str:
+    normalized = _normalize_runtime_status(status_value)
+    if normalized in ("completed", "partial", "pending", "canceled", "fail", "unknown"):
+        return normalized
+    return "unknown"
+
+
+def _is_completed_for_profit(order_record: Dict, panel_status: str, funpay_status: Optional[str]) -> bool:
+    return panel_status == "completed" and funpay_status == "closed"
+
+
+def _calc_order_net_profit(order_record: Dict) -> float:
+    try:
+        revenue = float(order_record.get("summa", 0) or 0)
+    except Exception:
+        revenue = 0.0
+    try:
+        spent = float(order_record.get("spent", 0) or 0)
+    except Exception:
+        spent = 0.0
+    return round(revenue - spent, 2)
 
 
 def get_period_analytics(period: str = "24h") -> Dict:
@@ -2938,37 +3008,58 @@ def get_period_analytics(period: str = "24h") -> Dict:
     total = len(lst)
     active = 0
     completed = 0
+    refunded = 0
+    partial = 0
     errors = 0
 
     revenue = 0.0
     spent = 0.0
+    profit = 0.0
+    profit_pending = 0.0
+    losses = 0.0
 
     for o in lst:
-        st = str(o.get("status", "unknown") or "unknown").lower()
-        refunded = _is_order_refundedish(o)
-
-        if refunded:
-            # в UX нет отдельной метрики refunded -> считаем как "ошибка" по смыслу
-            errors += 1
-            continue
-
-        if st in _COMPLETED:
-            completed += 1
-        elif st in _FAILED:
-            errors += 1
-        else:
-            active += 1
+        panel_status = _normalize_analytics_status(o.get("status", "unknown"))
+        funpay_status = _get_effective_funpay_status(o)
+        refunded_like = funpay_status in ("refunded", "partially_refunded")
 
         try:
             revenue += float(o.get("summa", 0) or 0)
         except Exception:
             pass
         try:
-            spent += float(o.get("spent", 0) or 0)
+            order_spent = float(o.get("spent", 0) or 0)
         except Exception:
-            pass
+            order_spent = 0.0
+        spent += order_spent
 
-    profit = revenue - spent
+        order_net_profit = _calc_order_net_profit(o)
+
+        if refunded_like:
+            refunded += 1
+            if panel_status in ("completed", "partial") or order_spent > 0:
+                losses += order_spent
+            continue
+
+        if panel_status == "partial":
+            partial += 1
+            continue
+
+        if _is_completed_for_profit(o, panel_status, funpay_status):
+            completed += 1
+            profit += order_net_profit
+            continue
+
+        if panel_status == "completed" and funpay_status in (None, "open"):
+            active += 1
+            profit_pending += order_net_profit
+            continue
+
+        if panel_status in ("fail", "canceled", "unknown"):
+            errors += 1
+            continue
+
+        active += 1
 
     return {
         "period_norm": _period_info(period)[0],
@@ -2976,9 +3067,13 @@ def get_period_analytics(period: str = "24h") -> Dict:
         "revenue": round(revenue, 2),
         "spent": round(spent, 2),
         "profit": round(profit, 2),
+        "profit_pending": round(profit_pending, 2),
+        "losses": round(losses, 2),
         "total": int(total),
         "active": int(active),
         "completed": int(completed),
+        "refunded": int(refunded),
+        "partial": int(partial),
         "errors": int(errors),
     }
 
@@ -2994,26 +3089,69 @@ def _fmt_rub(x: float) -> str:
     return f"{v:.2f}"
 
 
-def format_analytics(period: str = "24h", top_n: int = 5, last_n: int = 8) -> str:
+def _count_orders_awaiting_confirmation(period: str = "24h") -> int:
+    label, lst = _filter_by_period(_merged_orders(), period)
+    count = 0
+
+    for o in lst:
+        panel_status = _normalize_analytics_status(o.get("status", "unknown"))
+        funpay_status = _get_effective_funpay_status(o)
+        if panel_status == "completed" and funpay_status in (None, "open"):
+            count += 1
+
+    return int(count)
+
+
+def format_analytics(period: str = "24h", top_n: int = 5, last_n: int = 8, mode: str = "main") -> str:
     """Main text formatter for analytics screen.
 
     NOTE: top_n / last_n kept for backward-compatibility (ignored).
     """
     d = get_period_analytics(period=period)
     period_title = d.get("period_label", "—")
+    expanded = str(mode or "").strip().lower() == "more"
 
-    return (
-        f"📊 AutoSMM — {period_title}\n\n"
-        f"💰 Финансы\n"
-        f"Выручка: {_fmt_rub(d.get('revenue', 0))} ₽\n"
-        f"Затраты: {_fmt_rub(d.get('spent', 0))} ₽\n"
-        f"📈 Профит: {_fmt_rub(d.get('profit', 0))} ₽\n\n"
-        f"📦 Заказы\n"
-        f"Всего: {int(d.get('total', 0) or 0)}\n"
-        f"⚙ В работе: {int(d.get('active', 0) or 0)}\n"
-        f"✅ Завершено: {int(d.get('completed', 0) or 0)}\n"
-        f"❌ Ошибки: {int(d.get('errors', 0) or 0)}"
-    )
+    if expanded:
+        awaiting_confirmation = _count_orders_awaiting_confirmation(period=period)
+        parts = [
+            f"📊 AutoSMM — {period_title} (расширенная)",
+            "",
+            "💰 Финансы",
+            f"Выручка: {_fmt_rub(d.get('revenue', 0))} ₽",
+            f"Затраты: {_fmt_rub(d.get('spent', 0))} ₽",
+            f"📈 Профит: {_fmt_rub(d.get('profit', 0))} ₽",
+            f"📉 Потери: {_fmt_rub(d.get('losses', 0))} ₽",
+            "",
+            "📦 Заказы",
+            f"Всего: {int(d.get('total', 0) or 0)}",
+            f"⚙ В работе: {int(d.get('active', 0) or 0)}",
+            f"✅ Завершено: {int(d.get('completed', 0) or 0)}",
+            f"↩ Refunded: {int(d.get('refunded', 0) or 0)}",
+            f"🧩 Partial: {int(d.get('partial', 0) or 0)}",
+            f"❌ Ошибки: {int(d.get('errors', 0) or 0)}",
+            "",
+            "⏳ Ожидание",
+            f"Профит в ожидании: {_fmt_rub(d.get('profit_pending', 0))} ₽",
+            f"Ожидают подтверждения: {awaiting_confirmation}",
+        ]
+        return "\n".join(parts)
+
+    parts = [
+        f"📊 AutoSMM — {period_title}",
+        "",
+        "💰 Финансы",
+        f"Выручка: {_fmt_rub(d.get('revenue', 0))} ₽",
+        f"Затраты: {_fmt_rub(d.get('spent', 0))} ₽",
+        f"📈 Профит: {_fmt_rub(d.get('profit', 0))} ₽",
+        "",
+        "📦 Заказы",
+        f"Всего: {int(d.get('total', 0) or 0)}",
+        f"⚙ В работе: {int(d.get('active', 0) or 0)}",
+        f"✅ Завершено: {int(d.get('completed', 0) or 0)}",
+        f"↩️ Refunded: {int(d.get('refunded', 0) or 0)}",
+    ]
+
+    return "\n".join(parts)
 
 
 def _period_to_cb(period: str) -> str:
@@ -3027,37 +3165,46 @@ def _period_to_cb(period: str) -> str:
     return CB_STATS_24H
 
 
-def build_analytics_keyboard(period: str = "24h"):
-    """Returns InlineKeyboardMarkup:
-
-    [24ч] [7д] [30д] [∞ всё]
-    [🔄 обновить]
-    [⬅ назад]
-    """
+def build_analytics_keyboard(period: str = "24h", mode: str = "main"):
+    """Returns InlineKeyboardMarkup for the analytics screen."""
     try:
         from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton  # type: ignore
     except Exception:
         return None
 
+    period_norm = _period_info(period)[0]
+    if period_norm == "7d":
+        period_callback_suffix = "week"
+    elif period_norm == "30d":
+        period_callback_suffix = "month"
+    elif period_norm == "all":
+        period_callback_suffix = "all"
+    else:
+        period_callback_suffix = "day"
+
+    toggle_callback = f"analytics_less_{period_callback_suffix}" if str(mode or "").strip().lower() == "more" else f"analytics_more_{period_callback_suffix}"
+    toggle_text = "◀️ Основное" if str(mode or "").strip().lower() == "more" else "Еще"
+
     kb = InlineKeyboardMarkup(row_width=4)
     kb.row(
-        InlineKeyboardButton("24ч", callback_data=CB_STATS_24H),
-        InlineKeyboardButton("7д", callback_data=CB_STATS_7D),
-        InlineKeyboardButton("30д", callback_data=CB_STATS_30D),
-        InlineKeyboardButton("∞ всё", callback_data=CB_STATS_ALL),
+        InlineKeyboardButton("🕒 24ч", callback_data="analytics_period_day"),
+        InlineKeyboardButton("📅 7д", callback_data="analytics_period_week"),
+        InlineKeyboardButton("🗓 30д", callback_data="analytics_period_month"),
+        InlineKeyboardButton("♾ Всё", callback_data="analytics_period_all"),
     )
     kb.row(
-        InlineKeyboardButton("🔄 обновить", callback_data=_period_to_cb(period)),
+        InlineKeyboardButton(toggle_text, callback_data=toggle_callback),
+        InlineKeyboardButton("🔄 Обновить", callback_data=f"analytics_period_{period_callback_suffix}"),
     )
     kb.row(
-        InlineKeyboardButton("⬅ назад", callback_data=CB_BACK),
+        InlineKeyboardButton("◀️ Назад", callback_data="return_to_settings"),
     )
     return kb
 
 
-def get_analytics_text_and_kb(period: str = "24h"):
+def get_analytics_text_and_kb(period: str = "24h", mode: str = "main"):
     """Convenience: returns (text, keyboard) for the analytics screen."""
-    return format_analytics(period=period), build_analytics_keyboard(period=period)
+    return format_analytics(period=period, mode=mode), build_analytics_keyboard(period=period, mode=mode)
 
 
 def parse_period_from_callback(callback_data: str) -> str:
@@ -3087,32 +3234,38 @@ analytics = SimpleNamespace(
     parse_period_from_callback=parse_period_from_callback,
 )
 
-def _render_analytics(call: types.CallbackQuery, period: str = "day"):
-    # period: day | week | month | all
+def _render_analytics(call: types.CallbackQuery, period: str = "day", mode: Optional[str] = None):
+    period_map = {
+        "day": "24h",
+        "week": "7d",
+        "month": "30d",
+        "all": "all",
+        "24h": "24h",
+        "7d": "7d",
+        "30d": "30d",
+    }
+    period_norm = period_map.get(str(period or "day").strip().lower(), "24h")
+    if mode is None:
+        mode = _get_analytics_view_mode(call.message.chat.id, call.message.message_id)
+    else:
+        _set_analytics_view_mode(call.message.chat.id, call.message.message_id, mode)
+
     try:
-        txt = analytics.format_analytics(period=period, top_n=5, last_n=8)
+        txt = analytics.format_analytics(period=period_norm, top_n=5, last_n=8, mode=mode)
     except Exception as e:
         logger.error(f"Ошибка формирования аналитики: {e}")
         txt = "❌ Ошибка формирования аналитики."
 
-    kb = InlineKeyboardMarkup(row_width=4)
-    kb.row(
-        InlineKeyboardButton("🕒 24ч", callback_data="analytics_period_day"),
-        InlineKeyboardButton("📅 7д", callback_data="analytics_period_week"),
-        InlineKeyboardButton("🗓 30д", callback_data="analytics_period_month"),
-        InlineKeyboardButton("♾ Всё", callback_data="analytics_period_all"),
-    )
-    kb.row(
-        InlineKeyboardButton("🔄 Обновить", callback_data=f"analytics_period_{period}"),
-        InlineKeyboardButton("◀️ Назад", callback_data="return_to_settings"),
-    )
+    kb = analytics.build_analytics_keyboard(period=period_norm, mode=mode)
 
     try:
         bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb)
     except Exception as e:
         logger.error(f"Ошибка при редактировании сообщения аналитики: {e}")
         try:
-            bot.send_message(call.message.chat.id, txt, parse_mode="HTML", reply_markup=kb)
+            sent = bot.send_message(call.message.chat.id, txt, parse_mode="HTML", reply_markup=kb)
+            if sent is not None:
+                _set_analytics_view_mode(call.message.chat.id, getattr(sent, "message_id", 0), mode)
         except Exception as e2:
             logger.error(f"Ошибка при отправке сообщения аналитики: {e2}")
 
@@ -3123,7 +3276,7 @@ def _render_analytics(call: types.CallbackQuery, period: str = "day"):
 
 
 def show_orders(call: types.CallbackQuery):
-    _render_analytics(call, period="day")
+    _render_analytics(call, period="day", mode="main")
 
 
 def analytics_period(call: types.CallbackQuery):
@@ -3134,6 +3287,26 @@ def analytics_period(call: types.CallbackQuery):
     if period not in ("day", "week", "month", "all"):
         period = "day"
     _render_analytics(call, period=period)
+
+
+def analytics_more(call: types.CallbackQuery):
+    try:
+        period = call.data.split("analytics_more_", 1)[1].strip()
+    except Exception:
+        period = "day"
+    if period not in ("day", "week", "month", "all"):
+        period = "day"
+    _render_analytics(call, period=period, mode="more")
+
+
+def analytics_less(call: types.CallbackQuery):
+    try:
+        period = call.data.split("analytics_less_", 1)[1].strip()
+    except Exception:
+        period = "day"
+    if period not in ("day", "week", "month", "all"):
+        period = "day"
+    _render_analytics(call, period=period, mode="main")
 
 
 # =========================================================
@@ -3451,6 +3624,13 @@ def _dispatch_navigation_callback(call: types.CallbackQuery, target: str):
         lot_settings(call)
     elif target == "api_settings":
         api_settings_menu(call)
+    elif target.startswith("api_service_"):
+        try:
+            service_idx = int(target.split("_")[-1])
+        except Exception:
+            api_settings_menu(call)
+            return
+        _open_api_service_card(call.message.chat.id, service_idx, message_id=call.message.message_id)
     elif target == "edit_messages":
         edit_messages_menu(call)
     elif target == "manage_websites":
@@ -3650,25 +3830,32 @@ def _show_lot_card(
     _set_lot_card_context(chat_id, lot_key, back_callback, back_label)
 
     ld_ = lot_map[lot_key]
-    txt_ = f"""
-<b>{lot_key}</b>
-Название: <code>{html.escape(str(ld_['name']))}</code>
-ID услуги: <code>{ld_['service_id']}</code>
-Кол-во: <code>{ld_['quantity']}</code>
-S#: <code>{ld_.get('service_number', 1)}</code>
-Fallback S#: <code>{ld_.get('fallback_service_number')}</code>
-Fallback ID: <code>{ld_.get('fallback_service_id')}</code>
-""".strip()
+    fallback_enabled = bool(cfg.get("fallback_enabled", False))
+    lines_ = [
+        f"<b>{lot_key}</b>",
+        f"Название: <code>{html.escape(str(ld_['name']))}</code>",
+        f"ID услуги: <code>{ld_['service_id']}</code>",
+        f"Кол-во: <code>{ld_['quantity']}</code>",
+        f"S#: <code>{ld_.get('service_number', 1)}</code>",
+    ]
+    if fallback_enabled:
+        lines_.append(f"Fallback S#: <code>{ld_.get('fallback_service_number')}</code>")
+        lines_.append(f"Fallback ID: <code>{ld_.get('fallback_service_id')}</code>")
+    txt_ = "\n".join(lines_).strip()
 
     kb_ = InlineKeyboardMarkup(row_width=1)
-    kb_.add(
+    card_buttons = [
         InlineKeyboardButton("Изменить название", callback_data=f"change_name_{lot_key}"),
         InlineKeyboardButton("Изменить ID услуги", callback_data=f"change_id_{lot_key}"),
         InlineKeyboardButton("Изменить количество", callback_data=f"change_quantity_{lot_key}"),
         InlineKeyboardButton("Изменить сервис#", callback_data=f"change_snum_{lot_key}"),
-        InlineKeyboardButton("Изменить Fallback S#", callback_data=f"change_fallback_snum_{lot_key}"),
-        InlineKeyboardButton("Изменить Fallback ID", callback_data=f"change_fallback_id_{lot_key}"),
-    )
+    ]
+    if fallback_enabled:
+        card_buttons.extend([
+            InlineKeyboardButton("Изменить Fallback S#", callback_data=f"change_fallback_snum_{lot_key}"),
+            InlineKeyboardButton("Изменить Fallback ID", callback_data=f"change_fallback_id_{lot_key}"),
+        ])
+    kb_.add(*card_buttons)
     kb_.add(InlineKeyboardButton("❌ Удалить лот", callback_data=f"delete_one_lot_{lot_key}"))
     kb_.add(InlineKeyboardButton(back_label, callback_data=back_callback))
 
@@ -4294,19 +4481,19 @@ def build_main_menu_text_and_kb(cfg: Dict) -> Tuple[str, InlineKeyboardMarkup]:
 
     total_balance_text = _get_total_panel_balance_text(cfg)
 
-    txt_ = f"""🚀 AUTOSMM v{VERSION}
+    txt_ = f"""🚀 <b>AUTOSMM v{VERSION}</b>
 
 ━━━━━━━━━━━━━━━━━━━━━
 
-📊 Статус: {status_text}
-📦 Лоты: {len(lmap)}
+📊 <b>Статус:</b> {status_text}
+📦 <b>Лоты:</b> {len(lmap)}
 
-Автозапуск: {'✅' if auto_start else '❌'}
-Автовозвраты: {'✅' if auto_refunds else '❌'}
-Подтверждение ссылки: {'✅' if confirm_link else '❌'}
+<b>Автозапуск:</b> {'✅' if auto_start else '❌'}
+<b>Автовозвраты:</b> {'✅' if auto_refunds else '❌'}
+<b>Подтверждение ссылки:</b> {'✅' if confirm_link else '❌'}
 
-💰 Профит за 24ч: {day_profit_fmt} ₽
-💳 Баланс панелей: {total_balance_text}
+💰 <b>Профит за 24ч:</b> {day_profit_fmt} ₽
+💳 <b>Баланс панелей:</b> {total_balance_text}
 
 ━━━━━━━━━━━━━━━━━━━━━
 """.strip()
@@ -4467,193 +4654,455 @@ def links_menu(call: types.CallbackQuery):
     bot.edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode=None, reply_markup=kb_)
 
 
-def api_settings_menu(call):
-    _clear_step_handler(call.message.chat.id)
-    _clear_navigation_states(call.message.chat.id)
 
-    cfg = load_config()
-    services = cfg["services"]
+def _sort_service_items(services: Dict) -> List[Tuple[str, Dict]]:
+    def _service_sort_key(item: Tuple[str, Dict]) -> Tuple[int, str]:
+        key = str(item[0] or "")
+        try:
+            return (0, f"{int(key):09d}")
+        except Exception:
+            return (1, key)
+    return sorted((services or {}).items(), key=_service_sort_key)
 
-    text_ = """
-<b>⚙️ Настройки API сервисов SMM</b>
 
-Здесь вы можете настроить подключение к различным SMM-сервисам, 
-проверить баланс или добавить новые сервисы.
-"""
+def normalize_api_url(raw_url: Any) -> str:
+    from urllib.parse import urlsplit
 
-    for srv_num, srv_data in services.items():
-        text_ += f"""
-<b>📡 Сервис #{srv_num}</b>
-• <b>URL:</b> <code>{html.escape(str(srv_data['api_url']))}</code>
-• <b>API KEY:</b> <code>{html.escape(str(srv_data['api_key']))}</code>
-"""
+    raw_value = str(raw_url or "").strip()
+    if not raw_value:
+        raise ValueError("ссылка или домен не должны быть пустыми")
 
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.row(InlineKeyboardButton("📡 API URLs", callback_data="header_no_action"))
+    markdown_match = re.match(r"^\[[^\]]+\]\(([^)]+)\)$", raw_value)
+    if markdown_match:
+        raw_value = markdown_match.group(1).strip()
 
-    api_buttons = []
-    for srv_num in services:
-        api_buttons.append(InlineKeyboardButton(f"Сервис #{srv_num}", callback_data=f"edit_apiurl_{srv_num}"))
-    kb.add(*api_buttons)
+    raw_value = raw_value.replace("\\", "/").strip()
+    if raw_value.startswith("//"):
+        raw_value = f"https:{raw_value}"
 
-    kb.row(InlineKeyboardButton("🔑 API Keys", callback_data="header_no_action"))
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://", raw_value):
+        raw_value = f"https://{raw_value.lstrip('/')}"
 
-    key_buttons = []
-    for srv_num in services:
-        key_buttons.append(InlineKeyboardButton(f"Ключ #{srv_num}", callback_data=f"edit_apikey_{srv_num}"))
-    kb.add(*key_buttons)
+    parts = urlsplit(raw_value)
+    host = str(parts.netloc or "").strip().lower()
 
-    kb.row(InlineKeyboardButton("💰 Балансы сервисов", callback_data="header_no_action"))
+    if not host and parts.path:
+        fallback_parts = urlsplit(f"https://{str(parts.path).lstrip('/')}")
+        host = str(fallback_parts.netloc or "").strip().lower()
+        parts = fallback_parts
 
-    balance_buttons = []
-    for srv_num in services:
-        balance_buttons.append(InlineKeyboardButton(f"Баланс #{srv_num}", callback_data=f"check_balance_{srv_num}"))
-    kb.add(*balance_buttons)
+    if "@" in host:
+        host = host.rsplit("@", 1)[-1]
+    if host.startswith("www."):
+        host = host[4:]
+
+    if not host or "." not in host:
+        raise ValueError("не удалось распознать домен")
+
+    host_no_port = host.split(":", 1)[0]
+    if not re.fullmatch(r"[a-z0-9.-]+", host_no_port) or host_no_port.startswith(".") or host_no_port.endswith("."):
+        raise ValueError("некорректный домен")
+
+    path_value = re.sub(r"/+", "/", str(parts.path or "").replace("\\", "/"))
+    lower_path = path_value.lower()
+
+    api_idx = lower_path.find("/api/v2")
+    normalized_path = "/api/v2" if api_idx == -1 else path_value[:api_idx + len("/api/v2")]
+
+    normalized_path = normalized_path.rstrip("/")
+    if normalized_path != "/api/v2":
+        normalized_path = "/api/v2"
+
+    return f"https://{host}{normalized_path}"
+
+
+def _extract_service_domain(api_url: Any) -> str:
+    from urllib.parse import urlsplit
+
+    raw_url = str(api_url or "").strip()
+    if not raw_url:
+        return ""
+
+    try:
+        normalized = normalize_api_url(raw_url)
+    except Exception:
+        normalized = raw_url if re.match(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://", raw_url) else f"https://{raw_url.lstrip('/')}"
+
+    try:
+        host = str(urlsplit(normalized).netloc or "").strip().lower()
+    except Exception:
+        return ""
+
+    if "@" in host:
+        host = host.rsplit("@", 1)[-1]
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def _domain_to_service_name(domain: str) -> str:
+    host = str(domain or "").strip().lower()
+    if not host:
+        return "Сервис"
+
+    first_label = host.split(":", 1)[0].split(".", 1)[0]
+    first_label = first_label.strip()
+    if not first_label:
+        return "Сервис"
+
+    if first_label.startswith("smm") and len(first_label) > 3:
+        return "SMM" + first_label[3:].capitalize()
+    if first_label.endswith("smm") and len(first_label) > 3:
+        return first_label[:-3].capitalize() + "SMM"
+    return first_label[:1].upper() + first_label[1:]
+
+
+def build_service_display_name(service_id, api_url, existing_name=None) -> str:
+    service_num = str(service_id or "").strip()
+    existing = re.sub(r"\s+", " ", str(existing_name or "").strip())
+
+    if existing:
+        if re.search(r"\s+#\d+\s*$", existing):
+            return re.sub(r"\s+#\d+\s*$", f" #{service_num}", existing)
+        return f"{existing} #{service_num}"
+
+    generated_base = _domain_to_service_name(_extract_service_domain(api_url))
+    return f"{generated_base} #{service_num}"
+
+
+def _service_name_is_default(existing_name: Any, service_id: int, api_url: Any) -> bool:
+    name_value = re.sub(r"\s+", " ", str(existing_name or "").strip())
+    if not name_value:
+        return True
+
+    generated_name = build_service_display_name(service_id, api_url, None)
+    if name_value.lower() == generated_name.lower():
+        return True
+
+    if re.fullmatch(r"(?i)(service|сервис)\s*#?\d+", name_value):
+        return True
+
+    return False
+
+
+def mask_api_key(api_key: Any) -> str:
+    key_value = _normalize_api_key(api_key)
+    if not key_value:
+        return "не задан"
+    if len(key_value) <= 2:
+        return f"{key_value[0]}......{key_value[-1]}"
+    return f"{key_value[:3]}......{key_value[-3:]}"
+
+
+def _is_api_key_length_suspicious(api_key: Any) -> bool:
+    return len(_normalize_api_key(api_key)) != EXPECTED_API_KEY_LENGTH
+
+
+def _get_service_balance_payload(service_number: int, service_cfg: Optional[Dict], timeout: int = 6) -> Dict[str, Any]:
+    service_cfg = service_cfg or {}
+    api_url_raw = str(service_cfg.get("api_url") or "").strip()
+    api_key = _normalize_api_key(service_cfg.get("api_key"))
+
+    if not api_url_raw or not api_key:
+        return {
+            "ok": False,
+            "status_emoji": "❌",
+            "balance_text": "недоступно",
+            "balance_value": None,
+            "currency": None,
+        }
+
+    try:
+        api_url = normalize_api_url(api_url_raw)
+        response = requests.get(api_url, params={"action": "balance", "key": api_key}, timeout=timeout)
+        response.raise_for_status()
+        payload = response.json()
+
+        balance_raw = payload.get("balance", 0)
+        try:
+            balance_value = float(str(balance_raw).replace(",", "."))
+        except Exception:
+            balance_value = float(balance_raw or 0)
+
+        currency = str(payload.get("currency") or "RUB").upper().strip() or "RUB"
+        balance_text = f"{balance_value:.2f} {_format_currency_for_main_menu(currency)}".strip()
+
+        return {
+            "ok": True,
+            "status_emoji": "✅",
+            "balance_text": balance_text,
+            "balance_value": balance_value,
+            "currency": currency,
+        }
+    except Exception as ex:
+        logger.warning(f"{LOGGER_PREFIX} Не удалось получить баланс для сервиса #{service_number}: {ex}")
+        return {
+            "ok": False,
+            "status_emoji": "❌",
+            "balance_text": "недоступно",
+            "balance_value": None,
+            "currency": None,
+        }
+
+
+def get_service_api_status(service_number: int, service_cfg: Optional[Dict]) -> str:
+    return _get_service_balance_payload(service_number, service_cfg).get("status_emoji", "❌")
+
+
+def _build_total_api_balance_text(service_payloads: List[Dict[str, Any]]) -> str:
+    successful = [item for item in (service_payloads or []) if item.get("ok")]
+    if not successful:
+        return "недоступно"
+
+    currencies = {str(item.get("currency") or "").upper().strip() for item in successful if item.get("currency")}
+    if len(currencies) != 1:
+        return "недоступно"
+
+    total_value = sum(float(item.get("balance_value") or 0.0) for item in successful)
+    currency_value = next(iter(currencies))
+    return f"{total_value:.2f} {_format_currency_for_main_menu(currency_value)}".strip()
+
+
+def render_api_menu(cfg: Dict) -> Tuple[str, InlineKeyboardMarkup]:
+    services = cfg.get("services", {}) or {}
+    service_rows: List[Tuple[str, Dict, Dict[str, Any], str]] = []
+    payloads: List[Dict[str, Any]] = []
+
+    for srv_num, srv_data in _sort_service_items(services):
+        try:
+            srv_int = int(srv_num)
+        except Exception:
+            continue
+
+        display_name = build_service_display_name(srv_int, (srv_data or {}).get("api_url"), (srv_data or {}).get("name"))
+        payload = _get_service_balance_payload(srv_int, srv_data)
+        payloads.append(payload)
+        service_rows.append((srv_num, srv_data or {}, payload, display_name))
+
+    total_balance_text = _build_total_api_balance_text(payloads)
+
+    lines = [
+        "🔌 Интеграция API",
+        "",
+        f"Общий баланс: {total_balance_text}",
+        "",
+        "Подключённые сервисы:",
+        "",
+    ]
+
+    if service_rows:
+        for idx, (_, _, payload, display_name) in enumerate(service_rows):
+            lines.append(f"📡 {display_name}")
+            lines.append(f"Статус API: {payload.get('status_emoji', '❌')}")
+            if idx != len(service_rows) - 1:
+                lines.append("")
+    else:
+        lines.append("Сервисов пока нет.")
+
+    kb = InlineKeyboardMarkup(row_width=1)
+    for srv_num, _, _, display_name in service_rows:
+        kb.add(InlineKeyboardButton(f"📡 {display_name}", callback_data=f"api_service_{srv_num}"))
 
     kb.row(
         InlineKeyboardButton("➕ Добавить сервис", callback_data="add_service"),
-        InlineKeyboardButton("🗑 Удалить сервис", callback_data="delete_service")
+        InlineKeyboardButton("➖ Удалить сервис", callback_data="delete_service"),
     )
-
     kb.add(InlineKeyboardButton("◀️ Назад", callback_data="return_to_settings"))
 
-    bot.edit_message_text(text_, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb)
+    return "\n".join(lines).strip(), kb
+
+
+def _build_api_service_card_not_found() -> Tuple[str, InlineKeyboardMarkup]:
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("◀️ Назад", callback_data="api_settings"))
+    return "❌ Сервис не найден.", kb
+
+
+def render_api_service_card(cfg: Dict, service_idx: int) -> Tuple[str, InlineKeyboardMarkup]:
+    services = cfg.get("services", {}) or {}
+    service_cfg = services.get(str(service_idx))
+    if not service_cfg:
+        return _build_api_service_card_not_found()
+
+    display_name = build_service_display_name(service_idx, service_cfg.get("api_url"), service_cfg.get("name"))
+    balance_payload = _get_service_balance_payload(service_idx, service_cfg)
+
+    lines = [
+        f"📡 {display_name}",
+        "",
+        f"Ключ: {mask_api_key(service_cfg.get('api_key'))}",
+        f"Статус API: {balance_payload.get('status_emoji', '❌')}",
+        f"Баланс: {balance_payload.get('balance_text', 'недоступно')}",
+    ]
+
+    if _is_api_key_length_suspicious(service_cfg.get("api_key")):
+        lines.extend(
+            [
+                "",
+                "⚠️ Ключ выглядит некорректно",
+                "Обычно API key берётся в настройках API панели.",
+            ]
+        )
+
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("Изменить ссылку", callback_data=f"edit_apiurl_{service_idx}"))
+    kb.add(InlineKeyboardButton("Изменить ключ", callback_data=f"edit_apikey_{service_idx}"))
+    kb.add(InlineKeyboardButton("Изменить название сервиса", callback_data=f"edit_apiname_{service_idx}"))
+    kb.add(InlineKeyboardButton("Изменить номер сервиса", callback_data=f"edit_apinum_{service_idx}"))
+    kb.add(InlineKeyboardButton("Обновить баланс", callback_data=f"check_balance_{service_idx}"))
+    kb.add(InlineKeyboardButton("◀️ Назад", callback_data="api_settings"))
+
+    return "\n".join(lines).strip(), kb
+
+
+def _open_api_menu(chat_id: int, message_id: Optional[int] = None):
+    cfg = load_config()
+    text_, kb = render_api_menu(cfg)
+    if message_id is None:
+        bot.send_message(chat_id, text_, reply_markup=kb)
+        return
+
+    try:
+        bot.edit_message_text(text_, chat_id, message_id, reply_markup=kb)
+    except Exception as ex:
+        if "message is not modified" not in str(ex).lower():
+            raise
+
+
+def _open_api_service_card(chat_id: int, service_idx: int, message_id: Optional[int] = None):
+    cfg = load_config()
+    text_, kb = render_api_service_card(cfg, service_idx)
+    if message_id is None:
+        bot.send_message(chat_id, text_, reply_markup=kb)
+        return
+
+    try:
+        bot.edit_message_text(text_, chat_id, message_id, reply_markup=kb)
+    except Exception as ex:
+        if "message is not modified" not in str(ex).lower():
+            raise
+
+
+def api_settings_menu(call):
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+
+    _clear_step_handler(call.message.chat.id)
+    _clear_navigation_states(call.message.chat.id)
+    _open_api_menu(call.message.chat.id, message_id=call.message.message_id)
 
 
 def process_apiurl_change(message: types.Message, service_idx: int):
-    new_url = message.text.strip()
-
-    if not new_url.startswith(("http://", "https://")):
-        _repeat_ui_input_flow(message.chat.id, "❌ URL должен начинаться с http:// или https://")
-        return
-
     cfg = load_config()
-    if str(service_idx) not in cfg["services"]:
+    service_cfg = (cfg.get("services") or {}).get(str(service_idx))
+    if not service_cfg:
         _clear_ui_input_state(message.chat.id)
-        kb_ = InlineKeyboardMarkup()
-        kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="api_settings"))
-        bot.send_message(message.chat.id, f"❌ Сервис #{service_idx} не найден в конфигурации.", reply_markup=kb_)
+        bot.send_message(message.chat.id, "❌ Сервис не найден.")
         return
 
-    old_url = cfg["services"][str(service_idx)]["api_url"]
-    cfg["services"][str(service_idx)]["api_url"] = new_url
+    raw_url = str(message.text or "").strip()
+    try:
+        normalized_url = normalize_api_url(raw_url)
+    except ValueError as ex:
+        _repeat_ui_input_flow(message.chat.id, f"❌ Ошибка: {ex}.")
+        return
+    except Exception:
+        _repeat_ui_input_flow(message.chat.id, "❌ Ошибка: не удалось обработать ссылку.")
+        return
+
+    old_url = str(service_cfg.get("api_url") or "").strip()
+    old_name = service_cfg.get("name")
+
+    service_cfg["api_url"] = normalized_url
+    if _service_name_is_default(old_name, service_idx, old_url):
+        service_cfg["name"] = build_service_display_name(service_idx, normalized_url, None)
+
     save_config(cfg)
     _clear_ui_input_state(message.chat.id)
-
-    kb_ = InlineKeyboardMarkup(row_width=1)
-    kb_.add(
-        InlineKeyboardButton("✅ Проверить баланс", callback_data=f"check_balance_{service_idx}"),
-        InlineKeyboardButton("◀️ Назад", callback_data="api_settings")
-    )
-
-    text_ = f"""
-✅ <b>URL сервиса #{service_idx} успешно обновлен!</b>
-
-• <b>Было:</b> <code>{html.escape(str(old_url))}</code>
-• <b>Стало:</b> <code>{html.escape(str(new_url))}</code>
-
-Вы можете сразу проверить баланс сервиса для проверки работоспособности.
-    """.strip()
-
-    bot.send_message(message.chat.id, text_, parse_mode="HTML", reply_markup=kb_)
+    _open_api_service_card(message.chat.id, service_idx)
 
 
 def process_apikey_change(message: types.Message, service_idx: int):
-    new_key = message.text.strip()
-
+    new_key = _normalize_api_key(message.text)
     if not new_key:
-        _repeat_ui_input_flow(message.chat.id, "❌ API ключ не может быть пустым")
+        _repeat_ui_input_flow(message.chat.id, "❌ API ключ не может быть пустым.")
         return
 
     cfg = load_config()
-    if str(service_idx) not in cfg["services"]:
+    service_cfg = (cfg.get("services") or {}).get(str(service_idx))
+    if not service_cfg:
         _clear_ui_input_state(message.chat.id)
-        kb_ = InlineKeyboardMarkup()
-        kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="api_settings"))
-        bot.send_message(message.chat.id, f"❌ Сервис #{service_idx} не найден в конфигурации.", reply_markup=kb_)
+        bot.send_message(message.chat.id, "❌ Сервис не найден.")
         return
 
-    old_key = cfg["services"][str(service_idx)]["api_key"]
-    old_key_masked = f"{old_key[:4]}...{old_key[-4:]}" if len(old_key) > 8 else old_key
-    new_key_masked = f"{new_key[:4]}...{new_key[-4:]}" if len(new_key) > 8 else new_key
-
-    cfg["services"][str(service_idx)]["api_key"] = new_key
+    service_cfg["api_key"] = new_key
     save_config(cfg)
     _clear_ui_input_state(message.chat.id)
+    _open_api_service_card(message.chat.id, service_idx)
 
-    kb_ = InlineKeyboardMarkup(row_width=1)
-    kb_.add(
-        InlineKeyboardButton("✅ Проверить баланс", callback_data=f"check_balance_{service_idx}"),
-        InlineKeyboardButton("◀️ Назад", callback_data="api_settings")
-    )
 
-    warning_text = ""
-    if len(new_key) != EXPECTED_API_KEY_LENGTH:
-        warning_text = (
-            "\n\n⚠️ Длина API-ключа отличается от ожидаемой (60 символов). Проверьте корректность ключа."
-        )
+def process_apiname_change(message: types.Message, service_idx: int):
+    new_name = re.sub(r"\s+", " ", str(message.text or "").strip())
+    if not new_name:
+        _repeat_ui_input_flow(message.chat.id, "❌ Название сервиса не может быть пустым.")
+        return
 
-    text_ = f"""
-✅ <b>API-ключ сервиса #{service_idx} успешно обновлен!</b>
+    cfg = load_config()
+    service_cfg = (cfg.get("services") or {}).get(str(service_idx))
+    if not service_cfg:
+        _clear_ui_input_state(message.chat.id)
+        bot.send_message(message.chat.id, "❌ Сервис не найден.")
+        return
 
-• <b>Было:</b> <code>{html.escape(str(old_key_masked))}</code>
-• <b>Стало:</b> <code>{html.escape(str(new_key_masked))}</code>{warning_text}
+    service_cfg["name"] = new_name
+    save_config(cfg)
+    _clear_ui_input_state(message.chat.id)
+    _open_api_service_card(message.chat.id, service_idx)
 
-Вы можете сразу проверить баланс сервиса для проверки работоспособности.
-    """.strip()
 
-    bot.send_message(message.chat.id, text_, parse_mode="HTML", reply_markup=kb_)
+def process_apinum_change(message: types.Message, service_idx: int):
+    try:
+        new_service_idx = int(str(message.text or "").strip())
+        if new_service_idx < 1:
+            raise ValueError
+    except ValueError:
+        _repeat_ui_input_flow(message.chat.id, "❌ Ошибка: номер сервиса должен быть положительным числом.")
+        return
+
+    cfg = load_config()
+    services = cfg.get("services", {}) or {}
+    old_key = str(service_idx)
+    new_key = str(new_service_idx)
+
+    if old_key not in services:
+        _clear_ui_input_state(message.chat.id)
+        bot.send_message(message.chat.id, "❌ Сервис не найден.")
+        return
+
+    if new_key != old_key and new_key in services:
+        _repeat_ui_input_flow(message.chat.id, f"❌ Сервис #{new_service_idx} уже существует.")
+        return
+
+    service_cfg = dict(services.pop(old_key))
+    service_cfg["name"] = build_service_display_name(new_service_idx, service_cfg.get("api_url"), service_cfg.get("name"))
+    services[new_key] = service_cfg
+    cfg["services"] = {k: v for k, v in _sort_service_items(services)}
+
+    save_config(cfg)
+    _clear_ui_input_state(message.chat.id)
+    _open_api_service_card(message.chat.id, new_service_idx)
 
 
 def check_balance_func(call: types.CallbackQuery, service_idx: int):
-    cfg = load_config()
-    s_ = cfg["services"].get(str(service_idx))
-    if not s_:
-        bot.edit_message_text(f"❌ Сервис {service_idx} не найден.", call.message.chat.id, call.message.message_id)
-        return
-        
-    bot.edit_message_text(f"⏳ Проверка баланса сервиса #{service_idx}...", 
-                         call.message.chat.id, call.message.message_id)
-                         
-    url_ = f"{s_['api_url']}?action=balance&key={s_['api_key']}"
-    
     try:
-        rr = requests.get(url_, timeout=10)
-        rr.raise_for_status()
-        d_ = rr.json()
-        bal_ = d_.get("balance", "0")
-        
-
-        text_ = f"""
-<b>💰 Баланс сервиса #{service_idx}</b>
-
-• <b>Текущий баланс:</b> <code>{bal_}</code>
-• <b>Сервис:</b> <code>{s_['api_url'].split('/')[2]}</code>
-• <b>Время запроса:</b> <code>{datetime.now().strftime('%H:%M:%S')}</code>
-        """.strip()
-        
-        kb_ = InlineKeyboardMarkup()
-        kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="api_settings"))
-        
-        bot.edit_message_text(text_, call.message.chat.id, call.message.message_id, 
-                             parse_mode="HTML", reply_markup=kb_)
-                             
-    except requests.exceptions.Timeout:
-        kb_ = InlineKeyboardMarkup()
-        kb_.add(InlineKeyboardButton("🔄 Повторить", callback_data=f"check_balance_{service_idx}"))
-        kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="api_settings"))
-        
-        bot.edit_message_text(f"⚠️ Время ожидания ответа от сервиса #{service_idx} истекло.",
-                             call.message.chat.id, call.message.message_id, reply_markup=kb_)
-                             
-    except Exception as e:
-        kb_ = InlineKeyboardMarkup()
-        kb_.add(InlineKeyboardButton("🔄 Повторить", callback_data=f"check_balance_{service_idx}"))
-        kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="api_settings"))
-        
-        bot.edit_message_text(f"❌ Ошибка при запросе баланса сервиса #{service_idx}:\n<code>{str(e)[:100]}</code>", 
-                             call.message.chat.id, call.message.message_id, 
-                             parse_mode="HTML", reply_markup=kb_)
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+    _clear_step_handler(call.message.chat.id)
+    _clear_navigation_states(call.message.chat.id)
+    _open_api_service_card(call.message.chat.id, service_idx, message_id=call.message.message_id)
 
 
 def change_fallback_snum_prompt(call: types.CallbackQuery):
@@ -4933,14 +5382,28 @@ def api_settings_callback(call: types.CallbackQuery):
     api_settings_menu(call)
 
 
+def api_service_callback(call: types.CallbackQuery):
+    idx_ = int(call.data.split("_")[-1])
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+    _clear_step_handler(call.message.chat.id)
+    _clear_navigation_states(call.message.chat.id)
+    _open_api_service_card(call.message.chat.id, idx_, message_id=call.message.message_id)
+
+
 def edit_apiurl(call: types.CallbackQuery):
     idx_ = int(call.data.split("_")[-1])
+    cfg = load_config()
+    service_cfg = (cfg.get("services") or {}).get(str(idx_)) or {}
+    current_url = str(service_cfg.get("api_url") or "").strip() or "не задан"
     _start_ui_input_flow(
         call,
-        f"Введите новый URL для сервиса #{idx_}:",
+        f"Введите ссылку или домен для сервиса #{idx_}:\n\nТекущий URL: {current_url}",
         process_apiurl_change,
         idx_,
-        back_target="api_settings",
+        back_target=f"api_service_{idx_}",
     )
 
 
@@ -4951,7 +5414,32 @@ def edit_apikey(call: types.CallbackQuery):
         f"Введите новый ключ для сервиса #{idx_}:",
         process_apikey_change,
         idx_,
-        back_target="api_settings",
+        back_target=f"api_service_{idx_}",
+    )
+
+
+def edit_apiname(call: types.CallbackQuery):
+    idx_ = int(call.data.split("_")[-1])
+    cfg = load_config()
+    service_cfg = (cfg.get("services") or {}).get(str(idx_)) or {}
+    current_name = build_service_display_name(idx_, service_cfg.get("api_url"), service_cfg.get("name"))
+    _start_ui_input_flow(
+        call,
+        f"Введите новое название сервиса #{idx_}:\n\nТекущее название: {current_name}",
+        process_apiname_change,
+        idx_,
+        back_target=f"api_service_{idx_}",
+    )
+
+
+def edit_apinum(call: types.CallbackQuery):
+    idx_ = int(call.data.split("_")[-1])
+    _start_ui_input_flow(
+        call,
+        f"Введите новый номер для сервиса #{idx_}:",
+        process_apinum_change,
+        idx_,
+        back_target=f"api_service_{idx_}",
     )
 
 
@@ -5136,7 +5624,7 @@ def delete_service(call: types.CallbackQuery):
 
 def process_add_service(message: types.Message):
     try:
-        srv_num = int(message.text.strip())
+        srv_num = int(str(message.text or "").strip())
         if srv_num < 1:
             raise ValueError
     except ValueError:
@@ -5144,39 +5632,42 @@ def process_add_service(message: types.Message):
         return
 
     cfg = load_config()
-    if str(srv_num) in cfg["services"]:
+    services = cfg.get("services", {}) or {}
+    service_key = str(srv_num)
+    if service_key in services:
         _repeat_ui_input_flow(message.chat.id, f"❌ Сервис #{srv_num} уже существует.")
         return
 
-    cfg["services"][str(srv_num)] = {
+    services[service_key] = {
+        "name": build_service_display_name(srv_num, "https://example.com/api/v2", None),
         "api_url": "https://example.com/api/v2",
-        "api_key": "YOUR_API_KEY"
+        "api_key": "YOUR_API_KEY",
     }
+    cfg["services"] = {k: v for k, v in _sort_service_items(services)}
     save_config(cfg)
     _clear_ui_input_state(message.chat.id)
-    kb_ = InlineKeyboardMarkup()
-    kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="api_settings"))
-    bot.send_message(message.chat.id, f"✅ Сервис #{srv_num} добавлен. Настройте его URL и ключ.", reply_markup=kb_)
+    _open_api_service_card(message.chat.id, srv_num)
 
 
 def process_delete_service(message: types.Message):
     try:
-        srv_num = int(message.text.strip())
+        srv_num = int(str(message.text or "").strip())
     except ValueError:
         _repeat_ui_input_flow(message.chat.id, "❌ Ошибка: Номер сервиса должен быть числом.")
         return
 
     cfg = load_config()
-    if str(srv_num) not in cfg["services"]:
+    services = cfg.get("services", {}) or {}
+    service_key = str(srv_num)
+    if service_key not in services:
         _repeat_ui_input_flow(message.chat.id, f"❌ Сервис #{srv_num} не существует.")
         return
 
-    del cfg["services"][str(srv_num)]
+    del services[service_key]
+    cfg["services"] = {k: v for k, v in _sort_service_items(services)}
     save_config(cfg)
     _clear_ui_input_state(message.chat.id)
-    kb_ = InlineKeyboardMarkup()
-    kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="api_settings"))
-    bot.send_message(message.chat.id, f"✅ Сервис #{srv_num} удален.", reply_markup=kb_)
+    _open_api_menu(message.chat.id)
 
 
 def set_notification_chat_id(call: types.CallbackQuery):
@@ -5608,6 +6099,8 @@ def init_commands(c_: Cardinal):
     _add_cb(page_navigation, func=lambda call: call.data.startswith("prev_page_") or call.data.startswith("next_page_"))
     _add_cb(show_orders, func=lambda call: call.data == "show_orders")
     _add_cb(analytics_period, func=lambda call: call.data.startswith("analytics_period_"))
+    _add_cb(analytics_more, func=lambda call: call.data.startswith("analytics_more_"))
+    _add_cb(analytics_less, func=lambda call: call.data.startswith("analytics_less_"))
     _add_cb(upload_lots_json, func=lambda call: call.data == "upload_lots_json")
     _add_cb(export_files, func=lambda call: call.data == "export_files")
     _add_cb(export_errors, func=lambda call: call.data == "export_errors")
@@ -5632,9 +6125,12 @@ def init_commands(c_: Cardinal):
     _add_cb(change_snum, func=lambda call: call.data.startswith("change_snum_"))
     _add_cb(delete_one_lot_callback, func=lambda call: call.data.startswith("delete_one_lot_"))
     _add_cb(api_settings_callback, func=lambda call: call.data == "api_settings")
+    _add_cb(api_service_callback, func=lambda call: call.data.startswith("api_service_"))
     _add_cb(header_no_action_callback, func=lambda call: call.data == "header_no_action")
     _add_cb(edit_apiurl, func=lambda call: call.data.startswith("edit_apiurl_"))
     _add_cb(edit_apikey, func=lambda call: call.data.startswith("edit_apikey_"))
+    _add_cb(edit_apiname, func=lambda call: call.data.startswith("edit_apiname_"))
+    _add_cb(edit_apinum, func=lambda call: call.data.startswith("edit_apinum_"))
     _add_cb(check_balance, func=lambda call: call.data.startswith("check_balance_"))
     _add_cb(add_new_lot, func=lambda call: call.data == "add_new_lot")
     _add_cb(edit_messages_menu, func=lambda call: call.data == "edit_messages")
