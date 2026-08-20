@@ -3,7 +3,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 if TYPE_CHECKING:
     from cardinal import Cardinal
 
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 from types import SimpleNamespace
 from pathlib import Path
 import re
@@ -18,6 +18,8 @@ import io
 import sys
 import subprocess
 import html
+import hashlib
+import unicodedata
 
 from datetime import datetime, timedelta
 
@@ -33,8 +35,8 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 # =========================================================
 
 NAME = "AutoSMM"
-VERSION = "0.0.8.3"
-DESCRIPTION = "Плагин для автоматической накрутки через 2+ сервис"
+VERSION = "0.0.9"
+DESCRIPTION = "AutoSMM v0.0.9 Final: polished buyer templates, safer order reference commands, clean storage paths, telemetry gate, and buyer-flow safety."
 CREDITS = "@w1bbex"
 UUID = "a6ccb3f1-3e7b-4984-9e4c-01d3ea7e0ad8"
 SETTINGS_PAGE = False
@@ -63,18 +65,141 @@ def normalize_incoming_text(text: Any) -> str:
     value = value.translate(ZERO_WIDTH_INVISIBLE_CHARS)
     return value.strip()
 
+
+def h(value: Any) -> str:
+    return html.escape(str(value or ""))
+
+
+def clean_tg_text(text: Any) -> str:
+    value = str(text or "").strip()
+    value = re.sub(r"\n{3,}", "\n\n", value)
+    return value
+
 waiting_for_lots_upload = set()
+waiting_for_backup_restore_upload = set()
 LOT_PAGE_CONTEXT: Dict[int, int] = {}
 LOT_INPUT_STATES: Dict[int, Dict[str, Any]] = {}
 LOT_CARD_CONTEXT: Dict[int, Dict[str, Any]] = {}
 UI_INPUT_STATES: Dict[int, Dict[str, Any]] = {}
 SEARCH_RESULT_CONTEXT: Dict[int, Dict[str, Any]] = {}
 ANALYTICS_VIEW_MODES: Dict[Tuple[int, int], str] = {}
+DELETE_CONFIRM_GRACE_UNTIL: Dict[int, float] = {}
 
-LOG_DIR = os.path.join("storage", "logs")
-os.makedirs(LOG_DIR, exist_ok=True)
-LOG_PATH = os.path.join(LOG_DIR, "auto_smm.log")
-EXPECTED_API_KEY_LENGTH = 60
+PLUGIN_FILE_PATH = Path(__file__).resolve()
+PLUGIN_DIR = PLUGIN_FILE_PATH.parent
+CARDINAL_ROOT = PLUGIN_DIR.parent if PLUGIN_DIR.name.lower() == "plugins" else Path.cwd()
+
+BASE_STORAGE_DIR = CARDINAL_ROOT / "storage" / "w1bbex" / "AutoSMM"
+AUTOSMM_DATA_DIR = str(BASE_STORAGE_DIR)
+CONFIG_PATH = str(BASE_STORAGE_DIR / "auto_lots.json")
+VALID_LINKS_PATH = str(BASE_STORAGE_DIR / "valid_link.json")
+ORDERS_PATH = str(BASE_STORAGE_DIR / "auto_smm_orders.json")
+ORDERS_DATA_PATH = str(BASE_STORAGE_DIR / "orders_data.json")
+ORDERS_RUNTIME_PATH = str(BASE_STORAGE_DIR / "orders_runtime.json")
+AUTOSMM_STATE_PATH = str(BASE_STORAGE_DIR / "auto_smm_state.json")
+LOGS_DIR = str(BASE_STORAGE_DIR / "logs")
+BACKUPS_DIR = str(BASE_STORAGE_DIR / "backups")
+LOG_DIR = LOGS_DIR
+AUTOSMM_BACKUPS_DIR = BACKUPS_DIR
+LOG_PATH = str(Path(LOGS_DIR) / "auto_smm.log")
+
+LEGACY_CACHE_DIR = CARDINAL_ROOT / "storage" / "cache"
+LEGACY_LOGS_DIR = CARDINAL_ROOT / "storage" / "logs"
+LEGACY_CONFIG_PATH = str(LEGACY_CACHE_DIR / "auto_lots.json")
+LEGACY_ORDERS_PATH = str(LEGACY_CACHE_DIR / "auto_smm_orders.json")
+LEGACY_ORDERS_DATA_PATH = str(LEGACY_CACHE_DIR / "orders_data.json")
+LEGACY_ORDERS_RUNTIME_PATH = str(LEGACY_CACHE_DIR / "orders_runtime.json")
+LEGACY_VALID_LINKS_PATH = str(LEGACY_CACHE_DIR / "valid_link.json")
+LEGACY_AUTOSMM_STATE_PATH = str(LEGACY_CACHE_DIR / "auto_smm_state.json")
+LEGACY_AUTOSMM_BACKUPS_DIR = str(LEGACY_CACHE_DIR / "autosmm_backups")
+LEGACY_LOG_PATH = str(LEGACY_LOGS_DIR / "auto_smm.log")
+
+NESTED_STORAGE_FILE_MAP = {
+    CONFIG_PATH: str(BASE_STORAGE_DIR / "config" / "auto_lots.json"),
+    VALID_LINKS_PATH: str(BASE_STORAGE_DIR / "config" / "valid_link.json"),
+    ORDERS_PATH: str(BASE_STORAGE_DIR / "orders" / "auto_smm_orders.json"),
+    ORDERS_DATA_PATH: str(BASE_STORAGE_DIR / "orders" / "orders_data.json"),
+    ORDERS_RUNTIME_PATH: str(BASE_STORAGE_DIR / "runtime" / "orders_runtime.json"),
+    AUTOSMM_STATE_PATH: str(BASE_STORAGE_DIR / "runtime" / "auto_smm_state.json"),
+}
+
+AUTOSMM_LEGACY_FILE_MAP = {
+    CONFIG_PATH: LEGACY_CONFIG_PATH,
+    VALID_LINKS_PATH: LEGACY_VALID_LINKS_PATH,
+    ORDERS_PATH: LEGACY_ORDERS_PATH,
+    ORDERS_DATA_PATH: LEGACY_ORDERS_DATA_PATH,
+    ORDERS_RUNTIME_PATH: LEGACY_ORDERS_RUNTIME_PATH,
+    AUTOSMM_STATE_PATH: LEGACY_AUTOSMM_STATE_PATH,
+}
+
+for _autosmm_dir in (AUTOSMM_DATA_DIR, AUTOSMM_BACKUPS_DIR, LOG_DIR):
+    os.makedirs(_autosmm_dir, exist_ok=True)
+
+EXPECTED_API_KEY_LENGTH = 60  # стандарт SocPanel v2; AutoSMM рассчитан на панели SocPanel v2
+
+
+def _path_has_content(path_value: str) -> bool:
+    try:
+        return os.path.exists(path_value) and os.path.getsize(path_value) > 0
+    except Exception:
+        return os.path.exists(path_value)
+
+
+def _copy_storage_file_if_needed(new_path: str, old_path: str, copied: List[str], source_label: str) -> None:
+    try:
+        if _path_has_content(new_path) or not os.path.exists(old_path):
+            return
+        os.makedirs(os.path.dirname(new_path), exist_ok=True)
+        shutil.copy2(old_path, new_path)
+        copied.append(f"{os.path.basename(old_path)} -> {os.path.basename(new_path)} ({source_label})")
+    except Exception as ex:
+        logger.warning(f"AUTO SMM STORAGE MIGRATION: не удалось скопировать {old_path} -> {new_path}: {ex}")
+
+
+def _migrate_nested_storage_layout_once() -> None:
+    """Copy files from the failed config/orders/runtime layout into the final flat layout."""
+    copied: List[str] = []
+    for new_path, old_path in NESTED_STORAGE_FILE_MAP.items():
+        _copy_storage_file_if_needed(new_path, old_path, copied, "nested")
+    if copied:
+        logger.info(f"AUTO SMM STORAGE MIGRATION: nested -> flat: {', '.join(copied)}")
+
+
+def _migrate_autosmm_files_from_legacy_if_needed():
+    """Copy old AutoSMM files into final storage/w1bbex/AutoSMM flat layout once.
+
+    This is intentionally copy-only: old files are not removed automatically.
+    """
+    try:
+        os.makedirs(AUTOSMM_DATA_DIR, exist_ok=True)
+        os.makedirs(AUTOSMM_BACKUPS_DIR, exist_ok=True)
+        os.makedirs(LOG_DIR, exist_ok=True)
+        _migrate_nested_storage_layout_once()
+        copied: List[str] = []
+        for new_path, legacy_path in AUTOSMM_LEGACY_FILE_MAP.items():
+            _copy_storage_file_if_needed(new_path, legacy_path, copied, "storage/cache")
+        if copied:
+            state = {}
+            try:
+                if os.path.exists(AUTOSMM_STATE_PATH):
+                    with open(AUTOSMM_STATE_PATH, "r", encoding="utf-8") as f:
+                        loaded_state = json.load(f)
+                        if isinstance(loaded_state, dict):
+                            state = loaded_state
+            except Exception:
+                state = {}
+            state["legacy_files_migrated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            state["legacy_files_migrated_from"] = "storage/cache"
+            try:
+                with open(AUTOSMM_STATE_PATH, "w", encoding="utf-8") as f:
+                    json.dump(state, f, ensure_ascii=False, indent=4)
+            except Exception as ex:
+                logger.warning(f"AUTO SMM LEGACY MIGRATION: не удалось записать состояние миграции: {ex}")
+            logger.info(f"AUTO SMM LEGACY MIGRATION: скопированы файлы: {', '.join(copied)}")
+    except Exception as ex:
+        logger.warning(f"AUTO SMM LEGACY MIGRATION FAILED: {ex}")
+
+_migrate_autosmm_files_from_legacy_if_needed()
 
 logger.setLevel(logging.INFO)
 if not any(isinstance(handler, logging.FileHandler) and getattr(handler, "baseFilename", None) == os.path.abspath(LOG_PATH) for handler in logger.handlers):
@@ -92,28 +217,328 @@ AUTO_LOTS_SEND_THREAD = None
 orders_info = {}
 processed_users = {}
 waiting_for_link: Dict[str, Dict] = {}
+BUYER_ORDER_SELECTION: Dict[str, str] = {}
+
+BUYER_STATE_WAITING_LINK = "waiting_link"
+BUYER_STATE_LINK_PAUSED = "link_paused"
+BUYER_STATE_WAITING_CONFIRM = "waiting_confirm"
+BUYER_STATE_PANEL_CREATED = "panel_created"
+BUYER_STATE_COMPLETED = "completed"
+BUYER_STATE_FAILED = "failed"
+BUYER_STATE_REFUNDED = "refunded"
+BUYER_ACTIVE_PRE_PANEL_STATES = {
+    BUYER_STATE_WAITING_LINK,
+    BUYER_STATE_LINK_PAUSED,
+    BUYER_STATE_WAITING_CONFIRM,
+}
+BUYER_REFUND_BLOCK_TEXT = "По этому заказу оформлен возврат.\nАвтоматическое выполнение недоступно."
+BUYER_PANEL_CREATED_BLOCK_TEXT = "Заказ уже передан в работу.\nИзменить ссылку автоматически нельзя."
 
 bot = None
 config = {}
 lot_mapping = {}
 cardinal_instance = None
 
-CONFIG_PATH = os.path.join("storage", "cache", "auto_lots.json")
-VALID_LINKS_PATH = os.path.join("storage", "cache", "valid_link.json")
-ORDERS_PATH = os.path.join("storage", "cache", "auto_smm_orders.json")
-ORDERS_DATA_PATH = os.path.join("storage", "cache", "orders_data.json")
-ORDERS_RUNTIME_PATH = os.path.join("storage", "cache", "orders_runtime.json")
-AUTOSMM_STATE_PATH = os.path.join("storage", "cache", "auto_smm_state.json")
-os.makedirs(os.path.dirname(ORDERS_PATH), exist_ok=True)
-os.makedirs(os.path.dirname(ORDERS_DATA_PATH), exist_ok=True)
-os.makedirs(os.path.dirname(ORDERS_RUNTIME_PATH), exist_ok=True)
-os.makedirs(os.path.dirname(AUTOSMM_STATE_PATH), exist_ok=True)
+DEFAULT_VALID_LINKS = [
+    "vk.com",
+    "m.vk.com",
+    "t.me",
+    "telegram.me",
+    "instagram.com",
+    "tiktok.com",
+    "vm.tiktok.com",
+    "vt.tiktok.com",
+    "youtube.com",
+    "youtu.be",
+    "twitch.tv",
+    "kick.com",
+    "twitter.com",
+    "x.com",
+    "threads.net",
+    "facebook.com",
+    "fb.com",
+    "ok.ru",
+    "rutube.ru",
+    "dzen.ru",
+    "discord.gg",
+    "discord.com",
+]
+LEGACY_DEFAULT_VALID_LINKS = [
+    "vk.com",
+    "instagram.com",
+    "tiktok.com",
+    "youtube.com",
+    "youtu.be",
+    "t.me",
+    "twitter.com",
+]
+VALID_LINKS_MIGRATION_STATE_KEY = "valid_links_defaults_migrated"
+# AutoSMM telemetry endpoint. Payload contains only plugin_name, version and anonymous_install_id.
+# anonymous_install_id is SHA-256 hash derived locally from FunPay username + FunPay ID.
+# Raw FunPay username/FunPay ID are never sent.
+TELEMETRY_URL = "https://api.autooffline.ru/v1/autosmm/telemetry"
+TELEMETRY_CONSENT_KEY = "telemetry_consent"
+TELEMETRY_IDENTITY_HASH_KEY = "telemetry_identity_hash"
+TELEMETRY_IDENTITY_SOURCE_KEY = "telemetry_identity_source"
+TELEMETRY_IDENTITY_DEBUG_KEY = "telemetry_identity_debug"
+TELEMETRY_LAST_PING_ATTEMPT_KEY = "telemetry_last_ping_attempt_at"
+TELEMETRY_LAST_PING_OK_KEY = "telemetry_last_ping_ok_at"
+TELEMETRY_LAST_PING_ERROR_KEY = "telemetry_last_ping_error"
+TELEMETRY_PING_INTERVAL_SECONDS = 86400
+TELEMETRY_TIMEOUT_SECONDS = 5
+TELEMETRY_SECURITY_URL = "https://teletype.in/@w1bbex/AutoSMM-Security"
+AUTOSMM_V008_NO_TELEMETRY_URL = "https://t.me/w1bbexplugins/25"
+TELEMETRY_GUEST_USED_KEY = "telemetry_guest_used"
+TELEMETRY_GUEST_STARTED_AT_KEY = "telemetry_guest_started_at"
+TELEMETRY_GUEST_UNTIL_KEY = "telemetry_guest_until"
 
-PLUGIN_FILE_PATH = Path(__file__).resolve()
-PLUGIN_DIR = PLUGIN_FILE_PATH.parent
+AUTOSMM_BACKUP_VERSION = 1
+AUTOSMM_BACKUP_FILE_MAP = {
+    "auto_lots.json": CONFIG_PATH,
+    "auto_smm_orders.json": ORDERS_PATH,
+    "orders_data.json": ORDERS_DATA_PATH,
+    "orders_runtime.json": ORDERS_RUNTIME_PATH,
+    "valid_link.json": VALID_LINKS_PATH,
+    "auto_smm_state.json": AUTOSMM_STATE_PATH,
+}
+AUTOSMM_BACKUP_DEFAULTS = {
+    "auto_lots.json": {},
+    "auto_smm_orders.json": [],
+    "orders_data.json": [],
+    "orders_runtime.json": {},
+    "valid_link.json": [],
+    "auto_smm_state.json": {},
+}
+
+DEFAULT_AFTER_PAYMENT_TEMPLATE = """👾 Благодарю за оплату!
+
+🧾 Заказ: #{order_id_funpay}
+📦 Лот: {lot_title}
+
+Чтобы запустить выполнение, отправьте ссылку на страницу, пост или профиль.
+
+Ссылка должна начинаться с:
+https://
+
+Если пока не готовы отправить ссылку:
+!ссылка
+
+Ваши заказы:
+!смм"""
+
+DEFAULT_AFTER_CONFIRMATION_TEMPLATE = """🎉 Заказ запущен!
+
+🧾 Заказ FunPay: #{order_id_funpay}
+🔢 ID заказа в сервисе: {panel_order_id}
+📦 Лот: {lot_title}
+
+🔗 Ссылка:
+{link}
+
+Проверить статус:
+чек {panel_order_id}
+
+Ваши заказы:
+!смм"""
+
+DEFAULT_LINK_CONFIRM_TEMPLATE = """✅ Ссылка получена
+
+🧾 Заказ: #{order_id_funpay}
+📦 Лот: {lot_title}
+
+🔗 Ссылка:
+{link}
+
+Подтвердите запуск:
+
++ — запустить
+- — изменить ссылку"""
+
+DEFAULT_AFTER_COMPLETED_TEMPLATE = """✅ Заказ выполнен!
+
+🧾 Заказ FunPay: #{order_id_funpay}
+🔢 ID заказа в сервисе: {panel_order_id}
+📦 Лот: {lot_title}
+
+Пожалуйста, подтвердите выполнение заказа:
+https://funpay.com/orders/{order_id_funpay}/
+
+Спасибо за покупку!"""
+
+DEFAULT_BUYER_COMMANDS_TEMPLATE = """📋 Команды AutoSMM
+
+!смм — ваши SMM-заказы
+!ссылка — приостановить или продолжить ожидание ссылки
+!ссылка НОМЕР — выбрать конкретный заказ
+
+!отмена — запросить отмену заказа, если продавец разрешил автоотмену
+
+чек НОМЕР — проверить статус заказа
+рефилл НОМЕР — запросить рефилл, если услуга поддерживает гарантию
+
+НОМЕР — это ID заказа в сервисе или номер заказа FunPay."""
+
+LEGACY_AFTER_CONFIRMATION_DEFAULTS = {
+    """🎉 Ваш заказ успешно оформлен!
+
+🔢 ID заказа в сервисе: {twiboost_id}
+🔗 Для отслеживания переходите по ссылке: {link}
+
+📋 Доступные команды:
+🔍 чек {twiboost_id} — Проверить статус заказа
+🔄 рефилл {twiboost_id} — Запросить рефилл
+
+Если у вас возникнут вопросы, не стесняйтесь обращаться!""",
+    """🎉 Ваш заказ успешно оформлен!
+
+🔢 ID заказа в сервисе: {twiboost_id}
+🔗 Для отслеживания переходите по ссылке: {link}
+
+📋 Доступные команды:
+🔍 чек {twiboost_id} — Проверить статус заказа (выводит информацию о заказе)
+🔄 рефилл {twiboost_id} — Запросить рефилл (работает лишь с гарантией - восстанавливает отписанных подписчиков)
+
+Если у вас возникнут вопросы, не стесняйтесь обращаться!""",
+    """🎉 Ваш заказ успешно оформлен!
+
+Лот: {lot_title}
+🔢 ID заказа в сервисе: {panel_order_id}
+🔗 Ссылка: {link}
+
+📋 Доступные команды:
+🔍 чек {panel_order_id} — проверить статус заказа
+🔄 рефилл {panel_order_id} — запросить рефилл, если услуга поддерживает гарантию
+📦 !смм — список заказов
+❓ !команды — помощь
+
+Если у вас возникнут вопросы, не стесняйтесь обращаться!""",
+
+}
+
+LEGACY_AFTER_PAYMENT_DEFAULTS = {
+    """❤️ Благодарим за оплату!
+
+Чтобы начать накрутку, отправьте корректную ссылку на вашу страницу или пост в социальных сетях. Ссылка должна начинаться с "https://", например:
+
+Пример: https://teletype.in/@w1bbex/wwTwed1ZBZE
+
+Без правильной ссылки накрутка не будет запущена. Убедитесь, что она ведет на активную страницу, доступную для общего просмотра.""",
+    """👾 Благодарю за оплату!
+
+Чтобы начать накрутку, отправьте корректную ссылку на вашу страницу или пост в социальных сетях. Ссылка должна начинаться с "https://", например:
+
+Пример: https://telegra.ph/Primery-ssylok-11-11
+
+Без правильной ссылки накрутка не будет запущена. Убедитесь, что она ведет на активную страницу, доступную для общего просмотра.""",
+    """👾 Благодарю за оплату!
+
+Чтобы начать накрутку, отправьте корректную ссылку на вашу страницу или пост в социальных сетях. Ссылка должна начинаться с "https://", например:
+
+Пример: https://telegra.ph/Primery-ssylok-11-11
+
+Без правильной ссылки накрутка не будет запущена.
+
+Команды:
+!команды — помощь
+!смм — ваши SMM-заказы""",
+
+}
+
+LEGACY_LINK_CONFIRM_DEFAULTS = {
+    """✅ Ссылка получена:
+{link}
+
+Напишите + чтобы подтвердить, - чтобы изменить ссылку.""",
+    """✅ Ссылка получена
+
+Заказ: #{order_id_funpay}
+Лот: {lot_title}
+Ссылка: {link}
+
+Подтвердите действие:
++ ━ да
+- ━ нет""",
+}
+
+LEGACY_AFTER_COMPLETED_DEFAULTS = {
+    """👾 Ваш заказ успешно завершён!
+
+Лот: {lot_title}
+🔢 Номер заказа: {panel_order_id}
+🔗 Подтвердите заказ:
+https://funpay.com/orders/{order_id_funpay}/
+
+Спасибо за покупку!""",
+    """✅ Ваш заказ завершён!
+
+Лот: {lot_title}
+🔢 ID заказа в сервисе: {panel_order_id}
+📊 Выполнено: {done_quantity}/{total_quantity}
+
+Если результат вас устраивает, пожалуйста, подтвердите выполнение заказа на FunPay.
+
+📦 !смм — ваши SMM-заказы
+❓ !команды — помощь""",
+}
+
+LEGACY_BUYER_COMMANDS_DEFAULTS = {
+    """📋 Команды AutoSMM
+
+!смм — показать ваши SMM-заказы
+!ссылка — поставить ожидание ссылки на паузу или продолжить
+!ссылка НОМЕР — выбрать конкретный заказ
+!отмена — отменить заказ до запуска, если продавец разрешил
+чек НОМЕР — проверить статус заказа
+рефилл НОМЕР — запросить рефилл, если услуга поддерживает гарантию
+
+Ссылку можно отправить обычным сообщением.
+Ссылка должна начинаться с https://.""",
+}
+
+INVALID_LINK_SCHEME_TEXT = """❌ Ссылка должна начинаться с https://."""
+
+INVALID_LINK_DOMAIN_TEXT = """❌ Ссылка не принята.
+
+Домен этой ссылки не разрешён продавцом.
+
+Проверьте ссылку и отправьте её ещё раз.
+Если ссылка верная — напишите продавцу."""
+
+CONFIRM_REMINDER_TEXT = """⏳ Ссылка ожидает подтверждения.
+
++ — запустить заказ
+- — изменить ссылку
+
+Если пока не готовы подтвердить:
+!ссылка"""
+
+ORDER_NOT_FOUND_TEXT = """Заказ не найден или недоступен.
+
+Проверьте номер заказа или напишите:
+!смм
+
+Там будут ваши последние SMM-заказы."""
+
+BUYER_CONFIRM_REMINDER_SECONDS = 600
+BUYER_LINK_RE = re.compile(r"(https?://\S+)", re.IGNORECASE)
+BUYER_CONFIRM_YES_WORDS = {"+", "да", "подтвердить", "подтверждаю", "ок", "окей", "го", "давай", "запускай", "верно", "правильно", "всё верно", "все верно"}
+BUYER_CONFIRM_NO_WORDS = {"-", "нет", "изменить", "сменить", "другая ссылка"}
+BUYER_AUTO_CANCEL_UNAVAILABLE_TEXT = "Автоматическая отмена недоступна.\nЕсли хотите отменить заказ, напишите продавцу."
+BUYER_AUTO_CANCEL_FAILED_TEXT = "Автоматическая отмена недоступна.\nПожалуйста, напишите продавцу."
+BUYER_ADD_TRANSPORT_MANUAL_TEXT = """Автоматическая обработка временно остановлена.
+
+Ваш заказ не потерян.
+Продавец уведомлён и проверит его вручную.
+
+Пожалуйста, не отправляйте ссылку повторно, чтобы не создать дубль."""
+BUYER_LOT_MATCH_MANUAL_TEXT = """Автоматическая обработка временно остановлена.
+
+Ваш заказ не потерян.
+Продавец уведомлён и проверит его вручную."""
+
 ACTIVE_PLUGIN_FILENAME = PLUGIN_FILE_PATH.name
 OLD_FILES_REMIND_CFG_KEY = "old_files_cleanup_remind_until"
-FULL_AUTOSMM_FILE_RE = re.compile(r"(?i)^AutoSMM(?:_(\d+(?:\.\d+)*))?\.py(?:c|o)?$")
+FULL_AUTOSMM_FILE_RE = re.compile(r"(?i)^AutoSMM(?:_(\d+(?:\.\d+)*))?(?:\s*\(\d+\))?\.py(?:c|o)?$")
 HELPER_AUTOSMM_FILE_RE = re.compile(r"(?i)^_autosmm_.*\.(?:py|pyc|pyo)$")
 
 REFUND_SYNC_PATTERNS = [
@@ -173,41 +598,244 @@ RUNTIME_FIELDS = {
     "refund_source",
     "panel_refund_cancel_attempted_at",
     "panel_refund_cancel_result",
+    "buyer_flow_state",
+    "saved_link",
+    "panel_order_id",
+    "panel_status",
+    "total_quantity",
+    "done_quantity",
+    "left_quantity",
+    "progress_percent",
+    "last_prompt_ts",
+    "updated_at",
 }
 
 LEGACY_COMPLETED_NOTIFICATION_RUNTIME_FIELD = "completed_notification_sent"
 
-def load_valid_links() -> List[str]:
-    if os.path.exists(VALID_LINKS_PATH):
-        with open(VALID_LINKS_PATH, 'r', encoding='utf-8') as f:
-            links = json.load(f)
-            if not links:
-                default_links = [
-                    "vk.com", "t.me", "instagram.com", "tiktok.com", "youtube.com",
-                    "youtu.be", "twitch.tv", "vt.tiktok.com", "vm.tiktok.com",
-                    "www.youtu.be", "www.youtube.com", "twitter.com"
-                ]
-                save_valid_links(default_links)
-                return default_links
-            return links
+def _normalize_allowed_domain(domain_value: Any) -> str:
+    raw_value = str(domain_value or "").strip().lower()
+    if not raw_value:
+        return ""
+    raw_value = raw_value.replace("\\", "/")
+    if "://" in raw_value:
+        parsed = urlparse(raw_value)
+        raw_value = parsed.hostname or ""
     else:
-        default_links = [
-            "vk.com", "t.me", "instagram.com", "tiktok.com", "youtube.com",
-            "youtu.be", "twitch.tv", "vt.tiktok.com", "vm.tiktok.com",
-            "www.youtu.be", "www.youtube.com", "twitter.com"
-        ]
-        save_valid_links(default_links)
-        return default_links
+        raw_value = raw_value.split("/", 1)[0]
+        raw_value = raw_value.split("?", 1)[0]
+        raw_value = raw_value.split("#", 1)[0]
+    raw_value = raw_value.split(":", 1)[0].strip().strip(".")
+    if raw_value.startswith("www."):
+        raw_value = raw_value[4:]
+    return raw_value
+
+
+def _is_plausible_allowed_domain(domain_value: Any) -> bool:
+    domain = str(domain_value or "").strip().lower()
+    if not domain or " " in domain or ".." in domain:
+        return False
+    if len(domain) > 253 or "." not in domain:
+        return False
+    labels = domain.split(".")
+    for label in labels:
+        if not label or len(label) > 63:
+            return False
+        if label.startswith("-") or label.endswith("-"):
+            return False
+        if not re.fullmatch(r"[a-z0-9-]+", label):
+            return False
+    return True
+
+
+def _normalize_valid_links_list(links: Any, include_defaults: bool = False) -> List[str]:
+    normalized: List[str] = []
+    seen = set()
+
+    def add_domain(domain_value: Any):
+        domain = _normalize_allowed_domain(domain_value)
+        if not domain or domain in seen or not _is_plausible_allowed_domain(domain):
+            return
+        seen.add(domain)
+        normalized.append(domain)
+
+    if isinstance(links, list):
+        for item in links:
+            add_domain(item)
+    elif isinstance(links, str):
+        add_domain(links)
+
+    if include_defaults:
+        for item in DEFAULT_VALID_LINKS:
+            add_domain(item)
+
+    return normalized
+
+
+def _load_autosmm_state() -> Dict:
+    state = _safe_load_json(AUTOSMM_STATE_PATH, {})
+    return state if isinstance(state, dict) else {}
+
+
+def _set_valid_links_defaults_migrated() -> None:
+    state = _load_autosmm_state()
+    if state.get(VALID_LINKS_MIGRATION_STATE_KEY) is True:
+        return
+    state[VALID_LINKS_MIGRATION_STATE_KEY] = True
+    _safe_write_json(AUTOSMM_STATE_PATH, state)
+
+
+def _valid_links_defaults_migrated() -> bool:
+    return bool(_load_autosmm_state().get(VALID_LINKS_MIGRATION_STATE_KEY, False))
+
+
+def _looks_like_legacy_default_whitelist(links: List[str]) -> bool:
+    if not links:
+        return False
+    normalized = set(_normalize_valid_links_list(links, include_defaults=False))
+    legacy = set(_normalize_valid_links_list(LEGACY_DEFAULT_VALID_LINKS, include_defaults=False))
+    defaults = set(_normalize_valid_links_list(DEFAULT_VALID_LINKS, include_defaults=False))
+    if normalized == legacy:
+        return True
+    # Old installs sometimes had the narrow default list plus a couple of manual domains.
+    # Do not treat an edited modern default list as legacy, otherwise removed defaults would return.
+    if legacy.issubset(normalized) and not defaults.issubset(normalized) and len(normalized - legacy) <= 5:
+        return True
+    return False
+
+
+def load_valid_links() -> List[str]:
+    """Load trusted domains without forcing deleted defaults back into the user's list."""
+    if not os.path.exists(VALID_LINKS_PATH):
+        links = _normalize_valid_links_list(DEFAULT_VALID_LINKS, include_defaults=False)
+        save_valid_links(links)
+        _set_valid_links_defaults_migrated()
+        return links
+
+    raw_links = _safe_load_json(VALID_LINKS_PATH, [])
+    links = _normalize_valid_links_list(raw_links, include_defaults=False)
+    raw_needs_normalization = not isinstance(raw_links, list) or raw_links != links
+
+    if not _valid_links_defaults_migrated():
+        if _looks_like_legacy_default_whitelist(links):
+            links = _normalize_valid_links_list(links + DEFAULT_VALID_LINKS, include_defaults=False)
+            save_valid_links(links)
+        else:
+            # Existing custom/empty lists are treated as the user's choice.
+            if raw_needs_normalization:
+                save_valid_links(links)
+        _set_valid_links_defaults_migrated()
+        return links
+
+    if raw_needs_normalization:
+        save_valid_links(links)
+    return links
 
 
 def save_valid_links(links: List[str]):
     os.makedirs(os.path.dirname(VALID_LINKS_PATH), exist_ok=True)
+    normalized_links = _normalize_valid_links_list(links, include_defaults=False)
     with open(VALID_LINKS_PATH, 'w', encoding='utf-8') as f:
-        json.dump(links, f, ensure_ascii=False, indent=4)
+        json.dump(normalized_links, f, ensure_ascii=False, indent=4)
+
+
+def reset_valid_links_to_defaults() -> List[str]:
+    links = _normalize_valid_links_list(DEFAULT_VALID_LINKS, include_defaults=False)
+    save_valid_links(links)
+    _set_valid_links_defaults_migrated()
+    return links
+
+
+def _normalize_template_for_compare(text_value: Any) -> str:
+    return re.sub(r"\s+", " ", str(text_value or "").strip())
+
+
+def _ensure_config_defaults(cfg: Dict) -> bool:
+    changed = False
+    if not isinstance(cfg, dict):
+        return False
+
+    def ensure_key(key: str, default_value: Any):
+        nonlocal changed
+        if key not in cfg:
+            cfg[key] = default_value
+            changed = True
+
+    ensure_key("services", {
+        "1": {
+            "api_url": "https://smmway.ru/api/v2",
+            "api_key": "YOUR_API_KEY",
+        }
+    })
+    ensure_key("auto_refunds", False)
+    ensure_key("fallback_enabled", False)
+    # TODO AutoSMM v0.0.10: buyer_cancel_max_amount; buyer_cancel_lot_policy; per-lot buyer cancel override; allowlist/denylist лотов для !отмена.
+    ensure_key("allow_buyer_cancel_before_panel_order", False)
+    ensure_key("try_panel_cancel_after_funpay_refund", False)
+    ensure_key("confirm_link", True)
+    ensure_key("notification_chat_id", None)
+    ensure_key("send_auto_lots", False)
+    ensure_key("send_auto_lots_interval", 30)
+    ensure_key("lot_mapping", {})
+    ensure_key("new_order_notifications", False)
+
+    if not isinstance(cfg.get("services"), dict):
+        cfg["services"] = {}
+        changed = True
+    if not isinstance(cfg.get("lot_mapping"), dict):
+        cfg["lot_mapping"] = {}
+        changed = True
+
+    messages = cfg.get("messages")
+    if not isinstance(messages, dict):
+        messages = {}
+        cfg["messages"] = messages
+        changed = True
+
+    current_after_payment = messages.get("after_payment")
+    legacy_norm = {_normalize_template_for_compare(item) for item in LEGACY_AFTER_PAYMENT_DEFAULTS}
+    if not current_after_payment or _normalize_template_for_compare(current_after_payment) in legacy_norm:
+        if messages.get("after_payment") != DEFAULT_AFTER_PAYMENT_TEMPLATE:
+            messages["after_payment"] = DEFAULT_AFTER_PAYMENT_TEMPLATE
+            changed = True
+
+    current_after_confirmation = messages.get("after_confirmation")
+    legacy_confirmation_norm = {_normalize_template_for_compare(item) for item in LEGACY_AFTER_CONFIRMATION_DEFAULTS}
+    if not current_after_confirmation or _normalize_template_for_compare(current_after_confirmation) in legacy_confirmation_norm:
+        if messages.get("after_confirmation") != DEFAULT_AFTER_CONFIRMATION_TEMPLATE:
+            messages["after_confirmation"] = DEFAULT_AFTER_CONFIRMATION_TEMPLATE
+            changed = True
+
+    current_link_confirm = messages.get("buyer_link_received_confirm")
+    legacy_link_norm = {_normalize_template_for_compare(item) for item in LEGACY_LINK_CONFIRM_DEFAULTS}
+    if not current_link_confirm or _normalize_template_for_compare(current_link_confirm) in legacy_link_norm:
+        if messages.get("buyer_link_received_confirm") != DEFAULT_LINK_CONFIRM_TEMPLATE:
+            messages["buyer_link_received_confirm"] = DEFAULT_LINK_CONFIRM_TEMPLATE
+            changed = True
+
+    current_after_completed = messages.get("after_completed")
+    legacy_completed_norm = {_normalize_template_for_compare(item) for item in LEGACY_AFTER_COMPLETED_DEFAULTS}
+    if not current_after_completed or _normalize_template_for_compare(current_after_completed) in legacy_completed_norm:
+        if messages.get("after_completed") != DEFAULT_AFTER_COMPLETED_TEMPLATE:
+            messages["after_completed"] = DEFAULT_AFTER_COMPLETED_TEMPLATE
+            changed = True
+
+    current_buyer_commands = messages.get("buyer_commands")
+    legacy_commands_norm = {_normalize_template_for_compare(item) for item in LEGACY_BUYER_COMMANDS_DEFAULTS}
+    if not current_buyer_commands or _normalize_template_for_compare(current_buyer_commands) in legacy_commands_norm:
+        if messages.get("buyer_commands") != DEFAULT_BUYER_COMMANDS_TEMPLATE:
+            messages["buyer_commands"] = DEFAULT_BUYER_COMMANDS_TEMPLATE
+            changed = True
+
+    return changed
+
+
+# Backward-compatible alias for older internal calls.
+def _ensure_microfix_config_defaults(cfg: Dict) -> bool:
+    return _ensure_config_defaults(cfg)
 
 
 def load_config() -> Dict:
-    logger.info("Загрузка конфигурации (auto_lots.json)...")
+    logger.debug("Загрузка конфигурации (файл настроек)...")
     
     file_lock = threading.Lock()
     
@@ -232,40 +860,8 @@ def load_config() -> Dict:
                         save_config(cfg)
                         return cfg
                     
-                    if "services" not in cfg:
-                        cfg["services"] = {
-                            "1": {
-                                "api_url": "https://service1.com/api/v2",
-                                "api_key": "SERVICE_1_KEY"
-                            },
-                            "2": {
-                                "api_url": "https://service2.com/api/v2",
-                                "api_key": "SERVICE_2_KEY"
-                            }
-                        }
-                    if "auto_refunds" not in cfg:
-                        cfg["auto_refunds"] = False
-                    if "fallback_enabled" not in cfg:
-                        cfg["fallback_enabled"] = False
-                    if "confirm_link" not in cfg:
-                        cfg["confirm_link"] = True
-                    if "messages" not in cfg:
-                        cfg["messages"] = {
-                            "after_payment": "❤️ Благодарим за оплату!\n\nЧтобы начать накрутку, отправьте корректную ссылку на вашу страницу или пост в социальных сетях. Ссылка должна начинаться с \"https://\", например:\n\nПример: https://teletype.in/@w1bbex/wwTwed1ZBZE\n\nБез правильной ссылки накрутка не будет запущена. Убедитесь, что она ведет на активную страницу, доступную для общего просмотра.",
-                            "after_confirmation": "🎉 Ваш заказ успешно оформлен!\n\n🔢 ID заказа в сервисе: {twiboost_id}\n🔗 Для отслеживания переходите по ссылке: {link}\n\n📋 Доступные команды:\n🔍 чек {twiboost_id} — Проверить статус заказа (выводит информацию о заказе)\n🔄 рефилл {twiboost_id} — Запросить рефилл (работает лишь с гарантией - восстанавливает отписанных подписчиков)\n\nЕсли у вас возникнут вопросы, не стесняйтесь обращаться!"
-                        }
-                    if "notification_chat_id" not in cfg:
-                        cfg["notification_chat_id"] = None
-                    if "send_auto_lots" not in cfg:
-                        cfg["send_auto_lots"] = False
-                    if "send_auto_lots_interval" not in cfg:
-                        cfg["send_auto_lots_interval"] = 30
-                    if "auto_start" not in cfg:
-                        cfg["auto_start"] = True
-                    if "lot_mapping" not in cfg:
-                        cfg["lot_mapping"] = {}
-                    if "new_order_notifications" not in cfg:
-                        cfg["new_order_notifications"] = False
+                    if _ensure_config_defaults(cfg):
+                        save_config(cfg)
                     return cfg
                 except Exception as e:
                     logger.error(f"Ошибка при чтении файла конфигурации: {e}. Создаем новый файл конфигурации.")
@@ -273,7 +869,7 @@ def load_config() -> Dict:
                     save_config(cfg)
                     return cfg
             else:
-                logger.info(f"Файл конфигурации {CONFIG_PATH} не найден. Создаем новый файл.")
+                logger.debug(f"Файл конфигурации {CONFIG_PATH} не найден. Создаем новый файл.")
                 cfg = create_default_config()
                 save_config(cfg)
                 return cfg
@@ -298,41 +894,30 @@ def create_default_config() -> Dict:
         },
         "auto_refunds": False,
         "fallback_enabled": False,
+        "allow_buyer_cancel_before_panel_order": False,
+        "try_panel_cancel_after_funpay_refund": False,
         "confirm_link": True,
         "messages": {
-            "after_payment": """👾 Благодарю за оплату!
-
-Чтобы начать накрутку, отправьте корректную ссылку на вашу страницу или пост в социальных сетях. Ссылка должна начинаться с "https://", например:
-
-Пример: https://telegra.ph/Primery-ssylok-11-11
-
-Без правильной ссылки накрутка не будет запущена. Убедитесь, что она ведет на активную страницу, доступную для общего просмотра.""",
-            "after_confirmation": """🎉 Ваш заказ успешно оформлен!
-
-🔢 ID заказа в сервисе: {twiboost_id}
-🔗 Для отслеживания переходите по ссылке: {link}
-
-📋 Доступные команды:
-🔍 чек {twiboost_id} — Проверить статус заказа (выводит информацию о заказе)
-🔄 рефилл {twiboost_id} — Запросить рефилл (работает лишь с гарантией - восстанавливает отписанных подписчиков)
-
-Если у вас возникнут вопросы, не стесняйтесь обращаться!"""
+            "after_payment": DEFAULT_AFTER_PAYMENT_TEMPLATE,
+            "buyer_link_received_confirm": DEFAULT_LINK_CONFIRM_TEMPLATE,
+            "after_confirmation": DEFAULT_AFTER_CONFIRMATION_TEMPLATE,
+            "after_completed": DEFAULT_AFTER_COMPLETED_TEMPLATE,
+            "buyer_commands": DEFAULT_BUYER_COMMANDS_TEMPLATE
         },
         "notification_chat_id": None,
         "send_auto_lots": False,
         "send_auto_lots_interval": 30,
-        "auto_start": True,
         "lot_mapping": {},
         "new_order_notifications": False
     }
 
 
 def save_config(cfg: Dict):
-    logger.info("Сохранение конфигурации (auto_lots.json)...")
+    logger.debug("Сохранение конфигурации (файл настроек)...")
     os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
     with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
         json.dump(cfg, f, ensure_ascii=False, indent=4)
-    logger.info("Конфигурация сохранена.")
+    logger.debug("Конфигурация сохранена.")
 
 
 def _parse_version_tuple(version_value: str) -> Tuple[int, ...]:
@@ -377,11 +962,32 @@ def find_old_autosmm_files() -> List[Path]:
                 outdated_files.append(item)
                 continue
 
+            lower_name = item_name.lower()
+            if lower_name in {"autosmm.py", "autosmm_old.py"} or lower_name.startswith("autosmm_old"):
+                outdated_files.append(item)
+                continue
+
             candidate_version = _extract_autosmm_file_version(item_name)
             if candidate_version is None:
                 continue
 
-            if not candidate_version or candidate_version < current_version:
+            if not candidate_version:
+                outdated_files.append(item)
+                continue
+
+            if candidate_version < current_version:
+                outdated_files.append(item)
+                continue
+
+            if candidate_version[:len(current_version)] == current_version and len(candidate_version) > len(current_version):
+                outdated_files.append(item)
+                continue
+
+            if (
+                candidate_version == current_version
+                and re.search(r"\(\d+\)", item_name)
+                and ACTIVE_PLUGIN_FILENAME.lower() == f"autosmm_{VERSION}.py".lower()
+            ):
                 outdated_files.append(item)
     except Exception:
         logger.exception("Ошибка при поиске старых файлов AutoSMM")
@@ -980,7 +1586,16 @@ def mark_order_refunded(order_id_funpay: str, detected_at: str | None = None, so
             runtime_updates["refund_source"] = source
         if runtime_updates:
             update_order_fields(order_id_funpay, **runtime_updates)
-        _attempt_panel_cancel_after_funpay_refund(orders.get_order_data(order_id_funpay), source=source or "refund_mark")
+        update_order_fields(
+            order_id_funpay,
+            buyer_flow_state=BUYER_STATE_REFUNDED,
+            saved_link=None,
+            refund_detected_at=detected_at or _now_str(),
+            refund_source=source or "refund_mark",
+            updated_at=_now_str(),
+        )
+        waiting_for_link.pop(str(order_id_funpay), None)
+        _attempt_panel_cancel_after_funpay_refund(get_order_data(order_id_funpay), source=source or "refund_mark")
         return True
 
     logger.warning(f"Заказ #{order_id_funpay} не найден в orders_data.json.")
@@ -1030,7 +1645,7 @@ def _build_invalid_api_key_payload(service_number: int, action: str, api_key: An
     key_len = len(_normalize_api_key(api_key))
     detail = (
         f"Некорректная длина API-ключа для service_number={service_number} перед action={action}: "
-        f"{key_len} символов (ожидается {EXPECTED_API_KEY_LENGTH})."
+        f"{key_len} символов (ожидается {EXPECTED_API_KEY_LENGTH}, стандарт SocPanel v2)."
     )
     logger.warning(f"{LOGGER_PREFIX} {detail}")
     return {
@@ -1431,6 +2046,8 @@ def _build_status_result_from_entry(entry: Any) -> Dict:
                 "status": _normalize_runtime_status(status_value),
                 "charge": entry.get("charge", "0"),
                 "currency": entry.get("currency", "USD"),
+                "remains": entry.get("remains"),
+                "start_count": entry.get("start_count"),
                 "raw": entry,
             }
 
@@ -1707,6 +2324,11 @@ def _sync_funpay_status_from_message(message_text: str) -> bool:
         update_fields["refund_detected_at"] = _now_str()
         update_fields["refund_source"] = "funpay_message"
 
+    if funpay_status in ("refunded", "partially_refunded"):
+        update_fields["buyer_flow_state"] = BUYER_STATE_REFUNDED
+        update_fields["saved_link"] = None
+        update_fields["updated_at"] = _now_str()
+        waiting_for_link.pop(str(order_id), None)
     orders.update_order_fields(order_id, **update_fields)
     updated_order = orders.get_order_data(order_id) or order_data
     if funpay_status == "refunded" and previous_funpay_status != "refunded":
@@ -1755,6 +2377,141 @@ def _fetch_funpay_status_via_cardinal(c: Cardinal, order_id_funpay: str) -> Dict
         return {"ok": False, "error": "cardinal_error", "detail": str(ex)}
 
 
+
+
+def _refresh_funpay_status_for_order(
+    c: Optional[Cardinal],
+    order_record: Optional[Dict],
+    force_check: bool = False,
+) -> Dict:
+    """Refreshes FunPay status for one stored order without breaking buyer-flow.
+
+    This helper is intentionally conservative: if Cardinal/FunPay status check is
+    unavailable, it returns the latest local record and does not invent a status.
+    """
+    if not isinstance(order_record, dict):
+        return {}
+
+    order_id_funpay = str(
+        order_record.get("order_id")
+        or order_record.get("order_id_funpay")
+        or ""
+    ).strip().lstrip("#")
+    if not order_id_funpay:
+        return dict(order_record)
+
+    latest_order = orders.get_order_data(order_id_funpay) or dict(order_record)
+
+    if not force_check and not _funpay_status_needs_recheck(latest_order, FUNPAY_STATUS_RECENT_CHECK_SECONDS):
+        return latest_order
+
+    if c is None:
+        return latest_order
+
+    previous_funpay_status = _get_effective_funpay_status(latest_order)
+    result = _fetch_funpay_status_via_cardinal(c, order_id_funpay)
+    checked_at = _now_str()
+
+    if not result.get("ok"):
+        try:
+            orders.update_order_fields(order_id_funpay, funpay_status_checked_at=checked_at)
+            latest_order = orders.get_order_data(order_id_funpay) or latest_order
+        except Exception:
+            logger.warning(
+                f"FUNPAY STATUS REFRESH FAILED: order=#{order_id_funpay}, "
+                f"error={result.get('error')}, detail={result.get('detail')}"
+            )
+        return latest_order
+
+    new_funpay_status = _normalize_funpay_status(result.get("funpay_status"))
+    if not new_funpay_status:
+        return latest_order
+
+    update_fields: Dict[str, Any] = {
+        "funpay_status": new_funpay_status,
+        "funpay_status_checked_at": checked_at,
+    }
+
+    if new_funpay_status in ("refunded", "partially_refunded"):
+        update_fields.update(
+            {
+                "buyer_flow_state": BUYER_STATE_REFUNDED,
+                "saved_link": None,
+                "refund_detected_at": checked_at,
+                "refund_source": "refund_gate_refresh",
+                "updated_at": checked_at,
+            }
+        )
+        waiting_for_link.pop(order_id_funpay, None)
+
+    try:
+        orders.update_order_fields(order_id_funpay, **update_fields)
+    except Exception as ex:
+        logger.warning(f"FUNPAY STATUS REFRESH SAVE FAILED: order=#{order_id_funpay}, error={ex}")
+        latest_order.update(update_fields)
+        return latest_order
+
+    refreshed_order = orders.get_order_data(order_id_funpay) or latest_order
+    refreshed_order.update(update_fields)
+
+    if new_funpay_status == "refunded" and previous_funpay_status != "refunded":
+        try:
+            _attempt_panel_cancel_after_funpay_refund(refreshed_order, source="refund_gate_refresh")
+        except Exception as ex:
+            logger.warning(f"PANEL CANCEL AFTER REFUND GATE FAILED: order=#{order_id_funpay}, error={ex}")
+
+    return refreshed_order
+
+
+def _apply_refund_gate(
+    c: Optional[Cardinal],
+    order_record: Optional[Dict],
+    notify_chat_id: Optional[int] = None,
+    force_check: bool = False,
+) -> bool:
+    """Blocks buyer actions when the related FunPay order is refunded.
+
+    Returns True when the caller must stop further buyer-flow processing.
+    """
+    if not isinstance(order_record, dict):
+        return False
+
+    latest_order = _refresh_funpay_status_for_order(c, order_record, force_check=force_check)
+    if not isinstance(latest_order, dict) or not latest_order:
+        latest_order = order_record
+
+    if not _is_order_refundedish(latest_order):
+        return False
+
+    order_id_funpay = str(
+        latest_order.get("order_id")
+        or latest_order.get("order_id_funpay")
+        or order_record.get("order_id")
+        or order_record.get("order_id_funpay")
+        or ""
+    ).strip().lstrip("#")
+
+    if order_id_funpay:
+        try:
+            orders.update_order_fields(
+                order_id_funpay,
+                buyer_flow_state=BUYER_STATE_REFUNDED,
+                saved_link=None,
+                updated_at=_now_str(),
+            )
+        except Exception as ex:
+            logger.warning(f"REFUND GATE SAVE FAILED: order=#{order_id_funpay}, error={ex}")
+        waiting_for_link.pop(order_id_funpay, None)
+
+    if notify_chat_id is not None and c is not None:
+        try:
+            _send_buyer_message(c, notify_chat_id, BUYER_REFUND_BLOCK_TEXT)
+        except Exception as ex:
+            logger.warning(f"REFUND GATE NOTIFY FAILED: order=#{order_id_funpay}, error={ex}")
+
+    return True
+
+
 def _attempt_panel_cancel_after_funpay_refund(order_record: Optional[Dict], source: str = "funpay_refund") -> bool:
     if not isinstance(order_record, dict):
         return False
@@ -1764,6 +2521,12 @@ def _attempt_panel_cancel_after_funpay_refund(order_record: Optional[Dict], sour
         return False
     if _get_effective_funpay_status(order_record) != "refunded":
         return False
+
+    cfg = load_config()
+    if not bool(cfg.get("try_panel_cancel_after_funpay_refund", False)):
+        logger.info(f"PANEL CANCEL SKIPPED: order=#{order_id_funpay}, source={source}, reason=disabled_by_config")
+        return False
+
     if order_record.get("panel_refund_cancel_attempted_at"):
         return False
 
@@ -1775,7 +2538,6 @@ def _attempt_panel_cancel_after_funpay_refund(order_record: Optional[Dict], sour
         )
         return False
 
-    cfg = load_config()
     service_cfg = (cfg.get("services") or {}).get(str(service_number))
     if not isinstance(service_cfg, dict):
         logger.info(
@@ -1905,6 +2667,11 @@ def _run_funpay_status_sync(c: Cardinal, recovery: bool = False):
                 "funpay_status": new_funpay_status,
                 "funpay_status_checked_at": checked_at,
             }
+            if new_funpay_status in ("refunded", "partially_refunded"):
+                update_fields["buyer_flow_state"] = BUYER_STATE_REFUNDED
+                update_fields["saved_link"] = None
+                update_fields["updated_at"] = _now_str()
+                waiting_for_link.pop(str(order_id_funpay), None)
             orders.update_order_fields(order_id_funpay, **update_fields)
             updated_order = orders.get_order_data(order_id_funpay) or order_record
             if new_funpay_status == "refunded" and previous_funpay_status != "refunded":
@@ -1953,11 +2720,34 @@ def _apply_status_result(c: Cardinal, order_record: Dict, result: Dict, backgrou
     order_id_funpay = str(order_record.get("order_id"))
     mapped_status = str(result.get("status", "unknown") or "unknown").lower()
 
+    progress_fields: Dict[str, Any] = {"panel_status": mapped_status}
+    remains_value = _safe_int(result.get("remains"))
+    total_quantity = _safe_int(order_record.get("total_quantity") or order_record.get("quantity")) or 0
+    if remains_value is not None:
+        progress_fields["left_quantity"] = max(0, remains_value)
+        if total_quantity:
+            done_quantity = max(0, total_quantity - progress_fields["left_quantity"])
+            progress_fields["done_quantity"] = done_quantity
+            progress_fields["progress_percent"] = int(max(0, min(100, round((done_quantity / total_quantity) * 100))))
+    elif mapped_status == "completed" and total_quantity:
+        progress_fields["done_quantity"] = total_quantity
+        progress_fields["left_quantity"] = 0
+        progress_fields["progress_percent"] = 100
+
+    if mapped_status == "completed":
+        progress_fields["buyer_flow_state"] = BUYER_STATE_COMPLETED
+    elif mapped_status in ("fail", "canceled", "unknown"):
+        progress_fields["buyer_flow_state"] = BUYER_STATE_FAILED
+    else:
+        progress_fields["buyer_flow_state"] = BUYER_STATE_PANEL_CREATED
+
     update_fields = {
         "status": mapped_status,
         "status_last_checked_at": _now_str(),
         "status_last_error": None,
         "incorrect_order_id_attempts": 0,
+        "updated_at": _now_str(),
+        **progress_fields,
     }
 
     if mapped_status == "unknown":
@@ -2245,12 +3035,14 @@ def refund_order(
                 f"Заказ #{order_id_funpay} был отменён (refund) для покупателя {buyer_chat_id}. "
                 f"Причина: {reason}. Технические детали: {detailed_reason}"
             )
+            orders.update_order_fields(order_id_funpay, funpay_status="refunded", buyer_flow_state=BUYER_STATE_REFUNDED, saved_link=None, refund_detected_at=_now_str(), refund_source="auto_refund", updated_at=_now_str())
             waiting_for_link.pop(str(order_id_funpay), None)
         except Exception as ex:
             logger.error(
                 f"Не удалось вернуть средства для заказа #{order_id_funpay}: {ex}. "
                 f"Технические детали: {detailed_reason}"
             )
+            orders.update_order_fields(order_id_funpay, buyer_flow_state=BUYER_STATE_FAILED, updated_at=_now_str())
             _send_admin_order_alert(
                 order_id_funpay=order_id_funpay,
                 reason=reason,
@@ -2260,6 +3052,7 @@ def refund_order(
             )
     else:
         logger.warning(f"Для заказа #{order_id_funpay} требуется ручной возврат. Технические детали: {detailed_reason}")
+        orders.update_order_fields(order_id_funpay, buyer_flow_state=BUYER_STATE_FAILED, updated_at=_now_str())
         _send_admin_order_alert(
             order_id_funpay=order_id_funpay,
             reason=reason,
@@ -2318,27 +3111,1027 @@ def start_order_checking(c: Cardinal):
             time.sleep(1)
 
 
+def _find_lot_matches_by_description(description: Any) -> List[Tuple[str, Dict]]:
+    description_text = str(description or "")
+    matches: List[Tuple[str, Dict]] = []
+    for lot_key, lot_data in (lot_mapping or {}).items():
+        if not isinstance(lot_data, dict):
+            continue
+        lot_name = str(lot_data.get("name") or "").strip()
+        if not lot_name:
+            continue
+        try:
+            if re.search(re.escape(lot_name), description_text, re.IGNORECASE):
+                matches.append((str(lot_key), lot_data))
+        except Exception:
+            continue
+    return matches
+
+
+def resolve_lot_by_description(description: str, order_amount: int) -> Dict[str, Any]:
+    matches = _find_lot_matches_by_description(description)
+    if not matches:
+        logger.warning("LOT MATCH FAILED: no matches for description=%r", str(description or "")[:300])
+        return {"ok": False, "error": "no_match", "matches": []}
+
+    if len(matches) > 1:
+        safe_matches = []
+        for lot_key, lot_data in matches:
+            safe_matches.append({
+                "lot_key": lot_key,
+                "name": lot_data.get("name"),
+                "service_id": lot_data.get("service_id"),
+                "quantity": lot_data.get("quantity"),
+                "service_number": lot_data.get("service_number", 1),
+            })
+        logger.warning(
+            "LOT MATCH AMBIGUOUS: found %s matches for description=%r",
+            len(matches),
+            str(description or "")[:300],
+        )
+        return {"ok": False, "error": "ambiguous_match", "matches": safe_matches}
+
+    lot_key, lot_data = matches[0]
+    try:
+        base_q = int(lot_data.get("quantity") or 0)
+    except Exception:
+        base_q = 0
+    try:
+        amount = int(order_amount or 1)
+    except Exception:
+        amount = 1
+    real_q = base_q * amount
+    return {
+        "ok": True,
+        "service_id": lot_data.get("service_id"),
+        "real_amount": real_q,
+        "service_number": lot_data.get("service_number", 1),
+        "lot_key": lot_key,
+        "lot_title": lot_data.get("name") or str(description or ""),
+    }
+
+
+def _is_lot_match_no_match(result: Dict[str, Any]) -> bool:
+    return not bool(result.get("ok")) and str(result.get("error") or "") == "no_match"
+
+
+def _is_lot_match_ambiguous(result: Dict[str, Any]) -> bool:
+    return not bool(result.get("ok")) and str(result.get("error") or "") == "ambiguous_match"
+
+
 def get_tg_id_by_description(description: str, order_amount: int) -> Tuple[int, int, int] | None:
-    for lot_key, lot_data in lot_mapping.items():
-        lot_name = lot_data["name"]
-        if re.search(re.escape(lot_name), description, re.IGNORECASE):
-            service_id = lot_data["service_id"]
-            base_q = lot_data["quantity"]
-            real_q = base_q * order_amount
-            srv_num = lot_data.get("service_number", 1)
-            return service_id, real_q, srv_num
-    return None
+    result = resolve_lot_by_description(description, order_amount)
+    if not result.get("ok"):
+        return None
+    return result.get("service_id"), result.get("real_amount"), result.get("service_number", 1)
+
+
+def _send_lot_match_manual_alert(order_id_funpay: Any, description: Any, resolve_result: Dict[str, Any]):
+    cfg = load_config()
+    notification_chat_id = cfg.get("notification_chat_id")
+    if not notification_chat_id or bot is None:
+        return
+
+    error_code = str(resolve_result.get("error") or "unknown")
+    if error_code == "ambiguous_match":
+        lines = [
+            "⚠️ AutoSMM: найдено несколько подходящих лотов",
+            "",
+            f"Заказ FunPay: #{order_id_funpay}",
+            "Описание заказа:",
+            str(description or "—"),
+            "",
+            "AutoSMM не может безопасно выбрать услугу панели.",
+            "",
+            "Совпадения:",
+        ]
+        for idx, item in enumerate(resolve_result.get("matches") or [], start=1):
+            lines.append(
+                f"{idx}. {item.get('lot_key')} — {item.get('name') or '—'} | "
+                f"ID услуги: {item.get('service_id') or '—'} | "
+                f"Кол-во: {item.get('quantity') or '—'} | "
+                f"Панель: {item.get('service_number') or '—'}"
+            )
+        lines.extend(["", "Действие:", "проверьте привязку лота вручную."])
+    else:
+        lines = [
+            "⚠️ AutoSMM: не удалось определить лот",
+            "",
+            f"Заказ FunPay: #{order_id_funpay}",
+            "Описание заказа:",
+            str(description or "—"),
+            "",
+            "AutoSMM не нашёл подходящий лот в настройках.",
+            "",
+            "Действие:",
+            "проверьте привязки лотов вручную.",
+        ]
+
+    try:
+        bot.send_message(notification_chat_id, "\n".join(lines))
+    except Exception as ex:
+        logger.error(f"Не удалось отправить alert по lot matching для заказа #{order_id_funpay}: {ex}")
+
+
+def _extract_http_link(text_value: Any) -> Optional[str]:
+    match = BUYER_LINK_RE.search(str(text_value or ""))
+    return match.group(1).strip() if match else None
+
+
+def _looks_like_link_without_https(text_value: Any) -> bool:
+    text = str(text_value or "").strip()
+    if not text or _extract_http_link(text):
+        return False
+    if re.search(r"(?i)\bwww\.[a-z0-9.-]+\.[a-z]{2,}\S*", text):
+        return True
+    if re.search(r"(?i)\b[a-z0-9-]+(?:\.[a-z0-9-]+)+/\S*", text):
+        return True
+    if re.fullmatch(r"@[A-Za-z0-9_.-]{3,}", text):
+        return True
+    return False
 
 
 def is_valid_link(link: str) -> Tuple[bool, str]:
-    valid_links = load_valid_links()
-    if not link.startswith(("http://", "https://")):
-        return False, "❌ Ссылка должна начинаться с http:// или https://."
-    for pf in valid_links:
-        if pf in link:
-            return True, f"✅ Ссылка корректна ({pf})."
-    return False, "❌ Недопустимая ссылка."
+    raw_link = str(link or "").strip()
+    if not raw_link.startswith("https://"):
+        return False, INVALID_LINK_SCHEME_TEXT
 
+    try:
+        parsed = urlparse(raw_link)
+    except Exception:
+        return False, "❌ Не удалось прочитать ссылку."
+
+    hostname = (parsed.hostname or "").strip().lower().strip(".")
+    if hostname.startswith("www."):
+        hostname = hostname[4:]
+    if not hostname:
+        return False, "❌ Не удалось определить домен ссылки."
+
+    for allowed_domain in load_valid_links():
+        domain = _normalize_allowed_domain(allowed_domain)
+        if not domain:
+            continue
+        if hostname == domain or hostname.endswith("." + domain):
+            return True, f"✅ Ссылка корректна ({domain})."
+
+    return False, INVALID_LINK_DOMAIN_TEXT
+
+
+
+# =========================================================
+# BUYER FLOW / RECOVERY
+# =========================================================
+
+class _SafeTemplateDict(dict):
+    def __missing__(self, key):
+        return ""
+
+
+def split_message_by_lines(text, max_lines: int = 18) -> List[str]:
+    max_lines = max(1, int(max_lines or 18))
+    lines = str(text or "").splitlines()
+    if not lines:
+        return [""]
+    chunks: List[str] = []
+    current: List[str] = []
+    for line in lines:
+        if len(current) >= max_lines:
+            chunks.append("\n".join(current).rstrip())
+            current = []
+        current.append(line)
+    if current:
+        chunks.append("\n".join(current).rstrip())
+    return [chunk for chunk in chunks if chunk != ""] or [""]
+
+
+def _send_buyer_message(c: Cardinal, chat_id: int, text: str, max_lines: int = 18):
+    for chunk in split_message_by_lines(text, max_lines=max_lines):
+        c.send_message(chat_id, chunk)
+
+
+def _order_ref_candidates(raw_ref: Any) -> List[str]:
+    value = str(raw_ref or "").strip().lstrip("#")
+    if not value:
+        return []
+    candidates = [value]
+    if value.lower().startswith("fp") and len(value) > 2:
+        candidates.append(value[2:])
+    return [candidate.upper() for candidate in candidates if candidate]
+
+
+def _matches_order_ref(order_id: Any, raw_ref: Any) -> bool:
+    order_value = str(order_id or "").strip().lstrip("#").upper()
+    return bool(order_value and order_value in _order_ref_candidates(raw_ref))
+
+
+def _buyer_selection_key(buyer_id: Any, chat_id: Any) -> str:
+    return f"buyer:{buyer_id}" if buyer_id not in (None, "") else f"chat:{chat_id}"
+
+
+def _get_panel_order_id(order_record: Optional[Dict]) -> Optional[int]:
+    if not isinstance(order_record, dict):
+        return None
+    for field_name in ("panel_order_id", "twiboost_id", "id_zakaz"):
+        value = _safe_int(order_record.get(field_name))
+        if value is not None:
+            return value
+    return None
+
+
+def _has_panel_order(order_record: Optional[Dict]) -> bool:
+    return _get_panel_order_id(order_record) is not None
+
+
+def _state_from_step(step_value: Any) -> str:
+    step = str(step_value or "").strip().lower()
+    if step == "await_confirm":
+        return BUYER_STATE_WAITING_CONFIRM
+    if step in ("paused", "link_paused"):
+        return BUYER_STATE_LINK_PAUSED
+    return BUYER_STATE_WAITING_LINK
+
+
+def _step_from_state(state_value: Any) -> str:
+    state = str(state_value or "").strip().lower()
+    if state == BUYER_STATE_WAITING_CONFIRM:
+        return "await_confirm"
+    if state == BUYER_STATE_LINK_PAUSED:
+        return "paused"
+    return "await_link"
+
+
+def _get_buyer_flow_state(order_record: Optional[Dict]) -> str:
+    if not isinstance(order_record, dict):
+        return BUYER_STATE_WAITING_LINK
+    if _is_order_refundedish(order_record):
+        return BUYER_STATE_REFUNDED
+
+    explicit_state = str(order_record.get("buyer_flow_state") or "").strip().lower()
+    panel_status = str(order_record.get("status") or order_record.get("panel_status") or "").strip().lower()
+
+    if _has_panel_order(order_record):
+        if panel_status == "completed":
+            return BUYER_STATE_COMPLETED
+        if panel_status in ("fail", "failed", "canceled", "cancelled", "unknown"):
+            return BUYER_STATE_FAILED
+        return BUYER_STATE_PANEL_CREATED
+
+    if explicit_state in {
+        BUYER_STATE_WAITING_LINK,
+        BUYER_STATE_LINK_PAUSED,
+        BUYER_STATE_WAITING_CONFIRM,
+        BUYER_STATE_PANEL_CREATED,
+        BUYER_STATE_COMPLETED,
+        BUYER_STATE_FAILED,
+        BUYER_STATE_REFUNDED,
+    }:
+        return explicit_state
+    return _state_from_step(order_record.get("step"))
+
+
+def _extract_progress_values(order_record: Optional[Dict]) -> Dict[str, Any]:
+    order_record = order_record or {}
+    total = _safe_int(order_record.get("total_quantity") or order_record.get("quantity") or order_record.get("real_amount") or order_record.get("order_amount")) or 0
+    done = _safe_int(order_record.get("done_quantity"))
+    left = _safe_int(order_record.get("left_quantity"))
+    if left is None:
+        left = _safe_int(order_record.get("remains"))
+    if done is None and total and left is not None:
+        done = max(0, total - max(0, left))
+    if left is None and total and done is not None:
+        left = max(0, total - max(0, done))
+    if done is None:
+        done = 0
+    if left is None:
+        left = max(0, total - done) if total else 0
+    progress_percent = int(max(0, min(100, round((done / total) * 100)))) if total > 0 else 0
+    return {"total_quantity": total, "done_quantity": done, "left_quantity": left, "progress_percent": progress_percent}
+
+
+def _build_template_context(order_record: Optional[Dict] = None, extra: Optional[Dict] = None) -> Dict[str, Any]:
+    merged = {**dict(order_record or {}), **dict(extra or {})}
+    progress = _extract_progress_values(merged)
+    panel_order_id = merged.get("panel_order_id") or merged.get("twiboost_id") or merged.get("id_zakaz") or ""
+    lot_title = merged.get("lot_title") or merged.get("service_name") or merged.get("orderDesc") or ""
+    order_price = merged.get("order_price") or merged.get("summa") or merged.get("orderPrice") or ""
+    order_amount = merged.get("order_amount") or merged.get("amount") or merged.get("orderAmount") or ""
+    ctx = {
+        "buyer_username": merged.get("buyer_username") or "",
+        "lot_title": lot_title,
+        "order_id_funpay": merged.get("order_id_funpay") or merged.get("order_id") or "",
+        "order_price": order_price,
+        "order_amount": order_amount,
+        "currency": merged.get("currency") or "RUB",
+        "link": merged.get("link") or merged.get("saved_link") or merged.get("customer_url") or "",
+        "panel_order_id": panel_order_id,
+        "panel_status": merged.get("panel_status") or merged.get("status") or "",
+        "funpay_status": _get_effective_funpay_status(merged) or merged.get("funpay_status") or "",
+        **progress,
+    }
+    ctx["orderDesc"] = ctx["lot_title"]
+    ctx["orderPrice"] = ctx["order_price"]
+    ctx["orderAmount"] = ctx["order_amount"]
+    ctx["twiboost_id"] = ctx["panel_order_id"]
+    return {key: (0 if value is None and key in ("total_quantity", "done_quantity", "left_quantity", "progress_percent") else ("" if value is None else value)) for key, value in ctx.items()}
+
+
+def _render_template(template_text: str, order_record: Optional[Dict] = None, extra: Optional[Dict] = None) -> str:
+    try:
+        return str(template_text or "").format_map(_SafeTemplateDict(_build_template_context(order_record, extra)))
+    except Exception as ex:
+        logger.error(f"Ошибка форматирования шаблона AutoSMM: {ex}")
+        return str(template_text or "")
+
+
+def _upsert_buyer_flow_order_record(chat_id: int, buyer_id: Any, buyer_username: Any, order_id_funpay: str, lot_title: str, order_price: Any, order_amount: Any, service_id: int, real_amount: int, service_number: int, funpay_status: str = "open", state: str = BUYER_STATE_WAITING_LINK, saved_link: Optional[str] = None):
+    orders_list = _load_orders_data_raw()
+    order_id_str = str(order_id_funpay)
+    existing = next((order for order in orders_list if str(order.get("order_id")) == order_id_str), None)
+    base = existing if isinstance(existing, dict) else {}
+    created_at = int(base.get("created_at") or time.time())
+    record_update = {
+        "chat_id": chat_id,
+        "buyer_id": buyer_id,
+        "buyer_username": buyer_username or "",
+        "order_id": order_id_str,
+        "lot_title": lot_title or base.get("lot_title") or base.get("service_name") or "",
+        "service_name": lot_title or base.get("service_name") or "—",
+        "service_id": service_id,
+        "quantity": int(real_amount or 0),
+        "total_quantity": int(real_amount or 0),
+        "order_amount": order_amount,
+        "order_price": order_price,
+        "service_number": service_number,
+        "funpay_status": _normalize_funpay_status(funpay_status) or "open",
+        "spent": float(base.get("spent", 0.0) or 0.0),
+        "summa": float(order_price or base.get("summa", 0) or 0),
+        "currency": str(base.get("currency", "RUB") or "RUB"),
+        "created_at": created_at,
+        "completed_notification_sent": bool(base.get("completed_notification_sent", False)),
+    }
+    if not _has_panel_order(base):
+        record_update["id_zakaz"] = base.get("id_zakaz")
+        record_update["status"] = base.get("status") or "pending"
+        record_update["customer_url"] = saved_link or base.get("customer_url") or ""
+    else:
+        record_update["id_zakaz"] = base.get("id_zakaz")
+        record_update["status"] = base.get("status", "pending")
+        record_update["customer_url"] = base.get("customer_url", saved_link or "")
+    if existing is None:
+        orders_list.append(record_update)
+    else:
+        existing.update(record_update)
+    save_orders_data(orders_list)
+    orders.update_order_fields(order_id_str, buyer_flow_state=state, saved_link=saved_link, total_quantity=int(real_amount or 0), done_quantity=0, left_quantity=int(real_amount or 0), progress_percent=0, last_prompt_ts=_now_str(), updated_at=_now_str())
+
+
+def _save_waiting_context(data: Dict, state: Optional[str] = None, saved_link_marker: Any = "__keep__"):
+    if not isinstance(data, dict):
+        return
+    order_id = str(data.get("order_id_funpay") or data.get("order_id") or "")
+    if not order_id:
+        return
+    if state:
+        data["state"] = state
+        data["step"] = _step_from_state(state)
+    else:
+        state = data.get("state") or _state_from_step(data.get("step"))
+    fields: Dict[str, Any] = {"buyer_flow_state": state, "updated_at": _now_str()}
+    if saved_link_marker != "__keep__":
+        fields["saved_link"] = saved_link_marker
+        if saved_link_marker in (None, ""):
+            data.pop("link", None)
+        else:
+            data["link"] = saved_link_marker
+    elif data.get("link"):
+        fields["saved_link"] = data.get("link")
+    orders.update_order_fields(order_id, **fields)
+
+
+def _build_waiting_context_from_order(order_record: Dict) -> Optional[Dict[str, Any]]:
+    if not isinstance(order_record, dict):
+        return None
+    order_id = str(order_record.get("order_id") or "")
+    if not order_id:
+        return None
+    state = _get_buyer_flow_state(order_record)
+    return {
+        "buyer_id": order_record.get("buyer_id"),
+        "chat_id": order_record.get("chat_id"),
+        "buyer_username": order_record.get("buyer_username") or "",
+        "service_id": order_record.get("service_id"),
+        "real_amount": int(order_record.get("quantity") or order_record.get("total_quantity") or 0),
+        "order_id_funpay": order_id,
+        "price": order_record.get("summa") or order_record.get("order_price") or 0,
+        "service_number": order_record.get("service_number", 1),
+        "lot_title": order_record.get("lot_title") or order_record.get("service_name") or "",
+        "state": state,
+        "step": _step_from_state(state),
+        "link": order_record.get("saved_link") or order_record.get("customer_url") or "",
+    }
+
+
+def _set_selected_order_for_buyer(buyer_id: Any, chat_id: Any, order_id: Any):
+    if order_id not in (None, ""):
+        BUYER_ORDER_SELECTION[_buyer_selection_key(buyer_id, chat_id)] = str(order_id)
+
+
+def _clear_selected_order_for_buyer(buyer_id: Any, chat_id: Any):
+    BUYER_ORDER_SELECTION.pop(_buyer_selection_key(buyer_id, chat_id), None)
+
+
+def _get_buyer_orders(buyer_id: Any, chat_id: Any) -> List[Dict]:
+    result: List[Dict] = []
+    for order_record in orders.load_orders_data():
+        if not isinstance(order_record, dict):
+            continue
+        buyer_match = buyer_id not in (None, "") and str(order_record.get("buyer_id")) == str(buyer_id)
+        chat_match = chat_id not in (None, "") and str(order_record.get("chat_id")) == str(chat_id)
+        if buyer_match or chat_match:
+            result.append(order_record)
+    result.sort(key=lambda item: int(item.get("created_at") or 0), reverse=True)
+    return result
+
+
+def _format_buyer_lot_title(order_record: Dict, max_len: int = 70) -> str:
+    """Return a short, buyer-facing lot title without long FunPay sales noise."""
+    if not isinstance(order_record, dict):
+        return "SMM-заказ"
+    raw_title = (
+        order_record.get("lot_title")
+        or order_record.get("service_name")
+        or order_record.get("orderDesc")
+        or "SMM-заказ"
+    )
+    raw_title = str(raw_title or "SMM-заказ").strip()
+    normalized = unicodedata.normalize("NFKC", raw_title)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    low = normalized.lower()
+
+    platform_patterns = [
+        ("TikTok", ("tiktok", "tik tok", "t i k t o k", "тик ток")),
+        ("Instagram", ("instagram", "инст")),
+        ("Telegram", ("telegram", "телеграм", "тг")),
+        ("YouTube", ("youtube", "ютуб")),
+        ("VK", ("vk", "вк")),
+        ("X", ("twitter", "x.com")),
+        ("Facebook", ("facebook", "fb")),
+        ("Twitch", ("twitch",)),
+    ]
+    platform = None
+    for name, needles in platform_patterns:
+        if any(needle in low for needle in needles):
+            platform = name
+            break
+
+    tail = ""
+    if "," in normalized:
+        parts = [part.strip(" ,;:-") for part in normalized.split(",") if part.strip(" ,;:-")]
+        if len(parts) >= 2:
+            tail = ", ".join(parts[1:]).strip()
+
+    def _clean(value: str) -> str:
+        value = unicodedata.normalize("NFKC", str(value or ""))
+        value = re.sub(r"[♻✅🤖💙❤️🔥⭐✨]+", " ", value)
+        value = re.sub(r"\s+", " ", value).strip(" -—,;:")
+        return value
+
+    tail = _clean(tail)
+    if platform and tail:
+        result = f"{platform} — {tail}"
+    elif platform:
+        cleaned = _clean(normalized)
+        # Remove a noisy platform token from the beginning when possible.
+        cleaned = re.sub(r"(?i)^(t\s*i\s*k\s*t\s*o\s*k|tiktok|tik tok|instagram|telegram|youtube|twitter|facebook|twitch|vk|вк|ютуб|телеграм|тик ток)\s*[-—:,]*\s*", "", cleaned).strip()
+        result = f"{platform} — {cleaned}" if cleaned else f"{platform} SMM-заказ"
+    else:
+        result = _clean(normalized) or "SMM-заказ"
+
+    if len(result) > max_len:
+        result = result[: max(1, max_len - 1)].rstrip() + "…"
+    return result
+
+
+def _buyer_status_label(order_record: Dict) -> str:
+    state = _get_buyer_flow_state(order_record)
+    if state == BUYER_STATE_WAITING_LINK:
+        return "ожидает ссылку"
+    if state == BUYER_STATE_LINK_PAUSED:
+        return "ожидание ссылки приостановлено"
+    if state == BUYER_STATE_WAITING_CONFIRM:
+        return "ожидает подтверждение ссылки"
+    if state == BUYER_STATE_COMPLETED:
+        return "выполнен"
+    if state == BUYER_STATE_FAILED:
+        return "требует проверки"
+    if state == BUYER_STATE_REFUNDED:
+        return "недоступен после возврата"
+    if _has_panel_order(order_record):
+        return "в работе"
+    return "ожидает ссылку"
+
+
+def _buyer_action_label(order_record: Dict) -> str:
+    state = _get_buyer_flow_state(order_record)
+    order_id = str(order_record.get("order_id") or "").lstrip("#")
+    panel_order_id = _get_panel_order_id(order_record)
+    if state == BUYER_STATE_WAITING_LINK:
+        return "отправьте ссылку"
+    if state == BUYER_STATE_LINK_PAUSED:
+        return f"напишите !ссылка {order_id}, когда будете готовы" if order_id else "напишите !ссылка, когда будете готовы"
+    if state == BUYER_STATE_WAITING_CONFIRM:
+        return "подтвердите ссылку: + или -"
+    if state == BUYER_STATE_REFUNDED:
+        return "недоступны после возврата"
+    if state in (BUYER_STATE_PANEL_CREATED, BUYER_STATE_COMPLETED) or _has_panel_order(order_record):
+        return f"чек {panel_order_id}" if panel_order_id else "ожидайте выполнение"
+    if state == BUYER_STATE_FAILED:
+        return "продавец проверит заказ вручную"
+    return "отправьте ссылку"
+
+
+def _format_short_order_list(records: List[Dict], command_name: str = "!ссылка") -> str:
+    command_name = str(command_name or "!ссылка").strip() or "!ссылка"
+    lines = ["📦 У вас несколько SMM-заказов", "", "Выберите нужный заказ командой:", ""]
+    shown = 0
+    for order_record in records[:5]:
+        order_id = str(order_record.get("order_id") or "").strip().lstrip("#")
+        if not order_id:
+            continue
+        shown += 1
+        lines.append(f"• #{order_id} — {_format_buyer_lot_title(order_record)}")
+        lines.append(f"  Команда: {command_name} {order_id}")
+        lines.append(f"  Статус: {_buyer_status_label(order_record)}")
+        lines.append("")
+    if not shown:
+        return "Заказ не найден."
+    lines.extend(["Чтобы посмотреть все заказы:", "!смм"])
+    return "\n".join(lines).strip()
+
+
+def _format_order_not_found_for_buyer(raw_ref: Any = None, records: Optional[List[Dict]] = None, command_name: str = "!ссылка") -> str:
+    ref = str(raw_ref or "").strip().lstrip("#")
+    active = [
+        r for r in (records or [])
+        if _get_buyer_flow_state(r) in BUYER_ACTIVE_PRE_PANEL_STATES
+        and not _has_panel_order(r)
+        and not _is_order_refundedish(r)
+    ]
+    if ref and len(active) == 1 and command_name in ("!ссылка", "!отмена"):
+        real_order_id = str(active[0].get("order_id") or "").strip().lstrip("#")
+        if real_order_id:
+            return (
+                f"Заказ #{ref} не найден.\n\n"
+                f"У вас есть активный заказ:\n"
+                f"#{real_order_id} — {_format_buyer_lot_title(active[0])}\n\n"
+                f"Чтобы продолжить:\n{command_name} {real_order_id}"
+            )
+    return ORDER_NOT_FOUND_TEXT
+
+def _resolve_buyer_order_for_action(c: Cardinal, buyer_id: Any, chat_id: Any, raw_ref: Optional[str], command_name: str) -> Optional[Dict]:
+    records = _get_buyer_orders(buyer_id, chat_id)
+    if raw_ref:
+        for order_record in records:
+            if _matches_order_ref(order_record.get("order_id"), raw_ref):
+                return order_record
+        _send_buyer_message(c, chat_id, _format_order_not_found_for_buyer(raw_ref, records, command_name=command_name))
+        return None
+
+    active = [
+        r for r in records
+        if _get_buyer_flow_state(r) in BUYER_ACTIVE_PRE_PANEL_STATES
+        and not _has_panel_order(r)
+        and not _is_order_refundedish(r)
+    ]
+    if command_name in ("!ссылка", "!отмена"):
+        if len(active) == 1:
+            return active[0]
+        if len(active) > 1:
+            _send_buyer_message(c, chat_id, _format_short_order_list(active, command_name=command_name))
+            return None
+        _send_buyer_message(c, chat_id, ORDER_NOT_FOUND_TEXT)
+        return None
+
+    if len(records) == 1:
+        return records[0]
+    if records:
+        _send_buyer_message(c, chat_id, _format_short_order_list(records, command_name=command_name))
+        return None
+    _send_buyer_message(c, chat_id, "У вас пока нет SMM-заказов.")
+    return None
+
+
+
+def _human_funpay_status(status_value: Any) -> str:
+    return {"open": "оплачен", "closed": "закрыт", "refunded": "возврат", "partially_refunded": "частичный возврат"}.get(_normalize_funpay_status(status_value), "неизвестно")
+
+
+def _human_panel_status(order_record: Dict) -> str:
+    state = _get_buyer_flow_state(order_record)
+    if state in (BUYER_STATE_WAITING_LINK, BUYER_STATE_LINK_PAUSED, BUYER_STATE_WAITING_CONFIRM, BUYER_STATE_FAILED, BUYER_STATE_REFUNDED, BUYER_STATE_COMPLETED):
+        return _buyer_status_label(order_record)
+    status = str(order_record.get("panel_status") or order_record.get("status") or "").strip().lower()
+    return {"pending": "в работе", "completed": "выполнен", "partial": "частично", "canceled": "отменён", "cancelled": "отменён", "fail": "требует проверки", "failed": "требует проверки", "unknown": "требует проверки"}.get(status, "в работе" if _has_panel_order(order_record) else "ожидает ссылку")
+
+
+def _format_created_at(order_record: Dict) -> str:
+    created_at = _safe_int(order_record.get("created_at"))
+    if created_at is not None:
+        try:
+            return datetime.fromtimestamp(created_at).strftime("%d.%m.%Y %H:%M")
+        except Exception:
+            pass
+    return str(order_record.get("date") or order_record.get("date_str") or "—")
+
+
+def _format_buyer_progress(order_record: Dict) -> str:
+    progress = _extract_progress_values(order_record)
+    total = _safe_int(progress.get("total_quantity")) or 0
+    done = _safe_int(progress.get("done_quantity")) or 0
+    if total > 0:
+        return f"{done}/{total}"
+    return "ожидается"
+
+
+def _format_buyer_smm_orders(records: List[Dict]) -> str:
+    if not records:
+        return "У вас пока нет SMM-заказов."
+    lines = ["📂 Ваши последние SMM-заказы", "━━━━━━━━━━━━━━━━━━━━━"]
+    for idx, order_record in enumerate(records[:5]):
+        if idx > 0:
+            lines.extend(["", "────────────────────", ""])
+        order_id = str(order_record.get("order_id") or "—").lstrip("#")
+        panel_order_id = _get_panel_order_id(order_record)
+        state = _get_buyer_flow_state(order_record)
+        lines.append(f"🧾 Заказ: #{order_id}")
+        lines.append(f"├ 📦 Лот: {_format_buyer_lot_title(order_record)}")
+        lines.append(f"├ 📅 Дата: {_format_created_at(order_record)}")
+        lines.append(f"├ ✅ FunPay: {_human_funpay_status(_get_effective_funpay_status(order_record))}")
+        lines.append(f"├ 🏁 Статус: {_buyer_status_label(order_record)}")
+        lines.append(f"├ 📊 Прогресс: {_format_buyer_progress(order_record)}")
+        if state == BUYER_STATE_WAITING_LINK:
+            lines.append("└ ✏️ Действие: отправьте ссылку")
+        elif state == BUYER_STATE_LINK_PAUSED:
+            lines.append(f"└ ✏️ Действие: напишите !ссылка {order_id}, когда будете готовы")
+        elif state == BUYER_STATE_WAITING_CONFIRM:
+            lines.append("└ ✏️ Действие: подтвердите ссылку: + или -")
+        elif state == BUYER_STATE_REFUNDED:
+            lines.append("└ 🔒 Действия: недоступны после возврата")
+        elif state in (BUYER_STATE_PANEL_CREATED, BUYER_STATE_COMPLETED) or _has_panel_order(order_record):
+            if panel_order_id:
+                lines.append(f"├ 🔍 Проверить: чек {panel_order_id}")
+                lines.append(f"└ 🔄 Рефилл: рефилл {panel_order_id}")
+            else:
+                lines.append("└ ✏️ Действие: ожидайте выполнение")
+        else:
+            lines.append("└ ⚠️ Действие: продавец проверит заказ вручную")
+    return "\n".join(lines).strip()
+
+
+def _handle_buyer_smm_command(c: Cardinal, msg_text: str, buyer_id: Any, chat_id: int) -> bool:
+    if not re.match(r"^!(?:смм|smm)\s*$", msg_text.strip(), re.IGNORECASE):
+        return False
+    _send_buyer_message(c, chat_id, _format_buyer_smm_orders(_get_buyer_orders(buyer_id, chat_id)[:5]))
+    return True
+
+
+def _handle_buyer_commands_command(c: Cardinal, msg_text: str, buyer_id: Any, chat_id: int) -> bool:
+    if not re.match(r"^!(?:команды|help|помощь)\s*$", msg_text.strip(), re.IGNORECASE):
+        return False
+    cfg = load_config()
+    template_text = (cfg.get("messages") or {}).get("buyer_commands") or DEFAULT_BUYER_COMMANDS_TEMPLATE
+    _send_buyer_message(c, chat_id, _render_template(template_text, {}, {}))
+    return True
+
+def _handle_buyer_link_command(c: Cardinal, msg_text: str, buyer_id: Any, chat_id: int) -> bool:
+    match = re.match(r"^!ссылка(?:\s+(.+))?$", msg_text.strip(), re.IGNORECASE)
+    if not match:
+        return False
+    raw_ref = (match.group(1) or "").strip() or None
+    order_record = _resolve_buyer_order_for_action(c, buyer_id, chat_id, raw_ref, command_name="!ссылка")
+    if not order_record:
+        return True
+    order_id = str(order_record.get("order_id"))
+    if _apply_refund_gate(c, order_record, notify_chat_id=chat_id, force_check=True):
+        return True
+    state = _get_buyer_flow_state(order_record)
+    if _has_panel_order(order_record) or state in (BUYER_STATE_PANEL_CREATED, BUYER_STATE_COMPLETED, BUYER_STATE_FAILED):
+        _send_buyer_message(c, chat_id, BUYER_PANEL_CREATED_BLOCK_TEXT)
+        return True
+    ctx = waiting_for_link.get(order_id) or _build_waiting_context_from_order(order_record) or {}
+    ctx.update({"order_id_funpay": order_id, "buyer_id": buyer_id, "chat_id": chat_id})
+    if state == BUYER_STATE_WAITING_LINK:
+        waiting_for_link[order_id] = ctx
+        _save_waiting_context(ctx, state=BUYER_STATE_LINK_PAUSED, saved_link_marker=None)
+        _clear_selected_order_for_buyer(buyer_id, chat_id)
+        _send_buyer_message(c, chat_id, f"⏸ Ожидание ссылки приостановлено.\n\n🧾 Заказ: #{order_id}\n\nКогда будете готовы отправить ссылку:\n!ссылка {order_id}")
+        return True
+    if state == BUYER_STATE_LINK_PAUSED:
+        waiting_for_link[order_id] = ctx
+        _save_waiting_context(ctx, state=BUYER_STATE_WAITING_LINK, saved_link_marker=None)
+        _set_selected_order_for_buyer(buyer_id, chat_id, order_id)
+        _send_buyer_message(c, chat_id, f"▶️ Ожидание ссылки возобновлено.\n\n🧾 Заказ: #{order_id}\n\nОтправьте ссылку для запуска заказа.\nСсылка должна начинаться с:\nhttps://")
+        return True
+    if state == BUYER_STATE_WAITING_CONFIRM:
+        waiting_for_link[order_id] = ctx
+        _save_waiting_context(ctx, state=BUYER_STATE_WAITING_LINK, saved_link_marker=None)
+        _set_selected_order_for_buyer(buyer_id, chat_id, order_id)
+        _send_buyer_message(c, chat_id, f"Текущая ссылка сброшена.\n\n🧾 Заказ: #{order_id}\n\nОтправьте новую ссылку.\nСсылка должна начинаться с:\nhttps://")
+        return True
+    _send_buyer_message(c, chat_id, "Отправьте ссылку для запуска заказа.")
+    return True
+
+def _buyer_owns_order(order_record: Dict, buyer_id: Any, chat_id: Any) -> bool:
+    if not isinstance(order_record, dict):
+        return False
+    buyer_match = buyer_id not in (None, "") and str(order_record.get("buyer_id")) == str(buyer_id)
+    chat_match = chat_id not in (None, "") and str(order_record.get("chat_id")) == str(chat_id)
+    return bool(buyer_match or chat_match)
+
+
+def _can_buyer_refund_pre_panel(c: Cardinal, order_record: Dict, buyer_id: Any, chat_id: Any) -> Tuple[bool, Dict]:
+    if not isinstance(order_record, dict):
+        return False, {}
+
+    order_id = str(order_record.get("order_id") or order_record.get("order_id_funpay") or "")
+    if not order_id:
+        return False, order_record
+
+    latest = orders.get_order_data(order_id) or order_record
+    if not _buyer_owns_order(latest, buyer_id, chat_id):
+        return False, latest
+
+    state = _get_buyer_flow_state(latest)
+    if state in (BUYER_STATE_PANEL_CREATED, BUYER_STATE_COMPLETED, BUYER_STATE_FAILED, BUYER_STATE_REFUNDED):
+        return False, latest
+    if _has_panel_order(latest):
+        return False, latest
+
+    # Force-check FunPay before any refund attempt. If the check is unavailable, do not refund.
+    result = _fetch_funpay_status_via_cardinal(c, order_id) if c else {"ok": False, "error": "no_cardinal"}
+    if not result.get("ok"):
+        logger.warning(f"BUYER CANCEL SAFETY BLOCKED: order=#{order_id}, reason=funpay_force_check_failed, detail={result.get('detail') or result.get('error')}")
+        return False, latest
+
+    funpay_status = _normalize_funpay_status(result.get("funpay_status"))
+    if funpay_status:
+        update_fields: Dict[str, Any] = {"funpay_status": funpay_status, "funpay_status_checked_at": _now_str()}
+        if funpay_status in ("refunded", "partially_refunded"):
+            update_fields.update({"buyer_flow_state": BUYER_STATE_REFUNDED, "saved_link": None, "updated_at": _now_str()})
+            waiting_for_link.pop(order_id, None)
+        orders.update_order_fields(order_id, **update_fields)
+        latest = orders.get_order_data(order_id) or latest
+
+    if funpay_status != "open":
+        logger.warning(f"BUYER CANCEL SAFETY BLOCKED: order=#{order_id}, reason=funpay_status_{funpay_status}")
+        return False, latest
+
+    state = _get_buyer_flow_state(latest)
+    if state in (BUYER_STATE_PANEL_CREATED, BUYER_STATE_COMPLETED, BUYER_STATE_FAILED, BUYER_STATE_REFUNDED):
+        return False, latest
+    if _has_panel_order(latest):
+        return False, latest
+
+    return True, latest
+
+
+def _handle_buyer_cancel_command(c: Cardinal, msg_text: str, buyer_id: Any, chat_id: int) -> bool:
+    match = re.match(r"^!отмена(?:\s+(.+))?$", msg_text.strip(), re.IGNORECASE)
+    if not match:
+        return False
+    raw_ref = (match.group(1) or "").strip() or None
+    order_record = _resolve_buyer_order_for_action(c, buyer_id, chat_id, raw_ref, command_name="!отмена")
+    if not order_record:
+        return True
+    order_id = str(order_record.get("order_id"))
+    if _apply_refund_gate(c, order_record, notify_chat_id=chat_id, force_check=True):
+        return True
+    state = _get_buyer_flow_state(order_record)
+    if _has_panel_order(order_record) or state in (BUYER_STATE_PANEL_CREATED, BUYER_STATE_COMPLETED, BUYER_STATE_FAILED):
+        _send_buyer_message(c, chat_id, "Заказ уже передан в работу.\nАвтоматическая отмена недоступна.")
+        return True
+    ctx = waiting_for_link.get(order_id) or _build_waiting_context_from_order(order_record) or {}
+    ctx.update({"order_id_funpay": order_id, "buyer_id": buyer_id, "chat_id": chat_id})
+
+    if bool(load_config().get("allow_buyer_cancel_before_panel_order", False)):
+        can_refund, fresh_order = _can_buyer_refund_pre_panel(c, order_record, buyer_id, chat_id)
+        if not can_refund:
+            _send_buyer_message(c, chat_id, BUYER_AUTO_CANCEL_UNAVAILABLE_TEXT)
+            return True
+        try:
+            c.account.refund(order_id)
+            orders.update_order_fields(order_id, funpay_status="refunded", buyer_flow_state=BUYER_STATE_REFUNDED, saved_link=None, refund_detected_at=_now_str(), refund_source="buyer_cancel_command", updated_at=_now_str())
+            waiting_for_link.pop(order_id, None)
+            _clear_selected_order_for_buyer(buyer_id, chat_id)
+            _send_buyer_message(c, chat_id, "Ввод ссылки отменён.\n\nЗаказ FunPay отменён.")
+            return True
+        except Exception as ex:
+            logger.error(f"BUYER CANCEL REFUND FAILED: order=#{order_id}, error={ex}")
+            waiting_for_link[order_id] = ctx
+            _save_waiting_context(ctx, state=BUYER_STATE_LINK_PAUSED, saved_link_marker=None)
+            _clear_selected_order_for_buyer(buyer_id, chat_id)
+            _send_admin_order_alert(
+                order_id_funpay=order_id,
+                reason=f"покупатель запросил !отмена, но автоматический refund не сработал: {ex}",
+                bot_action="refund не выполнен, ожидание ссылки приостановлено",
+                action="проверьте заказ и при необходимости отмените вручную",
+                title="⚠️ AutoSMM: не удалось выполнить buyer cancel",
+            )
+            _send_buyer_message(c, chat_id, BUYER_AUTO_CANCEL_FAILED_TEXT)
+            return True
+
+    waiting_for_link[order_id] = ctx
+    _save_waiting_context(ctx, state=BUYER_STATE_LINK_PAUSED, saved_link_marker=None)
+    _clear_selected_order_for_buyer(buyer_id, chat_id)
+    _send_buyer_message(c, chat_id, "Ввод ссылки отменён.\n\nЗаказ FunPay не отменён.\nЕсли хотите отменить заказ, напишите продавцу.\nЧтобы снова отправить ссылку, напишите: !ссылка")
+    return True
+
+
+def _get_waiting_candidates_for_message(buyer_id: Any, chat_id: int) -> List[Dict]:
+    return [r for r in _get_buyer_orders(buyer_id, chat_id) if _get_buyer_flow_state(r) in (BUYER_STATE_WAITING_LINK, BUYER_STATE_WAITING_CONFIRM) and not _has_panel_order(r)]
+
+
+def _choose_waiting_candidate(buyer_id: Any, chat_id: int, candidates: List[Dict]) -> Optional[Dict]:
+    selected = BUYER_ORDER_SELECTION.get(_buyer_selection_key(buyer_id, chat_id))
+    if selected:
+        for order_record in candidates:
+            if str(order_record.get("order_id")) == str(selected):
+                return order_record
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _send_link_confirmation_prompt(c: Cardinal, chat_id: int, order_id: str, link_value: str):
+    orders.update_order_fields(order_id, last_prompt_ts=_now_str(), updated_at=_now_str())
+    order_record = orders.get_order_data(order_id) or {}
+    cfg = load_config()
+    template_text = (cfg.get("messages") or {}).get("buyer_link_received_confirm") or DEFAULT_LINK_CONFIRM_TEMPLATE
+    message_text = _render_template(
+        template_text,
+        order_record,
+        {
+            "order_id_funpay": order_id,
+            "link": link_value,
+            "lot_title": order_record.get("lot_title") or order_record.get("service_name") or "—",
+        },
+    )
+    _send_buyer_message(c, chat_id, message_text)
+
+
+def _maybe_send_confirm_reminder(c: Cardinal, chat_id: int, order_record: Dict) -> bool:
+    order_id = str(order_record.get("order_id") or "")
+    age = _seconds_since_checked_at(order_record.get("last_prompt_ts"))
+    if age is not None and age < BUYER_CONFIRM_REMINDER_SECONDS:
+        return False
+    if order_id:
+        orders.update_order_fields(order_id, last_prompt_ts=_now_str(), updated_at=_now_str())
+    _send_buyer_message(c, chat_id, CONFIRM_REMINDER_TEXT)
+    return True
+
+def _normalize_buyer_confirm_action(text_value: Any) -> str:
+    return re.sub(r"\s+", " ", str(text_value or "").strip().lower()).strip(".!?,;: ")
+
+
+def _handle_waiting_link_message(c: Cardinal, order_record: Dict, msg_text: str, buyer_id: Any, chat_id: int) -> bool:
+    order_id = str(order_record.get("order_id"))
+    link_ = _extract_http_link(msg_text)
+    if not link_:
+        if _looks_like_link_without_https(msg_text):
+            _send_buyer_message(c, chat_id, INVALID_LINK_SCHEME_TEXT)
+            return True
+        return False
+    if _apply_refund_gate(c, order_record, notify_chat_id=chat_id, force_check=True):
+        return True
+    if _has_panel_order(order_record):
+        _send_buyer_message(c, chat_id, BUYER_PANEL_CREATED_BLOCK_TEXT)
+        return True
+    ok, reason = is_valid_link(link_)
+    if not ok:
+        _send_buyer_message(c, chat_id, reason)
+        return True
+    ctx = waiting_for_link.get(order_id) or _build_waiting_context_from_order(order_record) or {}
+    ctx.update({"buyer_id": buyer_id, "chat_id": chat_id, "order_id_funpay": order_id, "link": link_})
+    if load_config().get("confirm_link", True):
+        waiting_for_link[order_id] = ctx
+        _save_waiting_context(ctx, state=BUYER_STATE_WAITING_CONFIRM, saved_link_marker=link_)
+        _set_selected_order_for_buyer(buyer_id, chat_id, order_id)
+        _send_link_confirmation_prompt(c, chat_id, order_id, link_)
+        return True
+    waiting_for_link[order_id] = ctx
+    _save_waiting_context(ctx, state=BUYER_STATE_WAITING_LINK, saved_link_marker=link_)
+    process_link_without_confirmation(c, ctx)
+    _clear_selected_order_for_buyer(buyer_id, chat_id)
+    return True
+
+
+def _handle_waiting_confirm_message(c: Cardinal, order_record: Dict, msg_text: str, buyer_id: Any, chat_id: int) -> bool:
+    order_id = str(order_record.get("order_id"))
+    lowered = _normalize_buyer_confirm_action(msg_text)
+    link_ = _extract_http_link(msg_text)
+
+    if not link_ and lowered not in BUYER_CONFIRM_YES_WORDS and lowered not in BUYER_CONFIRM_NO_WORDS:
+        if _looks_like_link_without_https(msg_text):
+            _send_buyer_message(c, chat_id, INVALID_LINK_SCHEME_TEXT)
+            return True
+        return _maybe_send_confirm_reminder(c, chat_id, order_record)
+
+    if _apply_refund_gate(c, order_record, notify_chat_id=chat_id, force_check=True):
+        return True
+    if _has_panel_order(order_record):
+        _send_buyer_message(c, chat_id, BUYER_PANEL_CREATED_BLOCK_TEXT)
+        return True
+    ctx = waiting_for_link.get(order_id) or _build_waiting_context_from_order(order_record) or {}
+    ctx.update({"buyer_id": buyer_id, "chat_id": chat_id, "order_id_funpay": order_id, "link": order_record.get("saved_link") or ctx.get("link") or order_record.get("customer_url") or ""})
+
+    if lowered in BUYER_CONFIRM_YES_WORDS:
+        if not ctx.get("link"):
+            waiting_for_link[order_id] = ctx
+            _save_waiting_context(ctx, state=BUYER_STATE_WAITING_LINK, saved_link_marker=None)
+            _set_selected_order_for_buyer(buyer_id, chat_id, order_id)
+            _send_buyer_message(c, chat_id, f"Ссылка не найдена.\n\n🧾 Заказ: #{order_id}\n\nОтправьте ссылку для запуска заказа.\nСсылка должна начинаться с:\nhttps://")
+            return True
+        process_link_without_confirmation(c, ctx)
+        _clear_selected_order_for_buyer(buyer_id, chat_id)
+        return True
+
+    if lowered in BUYER_CONFIRM_NO_WORDS:
+        waiting_for_link[order_id] = ctx
+        _save_waiting_context(ctx, state=BUYER_STATE_WAITING_LINK, saved_link_marker=None)
+        _set_selected_order_for_buyer(buyer_id, chat_id, order_id)
+        _send_buyer_message(c, chat_id, f"Текущая ссылка сброшена.\n\n🧾 Заказ: #{order_id}\n\nОтправьте новую ссылку.\nСсылка должна начинаться с:\nhttps://")
+        return True
+
+    if link_:
+        ok, reason = is_valid_link(link_)
+        if not ok:
+            _send_buyer_message(c, chat_id, reason)
+            return True
+        ctx["link"] = link_
+        waiting_for_link[order_id] = ctx
+        _save_waiting_context(ctx, state=BUYER_STATE_WAITING_CONFIRM, saved_link_marker=link_)
+        _set_selected_order_for_buyer(buyer_id, chat_id, order_id)
+        _send_link_confirmation_prompt(c, chat_id, order_id, link_)
+        return True
+
+    return _maybe_send_confirm_reminder(c, chat_id, order_record)
+
+def _handle_buyer_flow_message(c: Cardinal, msg_text: str, buyer_id: Any, chat_id: int) -> bool:
+    candidates = _get_waiting_candidates_for_message(buyer_id, chat_id)
+    if not candidates:
+        if _extract_http_link(msg_text):
+            recent_orders = _get_buyer_orders(buyer_id, chat_id)
+            if recent_orders:
+                latest_order = recent_orders[0]
+                if _apply_refund_gate(c, latest_order, notify_chat_id=chat_id, force_check=True):
+                    return True
+                if _has_panel_order(latest_order) or _get_buyer_flow_state(latest_order) in (BUYER_STATE_PANEL_CREATED, BUYER_STATE_COMPLETED, BUYER_STATE_FAILED):
+                    _send_buyer_message(c, chat_id, BUYER_PANEL_CREATED_BLOCK_TEXT)
+                    return True
+        return False
+
+    order_record = _choose_waiting_candidate(buyer_id, chat_id, candidates)
+    if not order_record:
+        lowered = _normalize_buyer_confirm_action(msg_text)
+        if not _extract_http_link(msg_text) and lowered not in BUYER_CONFIRM_YES_WORDS and lowered not in BUYER_CONFIRM_NO_WORDS:
+            return False
+        _send_buyer_message(c, chat_id, _format_short_order_list(candidates, command_name="!ссылка"))
+        return True
+
+    state = _get_buyer_flow_state(order_record)
+    if state == BUYER_STATE_WAITING_LINK:
+        return _handle_waiting_link_message(c, order_record, msg_text, buyer_id, chat_id)
+    if state == BUYER_STATE_WAITING_CONFIRM:
+        return _handle_waiting_confirm_message(c, order_record, msg_text, buyer_id, chat_id)
+    return False
+
+
+def _recover_buyer_flow_runtime(c: Optional[Cardinal] = None):
+    waiting_for_link.clear()
+    recovered = 0
+    try:
+        all_orders = orders.load_orders_data()
+    except Exception as ex:
+        logger.error(f"BUYER FLOW RECOVERY FAILED: cannot load orders_data: {ex}")
+        return
+    for order_record in all_orders:
+        if not isinstance(order_record, dict):
+            continue
+        order_id = str(order_record.get("order_id") or "")
+        if not order_id:
+            continue
+        state = _get_buyer_flow_state(order_record)
+        if state not in BUYER_ACTIVE_PRE_PANEL_STATES:
+            continue
+        if _apply_refund_gate(c, order_record, notify_chat_id=None, force_check=True):
+            continue
+        if _has_panel_order(order_record):
+            orders.update_order_fields(order_id, buyer_flow_state=BUYER_STATE_PANEL_CREATED, panel_order_id=_get_panel_order_id(order_record), updated_at=_now_str())
+            continue
+        ctx = _build_waiting_context_from_order(order_record)
+        if ctx:
+            waiting_for_link[order_id] = ctx
+            recovered += 1
+    if recovered:
+        logger.info(f"BUYER FLOW RECOVERY: restored {recovered} active waiting orders")
 
 def _get_lot_fallback_targets(cfg: Dict, service_id: int, service_number: int) -> Tuple[Optional[int], Optional[int]]:
     lot_mapping_local = cfg.get("lot_mapping", {})
@@ -2407,6 +4200,18 @@ def _finalize_created_order(
         fallback_reason=fallback_reason,
         funpay_status="open",
     )
+    orders.update_order_fields(
+        order_id_funpay,
+        buyer_flow_state=BUYER_STATE_PANEL_CREATED,
+        panel_order_id=twiboost_id,
+        panel_status="pending",
+        saved_link=None,
+        total_quantity=int(real_amount or 0),
+        done_quantity=0,
+        left_quantity=int(real_amount or 0),
+        progress_percent=0,
+        updated_at=_now_str(),
+    )
 
     service_cfg = cfg["services"].get(str(service_number))
     if not service_cfg:
@@ -2432,17 +4237,208 @@ def _finalize_created_order(
 
     check_order_status(c, twiboost_id, buyer_chat_id, link_, order_id_funpay)
 
-    try:
-        msg_confirmation = cfg["messages"]["after_confirmation"].format(
-            twiboost_id=twiboost_id,
-            link=link_,
-        )
-    except Exception:
-        msg_confirmation = f"🎉 Заказ успешно оформлен!\n\n🔢 ID заказа в сервисе: {twiboost_id}\n🔗 {link_}"
+    order_record = orders.get_order_data(order_id_funpay) or {}
+    msg_confirmation = _render_template(
+        cfg.get("messages", {}).get("after_confirmation", "🎉 Заказ успешно оформлен!\n\n🔢 ID заказа в сервисе: {panel_order_id}\n🔗 {link}"),
+        order_record,
+        {
+            "panel_order_id": twiboost_id,
+            "twiboost_id": twiboost_id,
+            "link": link_,
+            "order_id_funpay": order_id_funpay,
+            "total_quantity": real_amount,
+            "done_quantity": 0,
+            "left_quantity": real_amount,
+            "progress_percent": 0,
+            "panel_status": "pending",
+            "funpay_status": "open",
+        },
+    )
 
-    c.send_message(buyer_chat_id, msg_confirmation)
+    _send_buyer_message(c, buyer_chat_id, msg_confirmation)
     waiting_for_link.pop(str(order_id_funpay), None)
 
+
+def _get_panel_balance_for_risk_check(service_number: Any) -> Dict[str, Any]:
+    cfg = load_config()
+    service_cfg = (cfg.get("services") or {}).get(str(service_number))
+    if not isinstance(service_cfg, dict):
+        return {"ok": False, "error": "service_not_found", "text": "недоступно"}
+
+    api_url = str(service_cfg.get("api_url") or "").strip()
+    api_key = _normalize_api_key(service_cfg.get("api_key"))
+    if not api_url or not api_key:
+        return {"ok": False, "error": "credentials_missing", "text": "недоступно"}
+
+    try:
+        response = requests.get(
+            api_url,
+            params={"action": "balance", "key": api_key},
+            timeout=6,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        balance_value = float(str(payload.get("balance", 0) or 0).replace(",", "."))
+        currency = str(payload.get("currency") or "RUB").upper().strip() or "RUB"
+        return {
+            "ok": True,
+            "balance": balance_value,
+            "currency": currency,
+            "text": f"{balance_value:.2f} {currency}",
+        }
+    except Exception as ex:
+        logger.warning(f"BALANCE RISK CHECK FAILED: service=#{service_number}, error={ex}")
+        return {"ok": False, "error": str(ex)[:120], "text": "недоступно"}
+
+
+def _format_balance_risk_value(balance_payload: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(balance_payload, dict) or not balance_payload.get("ok"):
+        return "недоступно"
+    return str(balance_payload.get("text") or "недоступно")
+
+
+def _build_transport_error_balance_note(balance_before: Optional[Dict[str, Any]], balance_after: Optional[Dict[str, Any]]) -> Tuple[str, str]:
+    before_ok = isinstance(balance_before, dict) and balance_before.get("ok")
+    after_ok = isinstance(balance_after, dict) and balance_after.get("ok")
+    before_text = _format_balance_risk_value(balance_before)
+    after_text = _format_balance_risk_value(balance_after)
+
+    if before_ok and after_ok and str(balance_before.get("currency")) == str(balance_after.get("currency")):
+        try:
+            delta = float(balance_after.get("balance") or 0) - float(balance_before.get("balance") or 0)
+        except Exception:
+            delta = 0.0
+        delta_text = f"{delta:.2f} {str(balance_after.get('currency') or '').upper()}".strip()
+        if float(balance_after.get("balance") or 0) < float(balance_before.get("balance") or 0):
+            note = (
+                f"Баланс до запроса: {before_text}\n"
+                f"Баланс после ошибки: {after_text}\n"
+                f"Разница: {delta_text}\n\n"
+                "Возможно, заказ был создан на панели, но AutoSMM не получил ответ.\n"
+                "Баланс — не доказательство создания заказа, а только признак риска."
+            )
+            return note, "high_risk_balance_decreased"
+        note = (
+            f"Баланс до запроса: {before_text}\n"
+            f"Баланс после ошибки: {after_text}\n"
+            "Разница: 0\n\n"
+            "Баланс не изменился, но transport-error не позволяет безопасно продолжить автоматически.\n"
+            "Баланс — не доказательство отсутствия заказа, а только признак риска."
+        )
+        return note, "manual_check_balance_unchanged"
+
+    note = (
+        "Баланс до/после проверить не удалось.\n"
+        "Transport-error после add-запроса требует ручной проверки.\n"
+        "Баланс — не источник правды, а только возможный признак риска."
+    )
+    return note, "manual_check_balance_unavailable"
+
+
+def _send_transport_error_after_add_alert(
+    order_id_funpay: Any,
+    service_number: Any,
+    service_id: Any,
+    real_amount: Any,
+    link_: str,
+    primary_error: Any,
+    primary_detail: Any,
+    balance_before: Optional[Dict[str, Any]] = None,
+    balance_after: Optional[Dict[str, Any]] = None,
+):
+    cfg = load_config()
+    notification_chat_id = cfg.get("notification_chat_id")
+    if not notification_chat_id or bot is None:
+        return
+
+    balance_note, _risk_code = _build_transport_error_balance_note(balance_before, balance_after)
+    text_ = (
+        "⚠️ Заказ требует ручной проверки\n\n"
+        f"Заказ FunPay: #{order_id_funpay}\n"
+        f"Панель: #{service_number}\n"
+        f"Услуга: {service_id}\n"
+        f"Итоговое количество: {real_amount}\n"
+        f"Ссылка: {link_}\n\n"
+        "Причина:\n"
+        "панель не вернула ID заказа после add-запроса.\n"
+        f"Ошибка: {primary_error}\n"
+        f"Детали: {str(primary_detail or '')[:300]}\n\n"
+        f"{balance_note}\n\n"
+        "Refund и резервная панель заблокированы.\n"
+        "Проверьте панель вручную."
+    )
+    try:
+        bot.send_message(notification_chat_id, text_)
+    except Exception as ex:
+        logger.error(f"Не удалось отправить transport-error alert по заказу #{order_id_funpay}: {ex}")
+
+
+def _handle_transport_error_after_add(
+    c: Cardinal,
+    order_id_funpay: Any,
+    buyer_chat_id: Any,
+    service_number: Any,
+    service_id: Any,
+    real_amount: Any,
+    link_: str,
+    primary_error: Any,
+    primary_detail: Any,
+    balance_before: Optional[Dict[str, Any]] = None,
+    balance_after: Optional[Dict[str, Any]] = None,
+    lot_price: Any = 0,
+    lot_title: str = "",
+):
+    order_id_str = str(order_id_funpay)
+    order_record = orders.get_order_data(order_id_str)
+    if not order_record:
+        try:
+            _upsert_buyer_flow_order_record(
+                chat_id=int(buyer_chat_id),
+                buyer_id=None,
+                buyer_username="",
+                order_id_funpay=order_id_str,
+                lot_title=lot_title or "—",
+                order_price=lot_price or 0,
+                order_amount=1,
+                service_id=int(service_id or 0),
+                real_amount=int(real_amount or 0),
+                service_number=int(service_number or 1),
+                funpay_status="open",
+                state=BUYER_STATE_FAILED,
+                saved_link=link_,
+            )
+        except Exception as ex:
+            logger.warning(f"Не удалось создать минимальную запись manual-check для заказа #{order_id_str}: {ex}")
+
+    orders.update_order_fields(
+        order_id_str,
+        status="unknown",
+        buyer_flow_state=BUYER_STATE_FAILED,
+        saved_link=link_,
+        customer_url=link_,
+        status_last_error=str(primary_error or "unknown"),
+        status_stop_reason="transport_error_after_add",
+        panel_status="manual_check",
+        updated_at=_now_str(),
+    )
+    waiting_for_link.pop(order_id_str, None)
+
+    try:
+        _send_buyer_message(c, int(buyer_chat_id), BUYER_ADD_TRANSPORT_MANUAL_TEXT)
+    except Exception as ex:
+        logger.warning(f"Не удалось отправить buyer manual text по transport-error #{order_id_str}: {ex}")
+
+    _send_transport_error_after_add_alert(
+        order_id_funpay=order_id_str,
+        service_number=service_number,
+        service_id=service_id,
+        real_amount=real_amount,
+        link_=link_,
+        primary_error=primary_error,
+        primary_detail=primary_detail,
+        balance_before=balance_before,
+        balance_after=balance_after,
+    )
 
 def process_link_without_confirmation(c: Cardinal, data: Dict):
     """
@@ -2461,6 +4457,14 @@ def process_link_without_confirmation(c: Cardinal, data: Dict):
     fallback_enabled = bool(cfg.get("fallback_enabled", False))
     fallback_service_id, fallback_service_number = _get_lot_fallback_targets(cfg, service_id, service_number)
     existing_order = orders.get_order_data(order_id_funpay)
+
+    if existing_order and _apply_refund_gate(c, existing_order, notify_chat_id=buyer_chat_id, force_check=True):
+        return
+    if existing_order and _has_panel_order(existing_order):
+        _send_buyer_message(c, buyer_chat_id, BUYER_PANEL_CREATED_BLOCK_TEXT)
+        return
+
+    balance_before = _get_panel_balance_for_risk_check(service_number)
 
     ok, twiboost_id, payload = send_order_to_service(
         c=c,
@@ -2491,18 +4495,27 @@ def process_link_without_confirmation(c: Cardinal, data: Dict):
 
     if primary_error in ("timeout", "network_error", "invalid_json", "http_error", "unknown"):
         logger.error("MANUAL CHECK REQUIRED")
+        logger.error("REFUND BLOCKED")
         logger.error("FALLBACK BLOCKED")
-        refund_order(
-            c,
-            order_id_funpay,
-            buyer_chat_id,
-            reason=f"{primary_error} на панели #{service_number}",
-            detailed_reason=(
-                f"Primary ошибка: {primary_error}. Автоматический fallback не запускался. Детали: {primary_detail}"
-            ),
-            bot_action="автоматическая обработка остановлена, fallback не запускался",
-            admin_action="проверьте заказ и при необходимости выполните возврат вручную",
-            failure_title="⚠️ Заказ требует ручной проверки",
+        try:
+            time.sleep(3)
+        except Exception:
+            pass
+        balance_after = _get_panel_balance_for_risk_check(service_number)
+        _handle_transport_error_after_add(
+            c=c,
+            order_id_funpay=order_id_funpay,
+            buyer_chat_id=buyer_chat_id,
+            service_number=service_number,
+            service_id=service_id,
+            real_amount=real_amount,
+            link_=link_,
+            primary_error=primary_error,
+            primary_detail=primary_detail,
+            balance_before=balance_before,
+            balance_after=balance_after,
+            lot_price=lot_price,
+            lot_title=(data.get("lot_title") or ""),
         )
         return
 
@@ -2515,9 +4528,9 @@ def process_link_without_confirmation(c: Cardinal, data: Dict):
             buyer_chat_id,
             reason=f"{primary_error} на панели #{service_number}",
             detailed_reason=(
-                f"Primary ошибка: {primary_error}. Fallback заблокирован. Детали: {primary_detail}"
+                f"Primary ошибка: {primary_error}. Резервная панель заблокирована. Детали: {primary_detail}"
             ),
-            bot_action="fallback заблокирован, заказ не создан автоматически",
+            bot_action="резервная панель заблокирована, заказ не создан автоматически",
             admin_action="проверьте заказ и при необходимости выполните возврат вручную",
             failure_title="⚠️ Заказ требует ручной проверки",
         )
@@ -2532,9 +4545,9 @@ def process_link_without_confirmation(c: Cardinal, data: Dict):
             buyer_chat_id,
             reason=f"{primary_error} на панели #{service_number}",
             detailed_reason=(
-                f"Primary ошибка: {primary_error}. Fallback не запускался. Детали: {primary_detail}"
+                f"Primary ошибка: {primary_error}. Резервная панель не запускалась. Детали: {primary_detail}"
             ),
-            bot_action="автоматическая обработка остановлена, fallback не запускался",
+            bot_action="автоматическая обработка остановлена, резервная панель не запускалась",
             admin_action="проверьте заказ и при необходимости выполните возврат вручную",
             failure_title="⚠️ Заказ требует ручной проверки",
         )
@@ -2548,8 +4561,8 @@ def process_link_without_confirmation(c: Cardinal, data: Dict):
             order_id_funpay,
             buyer_chat_id,
             reason=f"{primary_error} на панели #{service_number}",
-            detailed_reason=f"Fallback отключён. Primary ошибка: {primary_error} | {primary_detail}",
-            bot_action="fallback отключён, заказ не создан автоматически",
+            detailed_reason=f"Резервная панель отключена. Primary ошибка: {primary_error} | {primary_detail}",
+            bot_action="резервная панель отключена, заказ не создан автоматически",
             admin_action="проверьте заказ и при необходимости выполните возврат вручную",
             failure_title="⚠️ Заказ требует ручной проверки",
         )
@@ -2563,8 +4576,8 @@ def process_link_without_confirmation(c: Cardinal, data: Dict):
             order_id_funpay,
             buyer_chat_id,
             reason=f"{primary_error} на панели #{service_number}",
-            detailed_reason=f"Повторный fallback запрещён. Primary ошибка: {primary_error} | {primary_detail}",
-            bot_action="повторный fallback запрещён, заказ не создан автоматически",
+            detailed_reason=f"Повторная резервная панель запрещена. Primary ошибка: {primary_error} | {primary_detail}",
+            bot_action="повторная резервная панель запрещена, заказ не создан автоматически",
             admin_action="проверьте заказ и при необходимости выполните возврат вручную",
             failure_title="⚠️ Заказ требует ручной проверки",
         )
@@ -2578,8 +4591,8 @@ def process_link_without_confirmation(c: Cardinal, data: Dict):
             order_id_funpay,
             buyer_chat_id,
             reason=f"{primary_error} на панели #{service_number}",
-            detailed_reason=f"Fallback не настроен. Primary ошибка: {primary_error} | {primary_detail}",
-            bot_action="fallback не настроен, заказ не создан автоматически",
+            detailed_reason=f"Резервная панель не настроена. Primary ошибка: {primary_error} | {primary_detail}",
+            bot_action="резервная панель не настроена, заказ не создан автоматически",
             admin_action="проверьте заказ и при необходимости выполните возврат вручную",
             failure_title="⚠️ Заказ требует ручной проверки",
         )
@@ -2597,9 +4610,9 @@ def process_link_without_confirmation(c: Cardinal, data: Dict):
             buyer_chat_id,
             reason=f"{primary_error} на панели #{service_number}",
             detailed_reason=(
-                f"Primary ошибка: {primary_error}. Fallback заблокирован: primary и fallback указывают на один и тот же сервис #{service_number}."
+                f"Primary ошибка: {primary_error}. Резервная панель заблокирована: основная и резервная панели указывают на один и тот же сервис #{service_number}."
             ),
-            bot_action="fallback заблокирован, потому что primary и fallback указывают на одну панель",
+            bot_action="резервная панель заблокирована, потому что основная и резервная панели совпадают",
             admin_action="проверьте заказ и при необходимости выполните возврат вручную",
             failure_title="⚠️ Заказ требует ручной проверки",
         )
@@ -2614,9 +4627,9 @@ def process_link_without_confirmation(c: Cardinal, data: Dict):
             buyer_chat_id,
             reason=f"{primary_error} на панели #{service_number}",
             detailed_reason=(
-                f"Fallback заблокирован: primary и fallback указывают на один и тот же сервис #{service_number}."
+                f"Резервная панель заблокирована: основная и резервная панели указывают на один и тот же сервис #{service_number}."
             ),
-            bot_action="fallback заблокирован, потому что primary и fallback указывают на одну панель",
+            bot_action="резервная панель заблокирована, потому что основная и резервная панели совпадают",
             admin_action="проверьте заказ и при необходимости выполните возврат вручную",
             failure_title="⚠️ Заказ требует ручной проверки",
         )
@@ -2644,26 +4657,26 @@ def process_link_without_confirmation(c: Cardinal, data: Dict):
             lot_price=lot_price,
             fallback_used=True,
             fallback_reason=fallback_reason,
-            notification_info_title="ℹ️ Заказ переведён на fallback",
+            notification_info_title="ℹ️ Заказ переведён на резервную панель",
             notification_reason=f"{primary_error} на панели #{service_number}",
-            notification_action=f"заказ отправлен через fallback на панели #{fallback_service_number}",
+            notification_action=f"заказ отправлен через резервную панель #{fallback_service_number}",
         )
         return
 
     err2 = payload2.get("error", "unknown")
     detail2 = payload2.get("detail", str(payload2))
-    logger.error(f"Fallback попытка тоже провалена ({err2}) | {detail2}")
+    logger.error(f"Резервная панель попытка тоже провалена ({err2}) | {detail2}")
     _store_fallback_decision(order_id_funpay, fallback_used=False, fallback_reason=fallback_reason)
 
     refund_order(
         c,
         order_id_funpay,
         buyer_chat_id,
-        reason=f"{primary_error} на панели #{service_number}, fallback не смог создать заказ на панели #{fallback_service_number}",
+        reason=f"{primary_error} на панели #{service_number}, резервная панель не смогла создать заказ на панели #{fallback_service_number}",
         detailed_reason=(
-            f"Primary ошибка: {primary_error} | {primary_detail}. Fallback ошибка: {err2} | {detail2}."
+            f"Primary ошибка: {primary_error} | {primary_detail}. Ошибка резервной панели: {err2} | {detail2}."
         ),
-        bot_action="автоматическое создание через fallback не удалось",
+        bot_action="автоматическое создание через резервную панель не удалось",
         admin_action="проверьте заказ и при необходимости выполните возврат вручную",
         failure_title="⚠️ Заказ требует ручной проверки",
     )
@@ -3468,7 +5481,7 @@ def send_order_started_notification(
         else:
             parts.append(f"📈 Профит: недоступен (валюта панели: {currency})")
         parts.append("")
-        parts.append(f"📦 Кол-во: {real_amount}")
+        parts.append(f"📦 Итоговое количество: {real_amount}")
         parts.append(f"🔗 {order_url}")
 
         notification_text = "\n".join(parts)
@@ -3499,16 +5512,22 @@ def _send_completion_notification_if_needed(c: Cardinal, order_record: Dict):
     buyer_chat_id = order_record.get("chat_id")
     order_id_funpay = str(order_record.get("order_id"))
     twiboost_order_id = order_record.get("id_zakaz")
-    order_link = f"https://funpay.com/orders/{order_id_funpay}/"
-    message = (
-        f"👾 Ваш заказ успешно завершён!\n"
-        f"🔢 Номер заказа: {twiboost_order_id}\n"
-        f"🔗 Подтвердите заказ: {order_link}"
+    cfg = load_config()
+    template_text = (cfg.get("messages") or {}).get("after_completed") or DEFAULT_AFTER_COMPLETED_TEMPLATE
+    message = _render_template(
+        template_text,
+        order_record,
+        {
+            "order_id_funpay": order_id_funpay,
+            "panel_order_id": twiboost_order_id,
+            "twiboost_id": twiboost_order_id,
+            "lot_title": order_record.get("lot_title") or order_record.get("service_name") or "—",
+        },
     )
 
     try:
         c.send_message(buyer_chat_id, message)
-        orders.update_order_fields(order_id_funpay, completed_notification_sent=True)
+        orders.update_order_fields(order_id_funpay, completed_notification_sent=True, buyer_flow_state=BUYER_STATE_COMPLETED, panel_status="completed", updated_at=_now_str())
         order_record["completed_notification_sent"] = True
         logger.info(f"Уведомление о завершении отправлено покупателю {buyer_chat_id} (заказ #{twiboost_order_id}).")
     except Exception as ex:
@@ -3518,6 +5537,33 @@ def _send_completion_notification_if_needed(c: Cardinal, order_record: Dict):
 # =========================================================
 # LOTS UI
 # =========================================================
+
+def _is_delete_confirm_grace_active(chat_id: Any) -> bool:
+    try:
+        return time.time() < float(DELETE_CONFIRM_GRACE_UNTIL.get(int(chat_id), 0) or 0)
+    except Exception:
+        return False
+
+
+def _set_delete_confirm_grace(chat_id: Any, seconds: int = 30):
+    try:
+        DELETE_CONFIRM_GRACE_UNTIL[int(chat_id)] = time.time() + int(seconds or 30)
+    except Exception:
+        pass
+
+
+def _truncate_button_text(value: Any, limit: int = 48) -> str:
+    text_value = re.sub(r"\s+", " ", str(value or "Без названия")).strip() or "Без названия"
+    if len(text_value) <= limit:
+        return text_value
+    return text_value[: max(1, limit - 1)].rstrip() + "…"
+
+
+def _not_configured(value: Any) -> str:
+    raw_value = str(value or "").strip()
+    if not raw_value or raw_value.lower() in ("none", "null"):
+        return "не настроена"
+    return raw_value
 
 def _set_lot_page_context(chat_id: int, page: int) -> int:
     page = max(0, int(page or 0))
@@ -3641,6 +5687,8 @@ def _dispatch_navigation_callback(call: types.CallbackQuery, target: str):
         misc_settings(call)
     elif target == "links_menu":
         links_menu(call)
+    elif target == "seller_notifications_settings":
+        seller_notifications_settings(call)
     elif target == "add_new_lot":
         add_new_lot(call)
     elif target == "search_lot":
@@ -3715,7 +5763,9 @@ def _render_search_results(chat_id: int, search_term: str, message_id: Optional[
     found_lots = []
     for lot_key, lot_data in lot_map.items():
         lot_name = str(lot_data.get("name", "")).lower()
-        if term and term in lot_name:
+        service_id = str(lot_data.get("service_id", "")).lower()
+        lot_key_l = str(lot_key or "").lower()
+        if term and (term in lot_name or term in service_id or term in lot_key_l):
             found_lots.append((lot_key, lot_data))
 
     kb = InlineKeyboardMarkup(row_width=1)
@@ -3725,7 +5775,7 @@ def _render_search_results(chat_id: int, search_term: str, message_id: Optional[
             sid_ = lot_data.get("service_id")
             qty_ = lot_data.get("quantity")
             snum_ = lot_data.get("service_number", 1)
-            btn_text = f"{name_} [ID={sid_}, Q={qty_}, S={snum_}]"
+            btn_text = f"{name_} [ID={sid_}, Q={qty_}, панель={snum_}]"
             kb.add(InlineKeyboardButton(btn_text, callback_data=f"edit_lot_search_{lot_key}"))
         kb.add(InlineKeyboardButton("🔍 Новый поиск", callback_data="search_lot"))
         kb.add(InlineKeyboardButton("◀️ Назад", callback_data="lot_settings"))
@@ -3733,7 +5783,7 @@ def _render_search_results(chat_id: int, search_term: str, message_id: Optional[
     else:
         kb.add(InlineKeyboardButton("🔍 Новый поиск", callback_data="search_lot"))
         kb.add(InlineKeyboardButton("◀️ Назад", callback_data="lot_settings"))
-        text_ = f"❌ Лоты с названием '{term}' не найдены."
+        text_ = f"❌ Лоты по запросу '{term}' не найдены."
 
     if message_id is not None:
         bot.edit_message_text(text_, chat_id, message_id, reply_markup=kb)
@@ -3830,31 +5880,34 @@ def _show_lot_card(
     _set_lot_card_context(chat_id, lot_key, back_callback, back_label)
 
     ld_ = lot_map[lot_key]
-    fallback_enabled = bool(cfg.get("fallback_enabled", False))
-    lines_ = [
-        f"<b>{lot_key}</b>",
-        f"Название: <code>{html.escape(str(ld_['name']))}</code>",
-        f"ID услуги: <code>{ld_['service_id']}</code>",
-        f"Кол-во: <code>{ld_['quantity']}</code>",
-        f"S#: <code>{ld_.get('service_number', 1)}</code>",
-    ]
-    if fallback_enabled:
-        lines_.append(f"Fallback S#: <code>{ld_.get('fallback_service_number')}</code>")
-        lines_.append(f"Fallback ID: <code>{ld_.get('fallback_service_id')}</code>")
-    txt_ = "\n".join(lines_).strip()
+    fallback_number = _not_configured(ld_.get("fallback_service_number"))
+    fallback_id = _not_configured(ld_.get("fallback_service_id"))
+    txt_ = "\n".join([
+        f"<b>{html.escape(str(lot_key))}</b>",
+        "",
+        "<b>Название:</b>",
+        html.escape(str(ld_.get("name") or "Без названия")),
+        "",
+        f"Номер панели: <code>{html.escape(str(ld_.get('service_number', 1)))}</code>",
+        f"ID услуги: <code>{html.escape(str(ld_.get('service_id', '—')))}</code>",
+        f"Кол-во: <code>{html.escape(str(ld_.get('quantity', '—')))}</code>",
+        "",
+        "━━━━━━━━━━━━━━",
+        "<b>Резервная панель</b>",
+        "",
+        f"Номер панели: <code>{html.escape(fallback_number)}</code>",
+        f"ID услуги: <code>{html.escape(fallback_id)}</code>",
+    ]).strip()
 
     kb_ = InlineKeyboardMarkup(row_width=1)
     card_buttons = [
         InlineKeyboardButton("Изменить название", callback_data=f"change_name_{lot_key}"),
         InlineKeyboardButton("Изменить ID услуги", callback_data=f"change_id_{lot_key}"),
         InlineKeyboardButton("Изменить количество", callback_data=f"change_quantity_{lot_key}"),
-        InlineKeyboardButton("Изменить сервис#", callback_data=f"change_snum_{lot_key}"),
+        InlineKeyboardButton("Изменить номер панели", callback_data=f"change_snum_{lot_key}"),
+        InlineKeyboardButton("Изменить номер резервной панели", callback_data=f"change_fallback_snum_{lot_key}"),
+        InlineKeyboardButton("Изменить ID резервной услуги", callback_data=f"change_fallback_id_{lot_key}"),
     ]
-    if fallback_enabled:
-        card_buttons.extend([
-            InlineKeyboardButton("Изменить Fallback S#", callback_data=f"change_fallback_snum_{lot_key}"),
-            InlineKeyboardButton("Изменить Fallback ID", callback_data=f"change_fallback_id_{lot_key}"),
-        ])
     kb_.add(*card_buttons)
     kb_.add(InlineKeyboardButton("❌ Удалить лот", callback_data=f"delete_one_lot_{lot_key}"))
     kb_.add(InlineKeyboardButton(back_label, callback_data=back_callback))
@@ -3913,11 +5966,8 @@ def generate_lots_keyboard(page: int = 0) -> InlineKeyboardMarkup:
 
     kb_ = InlineKeyboardMarkup(row_width=1)
     for lot_key, lot_data in chunk:
-        name_ = lot_data["name"]
-        sid_ = lot_data["service_id"]
-        qty_ = lot_data["quantity"]
-        snum_ = lot_data.get("service_number", 1)
-        btn_text = f"{name_} [ID={sid_}, Q={qty_}, S={snum_}]"
+        name_ = lot_data.get("name", "Без названия")
+        btn_text = _truncate_button_text(name_)
         cd_ = f"edit_lot_{lot_key}"
         kb_.add(InlineKeyboardButton(btn_text, callback_data=cd_))
 
@@ -3961,21 +6011,14 @@ def delete_one_lot(call: types.CallbackQuery, lot_key: str):
 
 def delete_all_lots_func(call: types.CallbackQuery):
     cfg = load_config()
-    preserved_notification_chat_id = cfg.get("notification_chat_id")
-    preserved_services = cfg.get("services", {})
-    
-    new_config = {
-        "lot_mapping": {},
-        "services": preserved_services,
-        "auto_refunds": cfg.get("auto_refunds", True),
-        "messages": cfg.get("messages", {}),
-        "notification_chat_id": preserved_notification_chat_id
-    }
-    
-    save_config(new_config)
-    bot.edit_message_text("✅ Все лоты успешно удалены. Chat ID и сервисы сохранены.", 
-                         call.message.chat.id, 
-                         call.message.message_id)
+    cfg["lot_mapping"] = {}
+    save_config(cfg)
+    _set_lot_page_context(call.message.chat.id, 0)
+    bot.edit_message_text(
+        "✅ Все лоты успешно удалены. Настройки сохранены.",
+        call.message.chat.id,
+        call.message.message_id,
+    )
 
 
 def _finish_lot_edit(message: types.Message, lot_key: str, success_text: str):
@@ -4063,7 +6106,7 @@ def process_service_num_change(message: types.Message, lot_key: str):
 
     cfg = load_config()
     if str(new_snum) not in cfg.get("services", {}):
-        _repeat_lot_edit_flow(message.chat.id, f"❌ Ошибка: Сервис #{new_snum} не существует.")
+        _repeat_lot_edit_flow(message.chat.id, f"❌ Ошибка: панель #{new_snum} не существует.")
         return
 
     lot_map = cfg.get("lot_mapping", {})
@@ -4135,12 +6178,12 @@ def process_fallback_snum_change(message: types.Message, lot_key: str):
     try:
         new_snum = int(message.text.strip())
     except ValueError:
-        _repeat_lot_edit_flow(message.chat.id, "❌ Ошибка: Введите номер fallback сервиса (число).")
+        _repeat_lot_edit_flow(message.chat.id, "❌ Ошибка: введите номер резервной панели числом.")
         return
 
     cfg = load_config()
     if str(new_snum) not in cfg.get("services", {}):
-        _repeat_lot_edit_flow(message.chat.id, f"❌ Ошибка: Сервис #{new_snum} не существует.")
+        _repeat_lot_edit_flow(message.chat.id, f"❌ Ошибка: панель #{new_snum} не существует.")
         return
 
     lot_map = cfg.get("lot_mapping", {})
@@ -4152,14 +6195,14 @@ def process_fallback_snum_change(message: types.Message, lot_key: str):
     lot_map[lot_key]["fallback_service_number"] = new_snum
     cfg["lot_mapping"] = lot_map
     reindex_lots(cfg)
-    _finish_lot_edit(message, lot_key, f"✅ Fallback S# для {lot_key} изменён на {new_snum}.")
+    _finish_lot_edit(message, lot_key, f"✅ Номер резервной панели для {lot_key} изменён на {new_snum}.")
 
 
 def process_fallback_id_change(message: types.Message, lot_key: str):
     try:
         new_id = int(message.text.strip())
     except ValueError:
-        _repeat_lot_edit_flow(message.chat.id, "❌ Ошибка: ID fallback услуги должно быть числом.")
+        _repeat_lot_edit_flow(message.chat.id, "❌ Ошибка: ID резервной услуги должен быть числом.")
         return
 
     cfg = load_config()
@@ -4172,7 +6215,7 @@ def process_fallback_id_change(message: types.Message, lot_key: str):
     lot_map[lot_key]["fallback_service_id"] = new_id
     cfg["lot_mapping"] = lot_map
     reindex_lots(cfg)
-    _finish_lot_edit(message, lot_key, f"✅ Fallback ID для {lot_key} изменён на {new_id}.")
+    _finish_lot_edit(message, lot_key, f"✅ ID резервной услуги для {lot_key} изменён на {new_id}.")
 
 
 def lot_settings(call: types.CallbackQuery):
@@ -4249,11 +6292,36 @@ def change_quantity(call: types.CallbackQuery):
 
 def change_snum(call: types.CallbackQuery):
     lot_key = call.data.split("_", 2)[2]
-    _start_lot_edit_flow(call, lot_key, "change_snum", f"Введите номер сервиса для {lot_key}:", process_service_num_change)
+    _start_lot_edit_flow(call, lot_key, "change_snum", f"Введите номер панели для {lot_key}:", process_service_num_change)
 
 
 def delete_one_lot_callback(call: types.CallbackQuery):
     lot_key = call.data.split("_", 3)[3]
+    if _is_delete_confirm_grace_active(call.message.chat.id):
+        delete_one_lot(call, lot_key)
+        return
+    cfg = load_config()
+    lot_map = cfg.get("lot_mapping", {}) or {}
+    lot_data = lot_map.get(lot_key) or {}
+    lot_title = str(lot_data.get("name") or lot_key)
+    kb_ = InlineKeyboardMarkup(row_width=1)
+    kb_.add(InlineKeyboardButton("✅ Удалить", callback_data=f"confirm_delete_one_lot_{lot_key}"))
+    kb_.add(InlineKeyboardButton("◀️ Назад", callback_data=f"edit_lot_{lot_key}"))
+    txt_ = f"""⚠️ <b>Удалить лот?</b>
+
+Лот:
+{html.escape(lot_title)}
+
+Будет удалена только связка AutoSMM.
+FunPay-лот на сайте не удаляется.
+
+После подтверждения следующие удаления в течение 30 секунд будут выполняться без повторного подтверждения."""
+    bot.edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb_)
+
+
+def confirm_delete_one_lot_callback(call: types.CallbackQuery):
+    lot_key = call.data.split("confirm_delete_one_lot_", 1)[1]
+    _set_delete_confirm_grace(call.message.chat.id, 30)
     delete_one_lot(call, lot_key)
 
 
@@ -4277,31 +6345,608 @@ def update_lot_ids(call: types.CallbackQuery):
     misc_settings(call)
 
 
+
+# =========================================================
+# TELEMETRY / BACKUP HELPERS
+# =========================================================
+
+def _parse_autosmm_dt(value: Any) -> Optional[datetime]:
+    raw_value = str(value or "").strip()
+    if not raw_value:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f"):
+        try:
+            return datetime.strptime(raw_value, fmt)
+        except Exception:
+            continue
+    try:
+        return datetime.fromisoformat(raw_value)
+    except Exception:
+        return None
+
+
+def _save_autosmm_state(state: Dict) -> None:
+    _safe_write_json(AUTOSMM_STATE_PATH, state if isinstance(state, dict) else {})
+
+
+def _get_telemetry_consent_state() -> Optional[bool]:
+    state = _load_autosmm_state()
+    if TELEMETRY_CONSENT_KEY not in state:
+        return None
+    return bool(state.get(TELEMETRY_CONSENT_KEY))
+
+
+def _set_telemetry_consent(value: bool) -> None:
+    state = _load_autosmm_state()
+    state[TELEMETRY_CONSENT_KEY] = bool(value)
+    _save_autosmm_state(state)
+
+
+def _telemetry_consent_accepted() -> bool:
+    return _get_telemetry_consent_state() is True
+
+
+def _telemetry_guest_used() -> bool:
+    state = _load_autosmm_state()
+    return state.get(TELEMETRY_GUEST_USED_KEY) is True
+
+
+def _telemetry_guest_active() -> bool:
+    state = _load_autosmm_state()
+    guest_until = _parse_autosmm_dt(state.get(TELEMETRY_GUEST_UNTIL_KEY))
+    return bool(guest_until and guest_until > datetime.now())
+
+
+def _telemetry_allows_ping() -> bool:
+    return _telemetry_consent_accepted()
+
+
+def _activate_telemetry_guest_24h() -> bool:
+    state = _load_autosmm_state()
+    if state.get(TELEMETRY_CONSENT_KEY) is True:
+        return True
+    if state.get(TELEMETRY_GUEST_USED_KEY) is True:
+        return False
+    now_dt = datetime.now()
+    state[TELEMETRY_GUEST_USED_KEY] = True
+    state[TELEMETRY_GUEST_STARTED_AT_KEY] = now_dt.isoformat(timespec="seconds")
+    state[TELEMETRY_GUEST_UNTIL_KEY] = (now_dt + timedelta(hours=24)).isoformat(timespec="seconds")
+    _save_autosmm_state(state)
+    return True
+
+
+def _normalize_funpay_username(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _normalize_funpay_id(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _looks_like_funpay_user_id(value: Any) -> bool:
+    raw = _normalize_funpay_id(value)
+    return raw.isdigit() and 3 <= len(raw) <= 20
+
+
+def _looks_like_funpay_username(value: Any) -> bool:
+    raw = str(value or "").strip()
+    if not raw:
+        return False
+    if len(raw) > 64:
+        return False
+    if raw.startswith("<") or raw.startswith("{"):
+        return False
+    return True
+
+
+def _safe_get_identity_field(obj: Any, field_name: str) -> Any:
+    if obj is None:
+        return None
+    try:
+        if isinstance(obj, dict):
+            return obj.get(field_name)
+        value = getattr(obj, field_name, None)
+        if callable(value):
+            return None
+        return value
+    except Exception:
+        return None
+
+
+def _extract_identity_pair_from_obj(obj: Any, source_name: str) -> Optional[Dict[str, str]]:
+    """Extract a seller FunPay identity only when username and user_id come from the same object."""
+    if obj is None:
+        return None
+
+    username_value = None
+    for field_name in ("username", "user_name", "login", "name"):
+        candidate = _safe_get_identity_field(obj, field_name)
+        if _looks_like_funpay_username(candidate):
+            username_value = candidate
+            break
+
+    user_id_value = None
+    for field_name in ("user_id", "account_id", "id"):
+        candidate = _safe_get_identity_field(obj, field_name)
+        if _looks_like_funpay_user_id(candidate):
+            user_id_value = candidate
+            break
+
+    if not _looks_like_funpay_username(username_value) or not _looks_like_funpay_user_id(user_id_value):
+        return None
+
+    return {
+        "source": str(source_name or "unknown"),
+        "username": _normalize_funpay_username(username_value),
+        "user_id": _normalize_funpay_id(user_id_value),
+    }
+
+
+def _safe_call_account_identity_method(account: Any, method_name: str) -> Any:
+    try:
+        method = getattr(account, method_name, None)
+        if not callable(method):
+            return None
+        return method()
+    except Exception:
+        return None
+
+
+def _get_funpay_identity(c: Optional[Cardinal] = None) -> Tuple[str, str, str]:
+    """Return stable seller FunPay identity as (username, user_id, source).
+
+    The function intentionally accepts only complete username+user_id pairs from a single
+    Cardinal/FunPayAPI source object. It never mixes username from one source with user_id
+    from another source, because that can make anonymous_install_id unstable.
+    """
+    account = getattr(c or cardinal_instance, "account", None)
+    if account is None:
+        return "", "", "unavailable"
+
+    candidate_sources: List[Tuple[str, Any]] = []
+    for attr_name in ("profile", "me", "user"):
+        candidate_sources.append((f"account.{attr_name}", _safe_get_identity_field(account, attr_name)))
+    candidate_sources.append(("account", account))
+
+    for method_name in ("get_me", "get_profile", "get_user"):
+        candidate_sources.append((f"account.{method_name}()", _safe_call_account_identity_method(account, method_name)))
+
+    for source_name, source_obj in candidate_sources:
+        pair = _extract_identity_pair_from_obj(source_obj, source_name)
+        if not pair:
+            continue
+        return pair["username"], pair["user_id"], pair["source"]
+
+    return "", "", "unavailable"
+
+
+def build_anonymous_install_id(funpay_username: str, funpay_id: str) -> str:
+    username = _normalize_funpay_username(funpay_username)
+    user_id = _normalize_funpay_id(funpay_id)
+
+    if not username or not user_id:
+        raise ValueError("FunPay username and FunPay ID are required for AutoSMM telemetry id")
+
+    raw = f"autosmm:v1:{username}:{user_id}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _looks_like_anonymous_install_id(value: Any) -> bool:
+    return bool(re.fullmatch(r"[0-9a-f]{16}", str(value or "").strip().lower()))
+
+
+def _get_anonymous_install_id(c: Optional[Cardinal] = None) -> str:
+    state = _load_autosmm_state()
+    cached_hash = str(state.get(TELEMETRY_IDENTITY_HASH_KEY) or "").strip().lower()
+    if cached_hash and not _looks_like_anonymous_install_id(cached_hash):
+        cached_hash = ""
+
+    username, user_id, source = _get_funpay_identity(c)
+    new_hash = build_anonymous_install_id(username, user_id)
+
+    if cached_hash:
+        if cached_hash == new_hash:
+            return cached_hash
+
+        state[TELEMETRY_IDENTITY_DEBUG_KEY] = {
+            "last_mismatch_at": _now_str(),
+            "cached_hash_prefix": cached_hash[:8],
+            "new_hash_prefix": new_hash[:8],
+            "source": source,
+        }
+        _save_autosmm_state(state)
+        logger.warning(
+            "TELEMETRY IDENTITY MISMATCH: cached hash differs from current FunPay identity hash; using cached hash"
+        )
+        return cached_hash
+
+    state[TELEMETRY_IDENTITY_HASH_KEY] = new_hash
+    state[TELEMETRY_IDENTITY_SOURCE_KEY] = source
+    _save_autosmm_state(state)
+    return new_hash
+
+
+def _mask_identity_value(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return "—"
+    return f"{raw[:2]}***"
+
+
+def _build_telemetry_identity_debug_text(c: Optional[Cardinal] = None) -> str:
+    state = _load_autosmm_state()
+    cached_hash = str(state.get(TELEMETRY_IDENTITY_HASH_KEY) or "").strip().lower()
+    try:
+        username, user_id, source = _get_funpay_identity(c)
+        current_hash = build_anonymous_install_id(username, user_id)
+        return "\n".join([
+            "Telemetry identity debug:",
+            f"source: {h(source or 'unavailable')}",
+            f"username: {h(_mask_identity_value(username))}",
+            f"user_id: {h(_mask_identity_value(user_id))}",
+            f"hash: {h(current_hash[:8])}***",
+            f"cached_hash: {h(cached_hash[:8] + '***' if cached_hash else '—')}",
+        ])
+    except Exception:
+        return "\n".join([
+            "Telemetry identity debug:",
+            "source: unavailable",
+            "username: —",
+            "user_id: —",
+            "hash: —",
+            f"cached_hash: {h(cached_hash[:8] + '***' if cached_hash else '—')}",
+        ])
+
+
+def _build_telemetry_payload(c: Optional[Cardinal] = None) -> Dict[str, str]:
+    return {
+        "plugin_name": NAME,
+        "version": VERSION,
+        "anonymous_install_id": _get_anonymous_install_id(c),
+    }
+
+
+def _send_telemetry_ping_background(c: Optional[Cardinal] = None) -> None:
+    try:
+        payload = _build_telemetry_payload(c or cardinal_instance)
+    except ValueError:
+        state = _load_autosmm_state()
+        state[TELEMETRY_LAST_PING_ERROR_KEY] = "cannot resolve FunPay username/id"
+        _save_autosmm_state(state)
+        logger.warning("TELEMETRY ID FAILED: cannot resolve FunPay username/id")
+        return
+
+    try:
+        requests.post(TELEMETRY_URL, json=payload, timeout=TELEMETRY_TIMEOUT_SECONDS)
+        state = _load_autosmm_state()
+        state[TELEMETRY_LAST_PING_OK_KEY] = _now_str()
+        state[TELEMETRY_LAST_PING_ERROR_KEY] = None
+        _save_autosmm_state(state)
+    except Exception as ex:
+        state = _load_autosmm_state()
+        state[TELEMETRY_LAST_PING_ERROR_KEY] = str(ex)[:300]
+        _save_autosmm_state(state)
+        logger.warning(f"TELEMETRY PING FAILED: {ex}")
+
+
+def _maybe_send_telemetry_ping(c: Optional[Cardinal] = None, force: bool = False) -> None:
+    state = _load_autosmm_state()
+    if not _telemetry_allows_ping():
+        return
+    if not force:
+        last_attempt = _parse_autosmm_dt(state.get(TELEMETRY_LAST_PING_ATTEMPT_KEY))
+        if last_attempt and (datetime.now() - last_attempt).total_seconds() < TELEMETRY_PING_INTERVAL_SECONDS:
+            return
+    state[TELEMETRY_LAST_PING_ATTEMPT_KEY] = _now_str()
+    _save_autosmm_state(state)
+    try:
+        threading.Thread(target=_send_telemetry_ping_background, args=(c or cardinal_instance,), daemon=True).start()
+    except Exception as ex:
+        state = _load_autosmm_state()
+        state[TELEMETRY_LAST_PING_ERROR_KEY] = str(ex)[:300]
+        _save_autosmm_state(state)
+        logger.warning(f"TELEMETRY THREAD FAILED: {ex}")
+
+
+def _build_telemetry_consent_text(c: Optional[Cardinal] = None) -> str:
+    try:
+        anonymous_install_id = _get_anonymous_install_id(c or cardinal_instance)
+    except ValueError:
+        anonymous_install_id = "будет сформирован после получения FunPay username и FunPay ID"
+
+    return f"""📊 <b>Телеметрия AutoSMM</b>
+
+<b>AutoSMM</b> — бесплатный плагин.
+
+Для работы <b>AutoSMM v{h(VERSION)}</b> требуется согласие на минимальную техническую статистику.
+
+<b>Как формируется ID:</b>
+<blockquote>• <i>AutoSMM локально берёт FunPay username;</i>
+• <i>AutoSMM локально берёт FunPay ID;</i>
+• <i>из них формируется короткий SHA-256 хеш;</i>
+• <i>сырые FunPay username и FunPay ID на сервер не отправляются.</i>
+</blockquote>
+
+<b>Отправляется:</b>
+<blockquote>• <i>название плагина;</i>
+• <i>версия плагина;</i>
+• <i>обезличенный технический ID;</i>
+• <i>факт запуска.</i>
+</blockquote>
+
+<b>Не отправляются:</b>
+<blockquote>• <i>FunPay username в открытом виде;</i>
+• <i>FunPay ID в открытом виде;</i>
+• <i>переписки;</i>
+• <i>ссылки покупателей;</i>
+• <i>заказы;</i>
+• <i>API-ключи;</i>
+• <i>cookies;</i>
+• <i>настройки лотов.</i>
+</blockquote>
+
+На сервер отправляется только короткий хеш.
+
+Пример обезличенного ID: <tg-spoiler>{h(anonymous_install_id)}</tg-spoiler>
+
+<b>Продолжить использование AutoSMM?</b>
+
+Если не хотите использовать телеметрию, можно остаться на <a href=\"{h(AUTOSMM_V008_NO_TELEMETRY_URL)}\">AutoSMM v0.0.8</a> без неё."""
+
+def _build_telemetry_consent_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("✅ Согласиться и продолжить", callback_data="autosmm_telemetry_accept"))
+    kb.add(InlineKeyboardButton("🛡 Насколько это безопасно?", url=TELEMETRY_SECURITY_URL))
+    kb.add(InlineKeyboardButton("⛔ Не использовать v0.0.9", callback_data="autosmm_telemetry_refuse"))
+    return kb
+
+
+def _build_telemetry_refuse_text() -> str:
+    if _telemetry_guest_used() and not _telemetry_guest_active():
+        return f"""⏳ <b>Гостевой режим AutoSMM завершён</b>
+
+Вы уже использовали 24 часа без телеметрии.
+
+Чтобы продолжить использовать <b>AutoSMM v{h(VERSION)}</b>, примите минимальную техническую статистику.
+
+Если не хотите использовать телеметрию, можно остаться на <a href=\"{h(AUTOSMM_V008_NO_TELEMETRY_URL)}\">AutoSMM v0.0.8</a> без неё."""
+    return f"""⛔ <b>Телеметрия не принята</b>
+
+AutoSMM v{h(VERSION)} использует минимальную техническую статистику для бесплатной версии.
+
+Вы можете один раз попробовать плагин <b>24 часа без телеметрии</b>, чтобы проверить работу перед решением.
+
+<blockquote>• телеметрия в гостевом режиме не отправляется;
+• через 24 часа AutoSMM снова попросит выбрать;
+• повторно включить гостевой режим нельзя.
+</blockquote>
+
+Выберите действие:"""
+
+
+def _build_telemetry_refuse_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=1)
+    if not _telemetry_guest_used():
+        kb.add(InlineKeyboardButton("🧪 Попробовать 24 часа без телеметрии", callback_data="autosmm_telemetry_guest_24h"))
+    kb.add(InlineKeyboardButton("✅ Согласиться и продолжить", callback_data="autosmm_telemetry_accept"))
+    kb.add(InlineKeyboardButton("🛡 Насколько это безопасно?", url=TELEMETRY_SECURITY_URL))
+    kb.add(InlineKeyboardButton("📦 AutoSMM v0.0.8 без телеметрии", url=AUTOSMM_V008_NO_TELEMETRY_URL))
+    return kb
+
+
+def _show_telemetry_gate(chat_id: int, message_id: Optional[int] = None):
+    consent = _get_telemetry_consent_state()
+    if consent is False:
+        text_value = _build_telemetry_refuse_text()
+        kb = _build_telemetry_refuse_keyboard()
+    else:
+        text_value = _build_telemetry_consent_text(cardinal_instance)
+        kb = _build_telemetry_consent_keyboard()
+    if message_id is None:
+        bot.send_message(chat_id, clean_tg_text(text_value), parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+    else:
+        bot.edit_message_text(clean_tg_text(text_value), chat_id, message_id, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+
+
+def _telemetry_gate_allows_menu() -> bool:
+    return _telemetry_consent_accepted() or _telemetry_guest_active()
+
+
+def telemetry_accept_callback(call: types.CallbackQuery):
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+    _set_telemetry_consent(True)
+    _open_main_settings_menu(call.message.chat.id, message_id=call.message.message_id)
+    _maybe_send_telemetry_ping(cardinal_instance, force=True)
+
+
+def telemetry_refuse_callback(call: types.CallbackQuery):
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+    _set_telemetry_consent(False)
+    bot.edit_message_text(
+        clean_tg_text(_build_telemetry_refuse_text()),
+        call.message.chat.id,
+        call.message.message_id,
+        parse_mode="HTML",
+        reply_markup=_build_telemetry_refuse_keyboard(),
+        disable_web_page_preview=True,
+    )
+
+
+def telemetry_guest_24h_callback(call: types.CallbackQuery):
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+    if _telemetry_consent_accepted():
+        _open_main_settings_menu(call.message.chat.id, message_id=call.message.message_id)
+        return
+    if not _activate_telemetry_guest_24h():
+        bot.edit_message_text(
+            clean_tg_text(_build_telemetry_refuse_text()),
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="HTML",
+            reply_markup=_build_telemetry_refuse_keyboard(),
+            disable_web_page_preview=True,
+        )
+        return
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("🚀 Открыть AutoSMM", callback_data="return_to_settings"))
+    text_value = """🧪 <b>Гостевой режим включён</b>
+
+AutoSMM v0.0.9 доступен на <b>24 часа без телеметрии</b>.
+
+Через 24 часа плагин снова попросит выбрать: принять телеметрию или остаться на AutoSMM v0.0.8."""
+    bot.edit_message_text(
+        clean_tg_text(text_value),
+        call.message.chat.id,
+        call.message.message_id,
+        parse_mode="HTML",
+        reply_markup=kb,
+        disable_web_page_preview=True,
+    )
+
+
+def _backup_default_for_file(file_name: str):
+    default_value = AUTOSMM_BACKUP_DEFAULTS.get(file_name, {})
+    if isinstance(default_value, (dict, list)):
+        return json.loads(json.dumps(default_value, ensure_ascii=False))
+    return default_value
+
+
+def _read_backup_file_payload(file_name: str, path: str):
+    if not os.path.exists(path):
+        return _backup_default_for_file(file_name)
+    return _safe_load_json(path, _backup_default_for_file(file_name))
+
+
+def _build_full_backup_payload(reason: str = "manual_export") -> Dict[str, Any]:
+    return {
+        "autosmm_backup_version": AUTOSMM_BACKUP_VERSION,
+        "plugin": {
+            "name": NAME,
+            "version": VERSION,
+            "created_at": _now_str(),
+            "reason": reason,
+        },
+        "files": {
+            file_name: _read_backup_file_payload(file_name, file_path)
+            for file_name, file_path in AUTOSMM_BACKUP_FILE_MAP.items()
+        },
+    }
+
+
+def _backup_filename(prefix: str = "autosmm_backup") -> str:
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    return f"{prefix}_{VERSION}_{stamp}.json"
+
+
+def _create_full_backup(reason: str = "manual_export") -> Optional[str]:
+    try:
+        os.makedirs(AUTOSMM_BACKUPS_DIR, exist_ok=True)
+        prefix = "autosmm_emergency_backup" if str(reason or "").startswith("before_") else "autosmm_backup"
+        backup_path = os.path.join(AUTOSMM_BACKUPS_DIR, _backup_filename(prefix))
+        payload = _build_full_backup_payload(reason=reason)
+        _safe_write_json(backup_path, payload)
+        return backup_path
+    except Exception as ex:
+        logger.error(f"Не удалось создать полный бэкап AutoSMM: {ex}")
+        return None
+
+
+def _clear_autosmm_memory_contexts():
+    try:
+        waiting_for_link.clear()
+        BUYER_ORDER_SELECTION.clear()
+        LOT_INPUT_STATES.clear()
+        LOT_CARD_CONTEXT.clear()
+        UI_INPUT_STATES.clear()
+        SEARCH_RESULT_CONTEXT.clear()
+        ANALYTICS_VIEW_MODES.clear()
+        waiting_for_lots_upload.clear()
+        waiting_for_backup_restore_upload.clear()
+    except Exception:
+        logger.exception("Не удалось полностью очистить in-memory состояния AutoSMM")
+
+
+def _validate_backup_wrapper(payload: Any) -> Tuple[bool, str]:
+    if not isinstance(payload, dict):
+        return False, "Файл не похож на полный бэкап AutoSMM."
+    if payload.get("autosmm_backup_version") != AUTOSMM_BACKUP_VERSION:
+        return False, "Неподдерживаемая версия бэкапа AutoSMM."
+    files = payload.get("files")
+    if not isinstance(files, dict):
+        return False, "В бэкапе нет раздела files."
+    unknown_files = sorted(set(files.keys()) - set(AUTOSMM_BACKUP_FILE_MAP.keys()))
+    if unknown_files:
+        return False, "Бэкап содержит неизвестные файлы. Восстановление отменено."
+    return True, "OK"
+
+
+def _restore_backup_wrapper(payload: Dict[str, Any]) -> Tuple[bool, str]:
+    ok, error = _validate_backup_wrapper(payload)
+    if not ok:
+        return False, error
+    emergency_backup = _create_full_backup(reason="before_restore")
+    if not emergency_backup:
+        return False, "Не удалось создать аварийный бэкап. Восстановление отменено."
+    files = payload.get("files") or {}
+    try:
+        for file_name, file_path in AUTOSMM_BACKUP_FILE_MAP.items():
+            value = files.get(file_name, _backup_default_for_file(file_name))
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            _safe_write_json(file_path, value)
+        _clear_autosmm_memory_contexts()
+        try:
+            cfg = load_config()
+            config.clear()
+            config.update(cfg)
+            lot_mapping.clear()
+            lot_mapping.update(cfg.get("lot_mapping", {}))
+        except Exception:
+            pass
+        return True, f"✅ Бэкап AutoSMM восстановлен.\n\nРекомендуется перезапустить Cardinal, чтобы все состояния точно перечитались."
+    except Exception as ex:
+        logger.error(f"Ошибка восстановления бэкапа AutoSMM: {ex}")
+        return False, f"❌ Не удалось восстановить бэкап: {ex}"
+
 # =========================================================
 # SETTINGS UI
 # =========================================================
 
 def add_website(message: types.Message, new_site: str):
+    normalized_site = _normalize_allowed_domain(new_site)
+    if not normalized_site or not _is_plausible_allowed_domain(normalized_site):
+        bot.send_message(message.chat.id, "❌ Не удалось определить корректный домен сайта.")
+        return
     valid_links = load_valid_links()
-    if new_site not in valid_links:
-        valid_links.append(new_site)
+    if normalized_site not in valid_links:
+        valid_links.append(normalized_site)
         save_valid_links(valid_links)
-        bot.send_message(message.chat.id, f"✅ Сайт {new_site} успешно добавлен в список.")
+        bot.send_message(message.chat.id, f"✅ Сайт {normalized_site} успешно добавлен в список.")
     else:
-        bot.send_message(message.chat.id, f"❌ Сайт {new_site} уже есть в списке.")
+        bot.send_message(message.chat.id, f"❌ Сайт {normalized_site} уже есть в списке.")
 
 
 def remove_website(message: types.Message, site_to_remove: str):
+    normalized_site = _normalize_allowed_domain(site_to_remove)
     valid_links = load_valid_links()
-    if site_to_remove in valid_links:
-        valid_links.remove(site_to_remove)
+    if normalized_site in valid_links:
+        valid_links.remove(normalized_site)
         save_valid_links(valid_links)
-        bot.send_message(message.chat.id, f"✅ Сайт {site_to_remove} успешно удалён из списка.")
+        bot.send_message(message.chat.id, f"✅ Сайт {normalized_site} успешно удалён из списка.")
     else:
-        bot.send_message(message.chat.id, f"❌ Сайт {site_to_remove} не найден в списке.")
+        bot.send_message(message.chat.id, f"❌ Сайт {normalized_site or site_to_remove} не найден в списке.")
 
 
 def _send_or_edit_text(chat_id: int, text_value: str, kb: InlineKeyboardMarkup, message_id: Optional[int] = None):
+    text_value = clean_tg_text(text_value)
     if message_id is None:
         bot.send_message(chat_id, text_value, parse_mode="HTML", reply_markup=kb)
         return
@@ -4334,7 +6979,7 @@ def build_old_files_warning_text_and_kb() -> Tuple[str, InlineKeyboardMarkup]:
 Рекомендуется удалить их перед использованием текущей версии.
 
 Если хотите вернуться к этому позже, очистка будет доступна в разделе:
-📁 Бэкап / файлы
+📁 Файлы и бэкап
     """.strip()
 
     kb = InlineKeyboardMarkup(row_width=1)
@@ -4347,21 +6992,19 @@ def build_old_files_warning_text_and_kb() -> Tuple[str, InlineKeyboardMarkup]:
 
 def build_old_files_confirm_text_and_kb() -> Tuple[str, InlineKeyboardMarkup]:
     txt_ = """
-⚠️ <b>Подтверждение удаления</b>
+⚠️ <b>Очистка старых файлов AutoSMM</b>
 
-Будут удалены только старые файлы AutoSMM.
-Текущая версия плагина затронута не будет.
+Будут удалены только старые файлы плагина AutoSMM из папки plugins.
 
-После удаления останется только активная версия AutoSMM.
+Текущая сборка затронута не будет.
     """.strip()
 
     kb = InlineKeyboardMarkup(row_width=1)
     kb.add(
-        InlineKeyboardButton("✅ Подтвердить удаление", callback_data="cleanup_old_files_confirm"),
-        InlineKeyboardButton("◀️ Отмена", callback_data="cleanup_old_files_cancel"),
+        InlineKeyboardButton("✅ Удалить старые файлы", callback_data="cleanup_old_files_confirm"),
+        InlineKeyboardButton("◀️ Назад", callback_data="autosmm_cleanup_menu"),
     )
     return txt_, kb
-
 
 def build_old_files_removed_text_and_kb() -> Tuple[str, InlineKeyboardMarkup]:
     txt_ = """
@@ -4372,7 +7015,7 @@ def build_old_files_removed_text_and_kb() -> Tuple[str, InlineKeyboardMarkup]:
     """.strip()
 
     kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(InlineKeyboardButton("◀️ В настройки", callback_data="return_to_settings"))
+    kb.add(InlineKeyboardButton("◀️ Назад", callback_data="autosmm_cleanup_menu"))
     return txt_, kb
 
 
@@ -4465,12 +7108,11 @@ def _get_total_panel_balance_text(cfg: Dict) -> str:
 
 
 def build_main_menu_text_and_kb(cfg: Dict) -> Tuple[str, InlineKeyboardMarkup]:
-    """Собирает текст и клавиатуру главного меню настроек AutoSMM."""
-    lmap = cfg.get("lot_mapping", {})
-    auto_refunds = cfg.get("auto_refunds", True)
-    confirm_link = cfg.get("confirm_link", True)
-    auto_start = cfg.get("auto_start", False)
-    status_text = "АКТИВИРОВАН ✅" if RUNNING else "ОСТАНОВЛЕН ❌"
+    """Собирает главное меню AutoSMM."""
+    lmap = cfg.get("lot_mapping", {}) or {}
+    auto_refunds_icon = "✅" if cfg.get("auto_refunds", False) else "❌"
+    confirm_link_icon = "✅" if cfg.get("confirm_link", True) else "❌"
+    fallback_icon = "✅" if cfg.get("fallback_enabled", False) else "❌"
 
     stats = analytics.get_statistics()
     day_profit = stats.get("day_chistota", 0) if stats else 0
@@ -4481,141 +7123,204 @@ def build_main_menu_text_and_kb(cfg: Dict) -> Tuple[str, InlineKeyboardMarkup]:
 
     total_balance_text = _get_total_panel_balance_text(cfg)
 
-    txt_ = f"""🚀 <b>AUTOSMM v{VERSION}</b>
-
-━━━━━━━━━━━━━━━━━━━━━
-
-📊 <b>Статус:</b> {status_text}
-📦 <b>Лоты:</b> {len(lmap)}
-
-<b>Автозапуск:</b> {'✅' if auto_start else '❌'}
-<b>Автовозвраты:</b> {'✅' if auto_refunds else '❌'}
-<b>Подтверждение ссылки:</b> {'✅' if confirm_link else '❌'}
-
-💰 <b>Профит за 24ч:</b> {day_profit_fmt} ₽
-💳 <b>Баланс панелей:</b> {total_balance_text}
-
-━━━━━━━━━━━━━━━━━━━━━
-""".strip()
+    lines = [
+        f"🚀 <b>AutoSMM v{h(VERSION)}</b>",
+        "",
+        "━━━━━━━━━━━━━━━━━━━━━",
+        "",
+        f"📦 <b>Лоты:</b> <code>{h(len(lmap))}</code>",
+        "",
+        f"<b>Автовозвраты:</b> {auto_refunds_icon}",
+        f"<b>Подтверждение ссылки:</b> {confirm_link_icon}",
+        f"<b>Резервная панель:</b> {fallback_icon}",
+        "",
+        f"💰 <b>Профит за 24ч:</b> <code>{h(day_profit_fmt)} ₽</code>",
+        f"💳 <b>Баланс панелей:</b> <code>{h(total_balance_text)}</code>",
+        "",
+        "━━━━━━━━━━━━━━━━━━━━━",
+    ]
+    txt_ = clean_tg_text("\n".join(lines))
 
     kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
+    kb.row(
         InlineKeyboardButton("🛍️ Каталог лотов", callback_data="lot_settings"),
-        InlineKeyboardButton("➕ Создать новый лот", callback_data="add_new_lot")
+        InlineKeyboardButton("➕ Создать новый лот", callback_data="add_new_lot"),
     )
     kb.add(InlineKeyboardButton("🔌 Интеграция API", callback_data="api_settings"))
     kb.add(InlineKeyboardButton("📊 Аналитика", callback_data="show_orders"))
-    kb.add(
+    kb.row(
         InlineKeyboardButton("📁 Бэкап / файлы", callback_data="files_menu"),
-        InlineKeyboardButton("⚙️ Настройки", callback_data="misc_settings")
+        InlineKeyboardButton("⚙️ Настройки", callback_data="misc_settings"),
     )
     kb.add(InlineKeyboardButton("📚 Полезные ресурсы", callback_data="links_menu"))
-
     return txt_, kb
 
-
 def auto_smm_settings(message: types.Message):
+    if not _telemetry_gate_allows_menu():
+        _show_telemetry_gate(message.chat.id)
+        return
     if _should_show_old_files_warning(ignore_cooldown=False):
         open_old_files_warning_screen(message.chat.id, ignore_cooldown=False)
         return
     _open_main_settings_menu(message.chat.id)
+    _maybe_send_telemetry_ping(cardinal_instance, force=False)
 
 
 def auto_smm_delete(message: types.Message):
-    """Удаляет файлы кеша AutoSMM (конфиг/заказы/валидные ссылки) и останавливает работу."""
+    """Полная очистка данных AutoSMM после аварийного бэкапа."""
     global RUNNING
     try:
         RUNNING = False
     except Exception:
         pass
 
-    deleted = []
-    missing = []
+    backup_path = _create_full_backup(reason="before_delete")
+    if not backup_path:
+        bot.send_message(message.chat.id, "❌ Не удалось создать аварийный бэкап. Очистка отменена.")
+        return
 
-    for p in [CONFIG_PATH, ORDERS_PATH, ORDERS_DATA_PATH, VALID_LINKS_PATH]:
+    try:
+        with open(backup_path, "rb") as backup_file:
+            bot.send_document(message.chat.id, backup_file, caption="Аварийный бэкап AutoSMM перед очисткой")
+    except Exception as ex:
+        logger.warning(f"Не удалось отправить аварийный бэкап пользователю: {ex}")
+
+    deleted = []
+    for p in [CONFIG_PATH, ORDERS_PATH, ORDERS_DATA_PATH, ORDERS_RUNTIME_PATH, VALID_LINKS_PATH, AUTOSMM_STATE_PATH]:
         try:
             if os.path.exists(p):
                 os.remove(p)
-                deleted.append(p)
-            else:
-                missing.append(p)
+                deleted.append(os.path.basename(p))
         except Exception as e:
             logger.error(f"Не удалось удалить файл {p}: {e}")
 
-    txt = "🧹 AutoSMM: очистка выполнена.\n\n"
-    if deleted:
-        txt += "Удалено:\n" + "\n".join(f"• {x}" for x in deleted) + "\n\n"
-    if missing:
-        txt += "Не найдено:\n" + "\n".join(f"• {x}" for x in missing)
-
+    _clear_autosmm_memory_contexts()
+    filename = os.path.basename(backup_path)
+    txt = f"✅ Данные AutoSMM очищены.\n\nПеред очисткой создан аварийный бэкап:\n{filename}\n\nРекомендуется перезапустить Cardinal."
     bot.send_message(message.chat.id, txt)
 
 
 def files_menu(call: types.CallbackQuery):
     waiting_for_lots_upload.discard(call.from_user.id)
+    waiting_for_backup_restore_upload.discard(call.from_user.id)
     _clear_step_handler(call.message.chat.id)
     _clear_navigation_states(call.message.chat.id)
 
     txt_ = """
-<b>📁 Бэкап / файлы</b>
+<b>📁 Бэкап / файлы AutoSMM</b>
 
-Здесь находятся экспорт, загрузка JSON, логи и опасные действия с подтверждением.
+Здесь можно сохранить данные, загрузить бэкап, выгрузить логи или очистить данные AutoSMM.
     """.strip()
 
-    kb_ = InlineKeyboardMarkup(row_width=2)
-    kb_.row(
-        InlineKeyboardButton("📤 Экспорт файлов", callback_data="export_files"),
-        InlineKeyboardButton("🗑 Удалить лоты", callback_data="delete_all_lots")
-    )
-    kb_.row(
-        InlineKeyboardButton("📥 Загрузка JSON", callback_data="upload_lots_json"),
-        InlineKeyboardButton("🗑 Удалить заказы", callback_data="delete_orders")
-    )
-    kb_.add(InlineKeyboardButton("📝 Логи ошибок", callback_data="export_errors"))
-    kb_.add(InlineKeyboardButton("🧹 Очистка старых файлов AutoSMM", callback_data="cleanup_old_files_manual"))
+    kb_ = InlineKeyboardMarkup(row_width=1)
+    kb_.add(InlineKeyboardButton("📤 Экспорт бэкапа", callback_data="full_backup_prompt"))
+    kb_.add(InlineKeyboardButton("📥 Загрузка бэкапа", callback_data="restore_backup_prompt"))
+    kb_.add(InlineKeyboardButton("📝 Логи", callback_data="export_errors"))
+    kb_.add(InlineKeyboardButton("🧹 Очистка AutoSMM", callback_data="autosmm_cleanup_menu"))
     kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="return_to_settings"))
 
     bot.edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb_)
-
 
 def misc_settings(call: types.CallbackQuery):
     _clear_step_handler(call.message.chat.id)
     _clear_navigation_states(call.message.chat.id)
 
     cfg = load_config()
-    auto_refunds = cfg.get("auto_refunds", True)
-    confirm_link = cfg.get("confirm_link", True)
-    send_auto_lots = cfg.get("send_auto_lots", False)
-    send_auto_lots_interval = cfg.get("send_auto_lots_interval", 30)
-    auto_start = cfg.get("auto_start", False)
-    fallback_enabled = cfg.get("fallback_enabled", False)
-    notif_chat_id = cfg.get("notification_chat_id")
+    fallback_enabled = bool(cfg.get("fallback_enabled", False))
 
-    txt_ = f"""
-<b>⚙️ Настройки</b>
+    txt_ = """
+⚙️ <b>Настройки AutoSMM</b>
 
-• Автовозвраты: <code>{'Включены ✅' if auto_refunds else 'Выключены ❌'}</code>
-• Подтверждение ссылки: <code>{'Включено ✅' if confirm_link else 'Выключено ❌'}</code>
-• Отправка файла auto_lots.json: <code>{'Включена ✅' if send_auto_lots else 'Выключена ❌'}</code>
-• Интервал отправки: <code>{send_auto_lots_interval} мин.</code>
-• Автозапуск: <code>{'Включен ✅' if auto_start else 'Выключен ❌'}</code>
-• Fallback: <code>{'Включен ✅' if fallback_enabled else 'Выключен ❌'}</code>
-• Chat ID: <code>{notif_chat_id if notif_chat_id else 'не задан'}</code>
+Выберите раздел настроек:
     """.strip()
 
     kb_ = InlineKeyboardMarkup(row_width=1)
-    kb_.add(InlineKeyboardButton(f"🔄 {'Выключить' if auto_refunds else 'Включить'} автовозвраты", callback_data="toggle_auto_refunds"))
-    kb_.add(InlineKeyboardButton(f"✅ {'Выключить' if confirm_link else 'Включить'} подтверждение ссылки", callback_data="toggle_confirm_link"))
-    kb_.add(InlineKeyboardButton(f"📤 {'Выключить' if send_auto_lots else 'Включить'} отправку файла auto_lots.json", callback_data="toggle_send_auto_lots"))
-    kb_.add(InlineKeyboardButton("⏱️ Интервал отправки", callback_data="change_send_interval"))
-    kb_.add(InlineKeyboardButton(f"🚀 {'Выключить' if auto_start else 'Включить'} автозапуск плагина", callback_data="toggle_auto_start"))
-    kb_.add(InlineKeyboardButton(f"🔁 {'Выключить' if fallback_enabled else 'Включить'} Fallback", callback_data="toggle_fallback"))
-    kb_.add(InlineKeyboardButton("🌐 Доверенные сайты", callback_data="manage_websites"))
-    kb_.add(InlineKeyboardButton("💬 Шаблоны сообщений", callback_data="edit_messages"))
-    kb_.add(InlineKeyboardButton("📩 Указать Chat ID", callback_data="set_notification_chat_id"))
+    kb_.add(InlineKeyboardButton("👤 Покупательский сценарий", callback_data="buyer_flow_settings"))
+    kb_.add(InlineKeyboardButton("💬 Тексты сообщений", callback_data="edit_messages"))
+    kb_.add(InlineKeyboardButton("🔔 Уведомления продавцу", callback_data="seller_notifications_settings"))
+    kb_.add(InlineKeyboardButton("🌐 Разрешённые сайты", callback_data="manage_websites"))
+    kb_.add(InlineKeyboardButton(f"🔁 Резервная панель: {'✅' if fallback_enabled else '❌'}", callback_data="toggle_fallback"))
     kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="return_to_settings"))
-
     bot.edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb_)
+
+
+def buyer_flow_settings(call: types.CallbackQuery):
+    _clear_step_handler(call.message.chat.id)
+    _clear_navigation_states(call.message.chat.id)
+    cfg = load_config()
+    confirm_link = bool(cfg.get("confirm_link", True))
+    auto_refunds = bool(cfg.get("auto_refunds", False))
+    allow_cancel = bool(cfg.get("allow_buyer_cancel_before_panel_order", False))
+    txt_ = f"""
+👤 <b>Покупательский сценарий</b>
+
+Подтверждение ссылки: {'✅' if confirm_link else '❌'}
+Автовозвраты: {'✅' if auto_refunds else '❌'}
+Отмена до запуска: {'✅' if allow_cancel else '❌'}
+
+Здесь настраивается поведение покупателя после оплаты.
+    """.strip()
+    kb_ = InlineKeyboardMarkup(row_width=1)
+    kb_.add(InlineKeyboardButton(f"✅ Подтверждение ссылки: {'✅' if confirm_link else '❌'}", callback_data="toggle_confirm_link"))
+    kb_.add(InlineKeyboardButton(f"↩️ Автовозвраты: {'✅' if auto_refunds else '❌'}", callback_data="toggle_auto_refunds"))
+    kb_.add(InlineKeyboardButton(f"⚠️ Отмена до запуска: {'✅' if allow_cancel else '❌'}", callback_data="toggle_buyer_cancel_before_panel"))
+    kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="misc_settings"))
+    bot.edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb_)
+
+def seller_notifications_settings(call: types.CallbackQuery):
+    _clear_step_handler(call.message.chat.id)
+    _clear_navigation_states(call.message.chat.id)
+    cfg = load_config()
+    notif_chat_id = cfg.get("notification_chat_id")
+    txt_ = f"""
+<b>🔔 Уведомления продавцу</b>
+
+Чат уведомлений: {'задан' if notif_chat_id else 'не задан'}
+
+AutoSMM может отправлять продавцу уведомления о новых заказах, ошибках панели и ручной проверке.
+    """.strip()
+    kb_ = InlineKeyboardMarkup(row_width=1)
+    kb_.add(InlineKeyboardButton("📌 Использовать этот чат", callback_data="use_current_chat_for_notifications"))
+    kb_.add(InlineKeyboardButton("📩 Указать другой чат", callback_data="set_notification_chat_id"))
+    kb_.add(InlineKeyboardButton("🧪 Отправить тестовое уведомление", callback_data="send_test_notification"))
+    kb_.add(InlineKeyboardButton("🔕 Отключить уведомления", callback_data="disable_notifications"))
+    kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="misc_settings"))
+    bot.edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb_)
+
+
+def use_current_chat_for_notifications(call: types.CallbackQuery):
+    cfg = load_config()
+    cfg["notification_chat_id"] = call.message.chat.id
+    save_config(cfg)
+    try:
+        bot.answer_callback_query(call.id, "Чат уведомлений установлен")
+    except Exception:
+        pass
+    seller_notifications_settings(call)
+
+
+def send_test_notification(call: types.CallbackQuery):
+    cfg = load_config()
+    notification_chat_id = cfg.get("notification_chat_id")
+    if not notification_chat_id:
+        bot.answer_callback_query(call.id, "Чат уведомлений не задан")
+        seller_notifications_settings(call)
+        return
+    try:
+        bot.send_message(notification_chat_id, "🧪 Тестовое уведомление AutoSMM")
+        bot.answer_callback_query(call.id, "Отправлено")
+    except Exception as ex:
+        bot.answer_callback_query(call.id, "Не удалось отправить")
+        logger.warning(f"Не удалось отправить тестовое уведомление AutoSMM: {ex}")
+    seller_notifications_settings(call)
+
+
+def disable_notifications(call: types.CallbackQuery):
+    cfg = load_config()
+    cfg["notification_chat_id"] = None
+    save_config(cfg)
+    bot.answer_callback_query(call.id, "Отключено")
+    seller_notifications_settings(call)
 
 
 def toggle_fallback(call: types.CallbackQuery):
@@ -4633,27 +7338,71 @@ def toggle_fallback(call: types.CallbackQuery):
 
     misc_settings(call)
 
+def toggle_buyer_cancel_before_panel(call: types.CallbackQuery):
+    cfg = load_config()
+    current = bool(cfg.get("allow_buyer_cancel_before_panel_order", False))
+    if current:
+        cfg["allow_buyer_cancel_before_panel_order"] = False
+        save_config(cfg)
+        try:
+            config["allow_buyer_cancel_before_panel_order"] = False
+        except Exception:
+            pass
+        bot.answer_callback_query(call.id, "Отключено")
+        buyer_flow_settings(call)
+        return
+
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+    kb_ = InlineKeyboardMarkup(row_width=1)
+    kb_.add(InlineKeyboardButton("✅ Включить", callback_data="enable_buyer_cancel_before_panel"))
+    kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="buyer_flow_settings"))
+    txt_ = """⚠️ <b>Опасная настройка</b>
+
+Если включить эту опцию, покупатель сможет отменить заказ командой !отмена, пока выполнение ещё не запущено.
+
+После запуска выполнения автоматическая отмена будет недоступна.
+
+Включайте только если готовы к автоматическим отменам."""
+    bot.edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb_)
+
+
+def enable_buyer_cancel_before_panel(call: types.CallbackQuery):
+    cfg = load_config()
+    cfg["allow_buyer_cancel_before_panel_order"] = True
+    save_config(cfg)
+    try:
+        config["allow_buyer_cancel_before_panel_order"] = True
+    except Exception:
+        pass
+    bot.answer_callback_query(call.id, "Включено")
+    buyer_flow_settings(call)
+
 
 def links_menu(call: types.CallbackQuery):
     _clear_step_handler(call.message.chat.id)
     _clear_navigation_states(call.message.chat.id)
 
     txt_ = """
-<b>🔗 Полезные ссылки</b>
+📚 <b>Полезные ресурсы</b>
 
-Нужна помощь или есть идеи по улучшению? Пиши в поддержку.
+Полезные ссылки по AutoSMM и SMM-панелям.
     """.strip()
 
     kb_ = InlineKeyboardMarkup(row_width=2)
     kb_.row(
         InlineKeyboardButton("🛠 Поддержка", url="https://t.me/w1bbex"),
-        InlineKeyboardButton("🌐 Smmway", url="https://smmway.ru/ref3967025")
+        InlineKeyboardButton("📢 Канал плагинов", url="https://t.me/w1bbexplugins"),
     )
+    kb_.row(
+        InlineKeyboardButton("🌐 SmmWay", url="https://smmway.ru/ref3967025"),
+        InlineKeyboardButton("🌐 KuzyaBoost", url="https://kuzya-boost.ru/ref4251277"),
+    )
+    kb_.add(InlineKeyboardButton("❓ FAQ", url="https://teletype.in/@w1bbex/FAQ-AutoSMM"))
     kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="return_to_settings"))
-
-    bot.edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode=None, reply_markup=kb_)
-
-
+    bot.edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb_)
 
 def _sort_service_items(services: Dict) -> List[Tuple[str, Dict]]:
     def _service_sort_key(item: Tuple[str, Dict]) -> Tuple[int, str]:
@@ -4893,7 +7642,7 @@ def render_api_menu(cfg: Dict) -> Tuple[str, InlineKeyboardMarkup]:
     if service_rows:
         for idx, (_, _, payload, display_name) in enumerate(service_rows):
             lines.append(f"📡 {display_name}")
-            lines.append(f"Статус API: {payload.get('status_emoji', '❌')}")
+            lines.append(f"Состояние подключения: {payload.get('status_emoji', '❌')}")
             if idx != len(service_rows) - 1:
                 lines.append("")
     else:
@@ -4931,7 +7680,7 @@ def render_api_service_card(cfg: Dict, service_idx: int) -> Tuple[str, InlineKey
         f"📡 {display_name}",
         "",
         f"Ключ: {mask_api_key(service_cfg.get('api_key'))}",
-        f"Статус API: {balance_payload.get('status_emoji', '❌')}",
+        f"Состояние подключения: {balance_payload.get('status_emoji', '❌')}",
         f"Баланс: {balance_payload.get('balance_text', 'недоступно')}",
     ]
 
@@ -5112,7 +7861,7 @@ def change_fallback_snum_prompt(call: types.CallbackQuery):
         call,
         lot_key,
         "change_fallback_snum",
-        f"Введите номер fallback сервиса (S#) для {lot_key}:",
+        f"Введите номер резервной панели для {lot_key}:",
         process_fallback_snum_change,
     )
 
@@ -5124,7 +7873,7 @@ def change_fallback_id_prompt(call: types.CallbackQuery):
         call,
         lot_key,
         "change_fallback_id",
-        f"Введите fallback ID услуги для {lot_key}:",
+        f"Введите ID резервной услуги для {lot_key}:",
         process_fallback_id_change,
     )
 
@@ -5133,16 +7882,57 @@ def manage_websites(call: types.CallbackQuery):
     _clear_step_handler(call.message.chat.id)
     _clear_navigation_states(call.message.chat.id)
 
-    valid_links = load_valid_links()
+    txt_ = """
+🌐 <b>Разрешённые сайты</b>
+
+Здесь настраиваются сайты, ссылки с которых покупатели могут отправлять после оплаты.
+    """.strip()
     kb_ = InlineKeyboardMarkup(row_width=1)
-    for site in valid_links:
-        kb_.add(InlineKeyboardButton(f"🗑 {site}", callback_data=f"delete_website_{site}"))
+    kb_.add(InlineKeyboardButton("📋 Показать список", callback_data="show_allowed_websites_list"))
+    kb_.add(InlineKeyboardButton("➕ Добавить сайт", callback_data="add_website"))
+    kb_.add(InlineKeyboardButton("🗑 Удалить сайт", callback_data="show_allowed_websites_list"))
+    kb_.add(InlineKeyboardButton("🔄 Сбросить список", callback_data="reset_valid_links_prompt"))
+    kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="misc_settings"))
+    bot.edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb_)
+
+def reset_valid_links_prompt(call: types.CallbackQuery):
+    kb_ = InlineKeyboardMarkup(row_width=1)
+    kb_.add(InlineKeyboardButton("✅ Сбросить", callback_data="reset_valid_links_confirm"))
+    kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="manage_websites"))
+    txt_ = """Список разрешённых сайтов будет заменён на стандартный набор AutoSMM.
+Ваши добавленные вручную домены будут удалены.
+
+Продолжить?"""
+    bot.edit_message_text(txt_, call.message.chat.id, call.message.message_id, reply_markup=kb_)
+
+
+def reset_valid_links_confirm(call: types.CallbackQuery):
+    reset_valid_links_to_defaults()
+    try:
+        bot.answer_callback_query(call.id, "Список сброшен")
+    except Exception:
+        pass
+    manage_websites(call)
+
+
+def show_allowed_websites_list(call: types.CallbackQuery):
+    _clear_step_handler(call.message.chat.id)
+    _clear_navigation_states(call.message.chat.id)
+
+    valid_links = load_valid_links()
+    kb_ = InlineKeyboardMarkup(row_width=2)
+    if valid_links:
+        buttons = [InlineKeyboardButton(f"🗑 {site}", callback_data=f"delete_website_{site}") for site in valid_links]
+        for idx in range(0, len(buttons), 2):
+            kb_.row(*buttons[idx:idx + 2])
+        text_ = "🌐 <b>Разрешённые сайты</b>\n\nНажмите на сайт, чтобы удалить его из списка."
+    else:
+        text_ = "🌐 <b>Разрешённые сайты</b>\n\nСписок разрешённых сайтов пуст."
 
     kb_.add(InlineKeyboardButton("➕ Добавить сайт", callback_data="add_website"))
-    kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="misc_settings"))
-
-    bot.edit_message_text("Список разрешённых сайтов:", call.message.chat.id, call.message.message_id, reply_markup=kb_)
-
+    kb_.add(InlineKeyboardButton("🔄 Сбросить список", callback_data="reset_valid_links_prompt"))
+    kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="manage_websites"))
+    bot.edit_message_text(text_, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb_)
 
 def add_website_prompt(call: types.CallbackQuery):
     _start_ui_input_flow(
@@ -5166,12 +7956,49 @@ def process_add_website(message: types.Message):
 
 
 def remove_website_prompt(call: types.CallbackQuery):
-    site_to_remove = call.data.split("_", 2)[2]
+    site_to_remove = _normalize_allowed_domain(call.data.split("_", 2)[2])
+    if not site_to_remove:
+        show_allowed_websites_list(call)
+        return
+    if _is_delete_confirm_grace_active(call.message.chat.id):
+        _delete_allowed_website_and_refresh(call, site_to_remove)
+        return
+    kb_ = InlineKeyboardMarkup(row_width=1)
+    kb_.add(InlineKeyboardButton("✅ Удалить", callback_data=f"confirm_delete_website_{site_to_remove}"))
+    kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="show_allowed_websites_list"))
+    txt_ = f"""⚠️ <b>Удалить сайт из разрешённых?</b>
+
+Сайт:
+{html.escape(site_to_remove)}
+
+Покупатели больше не смогут отправлять ссылки с этого домена.
+
+После подтверждения следующие удаления в течение 30 секунд будут выполняться без повторного подтверждения."""
+    bot.edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb_)
+
+
+def _delete_allowed_website_and_refresh(call: types.CallbackQuery, domain: str):
+    domain = _normalize_allowed_domain(domain)
     valid_links = load_valid_links()
-    if site_to_remove in valid_links:
-        valid_links.remove(site_to_remove)
+    if domain in valid_links:
+        valid_links.remove(domain)
         save_valid_links(valid_links)
-    manage_websites(call)
+        try:
+            bot.answer_callback_query(call.id, "Удалено")
+        except Exception:
+            pass
+    else:
+        try:
+            bot.answer_callback_query(call.id, "Сайт уже отсутствует")
+        except Exception:
+            pass
+    show_allowed_websites_list(call)
+
+
+def confirm_delete_website_callback(call: types.CallbackQuery):
+    domain = call.data.split("confirm_delete_website_", 1)[1]
+    _set_delete_confirm_grace(call.message.chat.id, 30)
+    _delete_allowed_website_and_refresh(call, domain)
 
 
 def delete_all_lots_prompt(call: types.CallbackQuery):
@@ -5195,7 +8022,7 @@ def confirm_delete_all_lots(call: types.CallbackQuery):
     _set_lot_page_context(call.message.chat.id, 0)
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("◀️ Назад", callback_data="files_menu"))
-    bot.edit_message_text("✅ Все лоты успешно удалены.", call.message.chat.id, call.message.message_id, reply_markup=kb)
+    bot.edit_message_text("✅ Все лоты успешно удалены. Настройки сохранены.", call.message.chat.id, call.message.message_id, reply_markup=kb)
 
 
 def upload_lots_json(call: types.CallbackQuery):
@@ -5207,26 +8034,102 @@ def upload_lots_json(call: types.CallbackQuery):
     bot.edit_message_text("Пришлите файл JSON (можно любым названием).", call.message.chat.id, call.message.message_id, reply_markup=kb)
 
 
-def export_files(call: types.CallbackQuery):
-    chat_id_ = call.message.chat.id
-    files_to_send = [CONFIG_PATH, ORDERS_PATH, ORDERS_DATA_PATH]
-    errors = []
-    for f_ in files_to_send:
-        if os.path.exists(f_):
-            try:
-                with open(f_, 'rb') as ff:
-                    bot.send_document(chat_id_, ff, caption=f"Файл: {os.path.basename(f_)}")
-            except Exception as e:
-                errors.append(f"Ошибка отправки {os.path.basename(f_)}: {e}")
-        else:
-            errors.append(f"Файл не найден: {os.path.basename(f_)}")
+def full_backup_prompt(call: types.CallbackQuery):
+    kb_ = InlineKeyboardMarkup(row_width=1)
+    kb_.add(InlineKeyboardButton("📤 Создать бэкап", callback_data="full_backup_confirm"))
+    kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="files_menu"))
+    txt_ = """
+⚠️ <b>Экспорт бэкапа AutoSMM</b>
+
+Бэкап содержит настройки AutoSMM, лоты, заказы, разрешённые сайты и техническое состояние плагина.
+
+Также внутри могут быть API-ключи панелей.
+
+Не отправляйте этот файл посторонним.
+    """.strip()
+    bot.edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb_)
+
+def full_backup_confirm(call: types.CallbackQuery):
     try:
-        bot.answer_callback_query(call.id, "Файлы отправлены." if not errors else "Часть файлов не отправлена.")
+        bot.answer_callback_query(call.id)
     except Exception:
         pass
-    if errors:
-        bot.send_message(chat_id_, "\n".join(errors))
+    backup_path = _create_full_backup(reason="manual_export")
+    if not backup_path:
+        bot.send_message(call.message.chat.id, "❌ Не удалось создать бэкап AutoSMM.")
+        files_menu(call)
+        return
+    try:
+        with open(backup_path, "rb") as backup_file:
+            bot.send_document(call.message.chat.id, backup_file, caption="📤 Бэкап AutoSMM")
+    except Exception as ex:
+        bot.send_message(call.message.chat.id, f"❌ Не удалось отправить бэкап: {ex}")
     files_menu(call)
+
+
+# Backward-compatible callback name. It now opens full backup warning instead of partial export.
+def export_files(call: types.CallbackQuery):
+    full_backup_prompt(call)
+
+
+def restore_backup_prompt(call: types.CallbackQuery):
+    waiting_for_backup_restore_upload.add(call.from_user.id)
+    waiting_for_lots_upload.discard(call.from_user.id)
+    kb_ = InlineKeyboardMarkup(row_width=1)
+    kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="files_menu"))
+    txt_ = """
+📥 <b>Загрузка бэкапа AutoSMM</b>
+
+Отправьте JSON-файл бэкапа AutoSMM.
+
+Перед загрузкой AutoSMM создаст аварийный бэкап текущих данных.
+    """.strip()
+    bot.edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb_)
+
+def autosmm_cleanup_menu(call: types.CallbackQuery):
+    _clear_step_handler(call.message.chat.id)
+    _clear_navigation_states(call.message.chat.id)
+    txt_ = """
+🧹 <b>Очистка AutoSMM</b>
+
+Выберите, что нужно очистить.
+
+Перед очисткой данных AutoSMM будет создан аварийный бэкап.
+    """.strip()
+    kb_ = InlineKeyboardMarkup(row_width=1)
+    kb_.add(InlineKeyboardButton("🧹 Очистить данные AutoSMM", callback_data="full_autosmm_delete_prompt"))
+    kb_.add(InlineKeyboardButton("🗑 Очистить старые файлы", callback_data="cleanup_old_files_manual"))
+    kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="files_menu"))
+    bot.edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb_)
+
+def full_autosmm_delete_prompt(call: types.CallbackQuery):
+    kb_ = InlineKeyboardMarkup(row_width=1)
+    kb_.add(InlineKeyboardButton("✅ Да, очистить", callback_data="full_autosmm_delete_confirm"))
+    kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="autosmm_cleanup_menu"))
+    txt_ = """
+⚠️ <b>Очистить данные AutoSMM?</b>
+
+Будут удалены:
+• настройки лотов;
+• история заказов;
+• состояние заказов;
+• разрешённые сайты;
+• состояние плагина.
+
+Перед удалением AutoSMM создаст аварийный бэкап.
+
+Старые файлы старых версий не будут удалены.
+    """.strip()
+    bot.edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb_)
+
+def full_autosmm_delete_confirm(call: types.CallbackQuery):
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+    class _Msg:
+        chat = call.message.chat
+    auto_smm_delete(_Msg())
 
 
 def export_errors(call: types.CallbackQuery):
@@ -5234,7 +8137,7 @@ def export_errors(call: types.CallbackQuery):
     if os.path.exists(LOG_PATH):
         try:
             with open(LOG_PATH, 'rb') as f:
-                bot.send_document(chat_id_, f, caption="Лог ошибок")
+                bot.send_document(chat_id_, f, caption="📝 Логи AutoSMM")
             try:
                 bot.answer_callback_query(call.id, "Логи выгружены.")
             except Exception:
@@ -5242,7 +8145,7 @@ def export_errors(call: types.CallbackQuery):
         except Exception as e:
             bot.send_message(chat_id_, f"❌ Ошибка отправки лог-файла: {e}")
     else:
-        bot.send_message(chat_id_, "Лог-файл не найден.")
+        bot.send_message(chat_id_, "Логи ошибок пока не найдены.")
     files_menu(call)
 
 
@@ -5294,12 +8197,42 @@ def delete_orders_yes(call: types.CallbackQuery):
 
 def toggle_auto_refunds(call: types.CallbackQuery):
     cfg = load_config()
-    ar_ = cfg.get("auto_refunds", True)
-    cfg["auto_refunds"] = not ar_
-    save_config(cfg)
-    bot.answer_callback_query(call.id)
-    misc_settings(call)
+    current = bool(cfg.get("auto_refunds", False))
+    if current:
+        cfg["auto_refunds"] = False
+        save_config(cfg)
+        try:
+            bot.answer_callback_query(call.id, "Автовозвраты выключены")
+        except Exception:
+            pass
+        buyer_flow_settings(call)
+        return
 
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("✅ Включить автовозвраты", callback_data="enable_auto_refunds"))
+    kb.add(InlineKeyboardButton("◀️ Назад", callback_data="buyer_flow_settings"))
+    txt = """
+⚠️ <b>Автовозвраты</b>
+
+Если включить эту настройку, AutoSMM сможет автоматически вернуть деньги покупателю, если заказ не удалось безопасно запустить.
+
+Не включайте автовозвраты, пока не проверили свои панели и лоты.
+    """.strip()
+    bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb)
+
+def enable_auto_refunds(call: types.CallbackQuery):
+    cfg = load_config()
+    cfg["auto_refunds"] = True
+    save_config(cfg)
+    try:
+        bot.answer_callback_query(call.id, "Автовозвраты включены")
+    except Exception:
+        pass
+    buyer_flow_settings(call)
 
 def toggle_confirm_link(call: types.CallbackQuery):
     cfg = load_config()
@@ -5307,7 +8240,7 @@ def toggle_confirm_link(call: types.CallbackQuery):
     cfg["confirm_link"] = not confirm_link
     save_config(cfg)
     bot.answer_callback_query(call.id)
-    misc_settings(call)
+    buyer_flow_settings(call)
 
 
 def toggle_send_auto_lots(call: types.CallbackQuery):
@@ -5319,21 +8252,13 @@ def toggle_send_auto_lots(call: types.CallbackQuery):
     misc_settings(call)
 
 
-def toggle_auto_start(call: types.CallbackQuery):
-    cfg = load_config()
-    current_value = cfg.get("auto_start", False)
-    cfg["auto_start"] = not current_value
-    save_config(cfg)
-    bot.answer_callback_query(call.id)
-    misc_settings(call)
-
 
 def change_send_interval(call: types.CallbackQuery):
     cfg = load_config()
     current_interval = cfg.get("send_auto_lots_interval", 30)
     _start_ui_input_flow(
         call,
-        f"Текущий интервал отправки: {current_interval} минут\n\nВведите новый интервал отправки auto_lots.json в минутах (от 5 до 1440):",
+        f"Текущий интервал отправки: {current_interval} минут\n\nВведите новый интервал отправки файл настроек в минутах (от 5 до 1440):",
         process_send_interval_change,
         back_target="misc_settings",
     )
@@ -5360,7 +8285,7 @@ def process_send_interval_change(message: types.Message):
 
         kb_ = InlineKeyboardMarkup()
         kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="misc_settings"))
-        bot.send_message(message.chat.id, f"✅ Интервал отправки auto_lots.json установлен: {new_interval} минут", reply_markup=kb_)
+        bot.send_message(message.chat.id, f"✅ Интервал отправки файл настроек установлен: {new_interval} минут", reply_markup=kb_)
     except ValueError:
         _repeat_ui_input_flow(message.chat.id, "❌ Ошибка: Введите корректное число минут.")
 
@@ -5371,6 +8296,7 @@ def return_to_settings(call: types.CallbackQuery):
     except Exception:
         pass
     waiting_for_lots_upload.discard(call.from_user.id)
+    waiting_for_backup_restore_upload.discard(call.from_user.id)
     SEARCH_RESULT_CONTEXT.pop(int(call.message.chat.id), None)
     _clear_step_handler(call.message.chat.id)
     _clear_navigation_states(call.message.chat.id)
@@ -5448,107 +8374,254 @@ def check_balance(call: types.CallbackQuery):
     check_balance_func(call, idx_)
 
 
+TEMPLATE_EDITOR_DEFS = {
+    "after_payment": {
+        "title": "💸 Текст после оплаты",
+        "button": "💸 После оплаты",
+        "default": DEFAULT_AFTER_PAYMENT_TEMPLATE,
+        "variables": [
+            "• {buyer_username} — покупатель",
+            "• {lot_title} — название лота",
+            "• {order_id_funpay} — ID заказа FunPay",
+            "• {order_price} — цена",
+            "• {order_amount} — количество FunPay",
+            "• {total_quantity} — итоговое количество услуги",
+            "• {done_quantity} — выполнено",
+            "• {left_quantity} — осталось",
+            "• {progress_percent} — прогресс в процентах",
+            "• {currency} — валюта",
+        ],
+    },
+    "buyer_link_received_confirm": {
+        "title": "✅ Подтверждение ссылки",
+        "button": "✅ Подтверждение ссылки",
+        "default": DEFAULT_LINK_CONFIRM_TEMPLATE,
+        "variables": [
+            "• {order_id_funpay} — ID заказа FunPay",
+            "• {lot_title} — название лота",
+            "• {link} — ссылка покупателя",
+            "• {buyer_username} — покупатель",
+            "• {order_amount} — количество FunPay",
+            "• {order_price} — цена",
+            "• {total_quantity} — итоговое количество услуги",
+            "• {done_quantity} — выполнено",
+            "• {left_quantity} — осталось",
+            "• {progress_percent} — прогресс в процентах",
+            "• {currency} — валюта",
+        ],
+    },
+    "after_confirmation": {
+        "title": "🚀 Текст после запуска заказа",
+        "button": "🚀 После запуска заказа",
+        "default": DEFAULT_AFTER_CONFIRMATION_TEMPLATE,
+        "variables": [
+            "• {lot_title} — название лота",
+            "• {panel_order_id} — ID заказа в панели",
+            "• {twiboost_id} — ID заказа в панели",
+            "• {link} — ссылка покупателя",
+            "• {order_id_funpay} — ID заказа FunPay",
+            "• {total_quantity} — итоговое количество услуги",
+            "• {done_quantity} — выполнено",
+            "• {left_quantity} — осталось",
+            "• {progress_percent} — прогресс в процентах",
+        ],
+    },
+    "after_completed": {
+        "title": "🎉 Текст после завершения",
+        "button": "🎉 После завершения",
+        "default": DEFAULT_AFTER_COMPLETED_TEMPLATE,
+        "variables": [
+            "• {lot_title} — название лота",
+            "• {panel_order_id} — ID заказа в панели",
+            "• {twiboost_id} — ID заказа в панели",
+            "• {order_id_funpay} — ID заказа FunPay",
+            "• {total_quantity} — итоговое количество услуги",
+            "• {done_quantity} — выполнено",
+            "• {left_quantity} — осталось",
+            "• {progress_percent} — прогресс в процентах",
+        ],
+    },
+}
+
+
 def edit_messages_menu(call: types.CallbackQuery):
     try:
         bot.answer_callback_query(call.id)
     except Exception:
         pass
+    _clear_step_handler(call.message.chat.id)
+    _clear_navigation_states(call.message.chat.id)
+    text_ = """
+💬 <b>Тексты сообщений</b>
 
+Здесь настраиваются сообщения, которые видит покупатель.
+
+Полный список переменных:
+https://teletype.in/@w1bbex/AutoSMM
+    """.strip()
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("💸 После оплаты", callback_data="edit_msg_payment"))
+    kb.add(InlineKeyboardButton("✅ Подтверждение ссылки", callback_data="edit_msg_link_confirm"))
+    kb.add(InlineKeyboardButton("🚀 После запуска заказа", callback_data="edit_msg_confirmation"))
+    kb.add(InlineKeyboardButton("🎉 После завершения", callback_data="edit_msg_completion"))
+    kb.add(InlineKeyboardButton("🔄 Сбросить тексты", callback_data="reset_message_texts_prompt"))
+    kb.add(InlineKeyboardButton("◀️ Назад", callback_data="misc_settings"))
+    bot.edit_message_text(text_, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb)
+
+
+def _get_template_editor_def(template_key: str) -> Optional[Dict[str, Any]]:
+    return TEMPLATE_EDITOR_DEFS.get(str(template_key or ""))
+
+
+def _get_current_template_text(template_key: str) -> str:
+    cfg = load_config()
+    messages = cfg.get("messages") or {}
+    meta = _get_template_editor_def(template_key) or {}
+    return str(messages.get(template_key) or meta.get("default") or "")
+
+
+def _render_template_view_text(template_key: str) -> str:
+    meta = _get_template_editor_def(template_key) or {}
+    title = meta.get("title", "Текст сообщения")
+    template_text = _get_current_template_text(template_key)
+    template_for_view = template_text
+    warning = ""
+    if len(template_for_view) > 3500:
+        template_for_view = template_for_view[:3500].rstrip()
+        warning = "\n\n⚠️ Текст очень длинный, показаны первые 3500 символов."
+    variables = "\n".join(meta.get("variables") or [])
+    return f"""{html.escape(title)}
+
+Текущий текст:
+
+<pre>{html.escape(template_for_view)}</pre>{warning}
+
+Доступные переменные:
+{html.escape(variables)}
+
+Полный список переменных:
+https://teletype.in/@w1bbex/AutoSMM""".strip()
+
+
+def _show_template_editor_screen(chat_id: int, message_id: Optional[int], template_key: str):
+    if template_key not in TEMPLATE_EDITOR_DEFS:
+        return
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("✏️ Изменить текст", callback_data=f"template_edit_{template_key}"))
+    kb.add(InlineKeyboardButton("🔄 Сбросить этот текст", callback_data=f"template_reset_prompt_{template_key}"))
+    kb.add(InlineKeyboardButton("◀️ Назад", callback_data="edit_messages"))
+    text_ = _render_template_view_text(template_key)
+    if message_id is None:
+        bot.send_message(chat_id, text_, parse_mode="HTML", reply_markup=kb)
+    else:
+        bot.edit_message_text(text_, chat_id, message_id, parse_mode="HTML", reply_markup=kb)
+
+
+def template_view_callback(call: types.CallbackQuery):
+    template_key = call.data.split("template_view_", 1)[1]
     try:
-        _clear_step_handler(call.message.chat.id)
-        _clear_navigation_states(call.message.chat.id)
-
-        cfg = load_config()
-        default_messages = {
-            "after_payment": """❤️ Благодарим за оплату!
-
-Чтобы начать накрутку, отправьте корректную ссылку на вашу страницу или пост в социальных сетях. Ссылка должна начинаться с "https://", например:
-
-Пример: https://teletype.in/@w1bbex/wwTwed1ZBZE
-
-Без правильной ссылки накрутка не будет запущена. Убедитесь, что она ведет на активную страницу, доступную для общего просмотра.""",
-            "after_confirmation": """🎉 Ваш заказ успешно оформлен!
-
-🔢 ID заказа в сервисе: {twiboost_id}
-🔗 Для отслеживания переходите по ссылке: {link}
-
-📋 Доступные команды:
-🔍 чек {twiboost_id} — Проверить статус заказа (выводит информацию о заказе)
-🔄 рефилл {twiboost_id} — Запросить рефилл (работает лишь с гарантией - восстанавливает отписанных подписчиков)
-
-Если у вас возникнут вопросы, не стесняйтесь обращаться!"""
-        }
-        messages_cfg = cfg.get("messages", {})
-        if not isinstance(messages_cfg, dict):
-            messages_cfg = {}
-
-        msg_payment = messages_cfg.get("after_payment") or default_messages["after_payment"]
-        msg_confirmation = messages_cfg.get("after_confirmation") or default_messages["after_confirmation"]
-
-        payment_preview = _build_template_preview(msg_payment)
-        confirmation_preview = _build_template_preview(msg_confirmation)
-
-        text_ = f"""
-⚙ <b>Редактирование текстов сообщений</b>
-
-<b>После оплаты:</b>
-
-Переменные: https://teletype.in/@w1bbex/kT9IpmDNovR
-
-<code>{payment_preview}</code>
-
-<b>После подтверждения ссылки:</b>
-
-Переменные: https://teletype.in/@w1bbex/kT9IpmDNovR
-
-<code>{confirmation_preview}</code>
-        """.strip()
-
-        kb = InlineKeyboardMarkup(row_width=1)
-        kb.add(
-            InlineKeyboardButton("Изменить текст после оплаты", callback_data="edit_msg_payment"),
-            InlineKeyboardButton("Изменить текст после подтверждения", callback_data="edit_msg_confirmation")
-        )
-        kb.add(InlineKeyboardButton("◀️ Назад", callback_data="misc_settings"))
-
-        try:
-            bot.edit_message_text(
-                text_,
-                call.message.chat.id,
-                call.message.message_id,
-                parse_mode="HTML",
-                reply_markup=kb,
-            )
-        except Exception as edit_error:
-            err_text = str(edit_error).lower()
-            if "message is not modified" in err_text:
-                try:
-                    bot.edit_message_reply_markup(
-                        call.message.chat.id,
-                        call.message.message_id,
-                        reply_markup=kb,
-                    )
-                except Exception:
-                    pass
-                return
-            raise
+        bot.answer_callback_query(call.id)
     except Exception:
-        logger.exception("Ошибка при открытии экрана шаблонов сообщений")
-        error_text = "❌ Не удалось открыть раздел шаблонов сообщений."
-        kb = InlineKeyboardMarkup(row_width=1)
-        kb.add(InlineKeyboardButton("◀️ Назад", callback_data="misc_settings"))
-        try:
-            bot.edit_message_text(
-                error_text,
-                call.message.chat.id,
-                call.message.message_id,
-                reply_markup=kb,
-            )
-        except Exception:
-            try:
-                bot.send_message(call.message.chat.id, error_text, reply_markup=kb)
-            except Exception:
-                logger.exception("Не удалось показать fallback-ошибку для экрана шаблонов сообщений")
+        pass
+    _show_template_editor_screen(call.message.chat.id, call.message.message_id, template_key)
+
+
+def template_edit_callback(call: types.CallbackQuery):
+    template_key = call.data.split("template_edit_", 1)[1]
+    meta = _get_template_editor_def(template_key)
+    if not meta:
+        edit_messages_menu(call)
+        return
+    _start_ui_input_flow(
+        call,
+        f"Отправьте новый текст для:\n{meta.get('title')}\n\nТекущий текст можно скопировать с прошлого экрана.",
+        process_template_text_change,
+        template_key,
+        back_target="edit_messages",
+    )
+
+
+def template_reset_prompt_callback(call: types.CallbackQuery):
+    template_key = call.data.split("template_reset_prompt_", 1)[1]
+    meta = _get_template_editor_def(template_key)
+    if not meta:
+        edit_messages_menu(call)
+        return
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("✅ Сбросить этот текст", callback_data=f"template_reset_confirm_{template_key}"))
+    kb.add(InlineKeyboardButton("◀️ Назад", callback_data=f"template_view_{template_key}"))
+    bot.edit_message_text(f"Сбросить стандартный текст?\n\n{meta.get('title')}", call.message.chat.id, call.message.message_id, reply_markup=kb)
+
+
+def template_reset_confirm_callback(call: types.CallbackQuery):
+    template_key = call.data.split("template_reset_confirm_", 1)[1]
+    meta = _get_template_editor_def(template_key)
+    if not meta:
+        edit_messages_menu(call)
+        return
+    cfg = load_config()
+    messages = cfg.setdefault("messages", {})
+    messages[template_key] = meta.get("default") or ""
+    save_config(cfg)
+    try:
+        bot.answer_callback_query(call.id, "Текст сброшен")
+    except Exception:
+        pass
+    _show_template_editor_screen(call.message.chat.id, call.message.message_id, template_key)
+
+
+def process_template_text_change(message: types.Message, template_key: str):
+    new_text = str(message.text or "").strip()
+    if not new_text:
+        _repeat_ui_input_flow(message.chat.id, "❌ Текст не может быть пустым.")
+        return
+    if template_key not in TEMPLATE_EDITOR_DEFS:
+        _clear_ui_input_state(message.chat.id)
+        bot.send_message(message.chat.id, "❌ Неизвестный текст сообщения.")
+        return
+    cfg = load_config()
+    cfg.setdefault("messages", {})[template_key] = new_text
+    save_config(cfg)
+    _clear_ui_input_state(message.chat.id)
+    bot.send_message(message.chat.id, "✅ Текст обновлён.")
+    _show_template_editor_screen(message.chat.id, None, template_key)
+
+
+def edit_msg_payment(call: types.CallbackQuery):
+    _show_template_editor_screen(call.message.chat.id, call.message.message_id, "after_payment")
+
+
+def edit_msg_confirmation(call: types.CallbackQuery):
+    _show_template_editor_screen(call.message.chat.id, call.message.message_id, "after_confirmation")
+
+
+def edit_msg_link_confirm(call: types.CallbackQuery):
+    _show_template_editor_screen(call.message.chat.id, call.message.message_id, "buyer_link_received_confirm")
+
+
+def edit_msg_completion(call: types.CallbackQuery):
+    _show_template_editor_screen(call.message.chat.id, call.message.message_id, "after_completed")
+
+
+def reset_message_texts_prompt(call: types.CallbackQuery):
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("✅ Сбросить тексты", callback_data="reset_message_texts_confirm"))
+    kb.add(InlineKeyboardButton("◀️ Назад", callback_data="edit_messages"))
+    bot.edit_message_text("Сбросить стандартные тексты AutoSMM?", call.message.chat.id, call.message.message_id, reply_markup=kb)
+
+
+def reset_message_texts_confirm(call: types.CallbackQuery):
+    cfg = load_config()
+    cfg.setdefault("messages", {})
+    for key, meta in TEMPLATE_EDITOR_DEFS.items():
+        cfg["messages"][key] = meta.get("default") or ""
+    _ensure_config_defaults(cfg)
+    save_config(cfg)
+    try:
+        bot.answer_callback_query(call.id, "Тексты сброшены")
+    except Exception:
+        pass
+    edit_messages_menu(call)
 
 
 def _build_template_preview(text_value: str, limit: int = 450) -> str:
@@ -5556,52 +8629,6 @@ def _build_template_preview(text_value: str, limit: int = 450) -> str:
     if len(raw) > limit:
         raw = raw[:limit].rstrip() + "…"
     return html.escape(raw) if raw else "—"
-
-
-def edit_msg_payment(call: types.CallbackQuery):
-    _start_ui_input_flow(
-        call,
-        "Введите новый текст после оплаты:",
-        process_message_payment_change,
-        back_target="edit_messages",
-    )
-
-
-def edit_msg_confirmation(call: types.CallbackQuery):
-    _start_ui_input_flow(
-        call,
-        "Введите новый текст после подтверждения:",
-        process_message_confirmation_change,
-        back_target="edit_messages",
-    )
-
-
-def process_message_payment_change(message: types.Message):
-    new_text = message.text.strip()
-    if not new_text:
-        _repeat_ui_input_flow(message.chat.id, "❌ Текст не может быть пустым.")
-        return
-    cfg = load_config()
-    cfg["messages"]["after_payment"] = new_text
-    save_config(cfg)
-    _clear_ui_input_state(message.chat.id)
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("◀️ Назад", callback_data="edit_messages"))
-    bot.send_message(message.chat.id, "Текст после оплаты обновлен.", reply_markup=kb)
-
-
-def process_message_confirmation_change(message: types.Message):
-    new_text = message.text.strip()
-    if not new_text:
-        _repeat_ui_input_flow(message.chat.id, "❌ Текст не может быть пустым.")
-        return
-    cfg = load_config()
-    cfg["messages"]["after_confirmation"] = new_text
-    save_config(cfg)
-    _clear_ui_input_state(message.chat.id)
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("◀️ Назад", callback_data="edit_messages"))
-    bot.send_message(message.chat.id, "Текст после подтверждения обновлен.", reply_markup=kb)
 
 
 def add_service(call: types.CallbackQuery):
@@ -5616,7 +8643,7 @@ def add_service(call: types.CallbackQuery):
 def delete_service(call: types.CallbackQuery):
     _start_ui_input_flow(
         call,
-        "Введите номер сервиса для удаления:",
+        "Введите номер панели для удаления:",
         process_delete_service,
         back_target="api_settings",
     )
@@ -5673,24 +8700,38 @@ def process_delete_service(message: types.Message):
 def set_notification_chat_id(call: types.CallbackQuery):
     _start_ui_input_flow(
         call,
-        f"Введите Chat ID для уведомлений (например, -1001234567890 для группы или ваш ID, ваш id: {call.message.chat.id}):",
+        "Отправьте ID Telegram-чата для уведомлений.\n\nМожно нажать «Использовать этот чат» в предыдущем меню.",
         process_notification_chat_id,
-        back_target="misc_settings",
+        back_target="seller_notifications_settings",
     )
 
 
 def process_notification_chat_id(message: types.Message):
+    raw_text = str(message.text or "").strip()
+    if raw_text.lower() == "/chatid":
+        bot.send_message(
+            message.chat.id,
+            f"ID этого чата: {message.chat.id}\n\nОтправьте ID чата числом или нажмите «Использовать этот чат» в меню уведомлений.",
+            reply_markup=_build_ui_input_keyboard(message.chat.id),
+        )
+        state = _get_ui_input_state(message.chat.id)
+        if state:
+            try:
+                bot.register_next_step_handler(message, state["next_handler"], *state.get("handler_args", ()))
+            except Exception:
+                pass
+        return
     try:
-        new_chat_id = int(message.text.strip())
+        new_chat_id = int(raw_text)
         cfg = load_config()
         cfg["notification_chat_id"] = new_chat_id
         save_config(cfg)
         _clear_ui_input_state(message.chat.id)
         kb_ = InlineKeyboardMarkup()
-        kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="misc_settings"))
-        bot.send_message(message.chat.id, f"✅ Chat ID для уведомлений установлен: {new_chat_id}", reply_markup=kb_)
+        kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="seller_notifications_settings"))
+        bot.send_message(message.chat.id, f"✅ Чат уведомлений установлен: {new_chat_id}", reply_markup=kb_)
     except ValueError:
-        _repeat_ui_input_flow(message.chat.id, "❌ Ошибка: Введите корректный Chat ID (целое число).")
+        _repeat_ui_input_flow(message.chat.id, "❌ Ошибка: отправьте ID чата числом.")
 
 
 def cleanup_old_files_manual(call: types.CallbackQuery):
@@ -5702,8 +8743,8 @@ def cleanup_old_files_manual(call: types.CallbackQuery):
     waiting_for_lots_upload.discard(call.from_user.id)
     _clear_step_handler(call.message.chat.id)
     _clear_navigation_states(call.message.chat.id)
-    open_old_files_warning_screen(call.message.chat.id, call.message.message_id, ignore_cooldown=True)
-
+    txt_, kb = build_old_files_confirm_text_and_kb()
+    _send_or_edit_text(call.message.chat.id, txt_, kb, message_id=call.message.message_id)
 
 def cleanup_old_files_later(call: types.CallbackQuery):
     try:
@@ -5731,8 +8772,7 @@ def cleanup_old_files_cancel(call: types.CallbackQuery):
     except Exception:
         pass
 
-    open_old_files_warning_screen(call.message.chat.id, call.message.message_id, ignore_cooldown=True)
-
+    autosmm_cleanup_menu(call)
 
 def cleanup_old_files_confirm(call: types.CallbackQuery):
     try:
@@ -5778,6 +8818,70 @@ def links_menu_callback(call: types.CallbackQuery):
     links_menu(call)
 
 
+def _find_order_by_panel_order_id(panel_order_id: Any) -> Optional[Dict]:
+    target = str(panel_order_id or "").strip()
+    if not target:
+        return None
+    matches = []
+    for order_record in orders.load_orders_data():
+        if str(order_record.get("panel_order_id") or order_record.get("twiboost_id") or order_record.get("id_zakaz") or "").strip() == target:
+            matches.append(order_record)
+    if len(matches) > 1:
+        logger.warning("ORDER REF AMBIGUOUS: panel_order_id=%s matched %s local records", target, len(matches))
+        return None
+    return matches[0] if matches else None
+
+
+def _normalize_order_ref_for_lookup(raw_ref: Any) -> str:
+    return str(raw_ref or "").strip().lstrip("#").upper()
+
+
+def _find_order_by_any_order_ref(raw_ref: Any) -> Optional[Dict]:
+    ref = _normalize_order_ref_for_lookup(raw_ref)
+    if not ref:
+        return None
+    all_orders = [order for order in orders.load_orders_data() if isinstance(order, dict)]
+
+    def _funpay_matches() -> List[Dict]:
+        result = []
+        for order_record in all_orders:
+            for field_name in ("order_id", "order_id_funpay"):
+                value = _normalize_order_ref_for_lookup(order_record.get(field_name))
+                if value and value == ref:
+                    result.append(order_record)
+                    break
+        return result
+
+    def _panel_matches() -> List[Dict]:
+        result = []
+        for order_record in all_orders:
+            for field_name in ("panel_order_id", "twiboost_id", "id_zakaz"):
+                value = str(order_record.get(field_name) or "").strip()
+                if value and value == ref:
+                    result.append(order_record)
+                    break
+        return result
+
+    ordered_matchers = (_panel_matches, _funpay_matches) if ref.isdigit() else (_funpay_matches, _panel_matches)
+    for matcher in ordered_matchers:
+        matches = matcher()
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            logger.warning("ORDER REF AMBIGUOUS: ref=%s matched %s local records", ref, len(matches))
+            return None
+    return None
+
+def _buyer_can_access_order(order_record: Dict, buyer_id: Any, chat_id: Any) -> bool:
+    if not isinstance(order_record, dict):
+        return False
+    if buyer_id not in (None, "") and str(order_record.get("buyer_id")) == str(buyer_id):
+        return True
+    if chat_id not in (None, "") and str(order_record.get("chat_id")) == str(chat_id):
+        return True
+    return False
+
+
 # =========================================================
 # EVENT HANDLERS / INIT
 # =========================================================
@@ -5805,109 +8909,109 @@ def auto_smm_handler(c: Cardinal, e, *args):
         if _sync_funpay_status_from_message(msg_text):
             return
 
-        m_check = re.match(r'^чек\s+(\d+)$', msg_text.lower())
-        if m_check:
-            order_num = m_check.group(1)
-            od_ = orders.load_orders_data()
-            found = next((o for o in od_ if str(o["id_zakaz"]) == order_num), None)
-            if not found:
-                c.send_message(msg_chat_id, "❌ Заказ не найден в базе.")
-                return
-            cfg = load_config()
-            service_cfg = cfg["services"].get(str(found["service_number"]))
-            if not service_cfg:
-                c.send_message(msg_chat_id, f"❌ Не найден конфиг для service_number={found['service_number']}")
-                return
-            api_url = service_cfg["api_url"]
-            api_key = service_cfg["api_key"]
-            invalid_key_payload = _validate_api_key_for_action(found["service_number"], "status", api_key)
-            if invalid_key_payload:
-                c.send_message(msg_chat_id, "❌ Невозможно выполнить проверку: API-ключ сервиса имеет некорректную длину.")
-                return
-            url_ = f"{api_url}?action=status&order={order_num}&key={api_key}"
-            try:
-                rr = requests.get(url_)
-                rr.raise_for_status()
-                rdata = rr.json()
-                st_ = rdata.get("status", "неизв.")
-                rm_ = rdata.get("remains", "неизв.")
-                ch_ = rdata.get("charge", "неизв.")
-                cur_ = rdata.get("currency", "неизв.")
-                c.send_message(msg_chat_id, f"Статус: {st_}")
-            except Exception as ex:
-                c.send_message(msg_chat_id, f"Ошибка при проверке")
+        if _handle_buyer_commands_command(c, msg_text, msg_author_id, msg_chat_id):
             return
 
-        m_refill = re.match(r'^рефилл\s+(\d+)$', msg_text.lower())
-        if m_refill:
-            order_num = m_refill.group(1)
-            c.send_message(msg_chat_id, "Запрашиваю рефилл...")
-            od_ = orders.load_orders_data()
-            found = next((o for o in od_ if str(o["id_zakaz"]) == order_num), None)
+        if _handle_buyer_smm_command(c, msg_text, msg_author_id, msg_chat_id):
+            return
+
+        if _handle_buyer_link_command(c, msg_text, msg_author_id, msg_chat_id):
+            return
+
+        if _handle_buyer_cancel_command(c, msg_text, msg_author_id, msg_chat_id):
+            return
+
+        m_check = re.match(r'^чек\s+(.+?)\s*$', msg_text, re.IGNORECASE)
+        if m_check:
+            raw_ref = m_check.group(1).strip()
+            found = _find_order_by_any_order_ref(raw_ref)
             if not found:
-                c.send_message(msg_chat_id, "❌ Заказ не найден в базе.")
+                c.send_message(msg_chat_id, ORDER_NOT_FOUND_TEXT)
                 return
+            if not _buyer_can_access_order(found, msg_author_id, msg_chat_id):
+                c.send_message(msg_chat_id, ORDER_NOT_FOUND_TEXT)
+                return
+
+            if _is_order_refundedish(found):
+                progress_text = _format_buyer_progress(found)
+                c.send_message(msg_chat_id, f"📦 {_format_buyer_lot_title(found)}\n\nСтатус: недоступен после возврата\nПрогресс: {progress_text}")
+                return
+
+            panel_order_id = _get_panel_order_id(found)
+            if panel_order_id is None:
+                state = _get_buyer_flow_state(found)
+                if state == BUYER_STATE_WAITING_CONFIRM:
+                    c.send_message(msg_chat_id, "Ссылка ожидает подтверждения. Напишите + или -.")
+                else:
+                    c.send_message(msg_chat_id, "Заказ ещё не запущен. Отправьте ссылку для запуска.")
+                return
+
+            service_number = _safe_int(found.get("service_number")) or 1
+            result = _fetch_single_order_status(service_number, panel_order_id)
+            order_id_funpay = str(found.get("order_id") or found.get("order_id_funpay") or "")
+            if result.get("ok"):
+                _apply_status_result(c, found, result)
+                found = orders.get_order_data(order_id_funpay) or found
+                status_text = _human_panel_status(found)
+                quantity_text = _format_buyer_progress(found)
+                c.send_message(
+                    msg_chat_id,
+                    f"📦 {_format_buyer_lot_title(found)}\n\nСтатус: {status_text}\nПрогресс: {quantity_text}\n\nПожалуйста, не злоупотребляйте командой.\nМы уведомим вас, когда заказ будет завершён.",
+                )
+            else:
+                if order_id_funpay:
+                    orders.update_order_fields(order_id_funpay, status_last_error=result.get("error") or "status_error", status_last_checked_at=_now_str(), updated_at=_now_str())
+                c.send_message(msg_chat_id, "Не удалось проверить статус. Попробуйте позже или напишите продавцу.")
+            return
+
+        m_refill = re.match(r'^рефилл\s+(.+?)\s*$', msg_text, re.IGNORECASE)
+        if m_refill:
+            raw_ref = m_refill.group(1).strip()
+            found = _find_order_by_any_order_ref(raw_ref)
+            if not found:
+                c.send_message(msg_chat_id, ORDER_NOT_FOUND_TEXT)
+                return
+            if not _buyer_can_access_order(found, msg_author_id, msg_chat_id):
+                c.send_message(msg_chat_id, ORDER_NOT_FOUND_TEXT)
+                return
+            if _apply_refund_gate(c, found, notify_chat_id=msg_chat_id, force_check=True):
+                return
+
+            panel_order_id = _get_panel_order_id(found)
+            if panel_order_id is None:
+                c.send_message(msg_chat_id, "Заказ ещё не запущен. Рефилл будет доступен только после запуска заказа.")
+                return
+
             cfg = load_config()
-            service_cfg = cfg["services"].get(str(found["service_number"]))
+            service_cfg = cfg.get("services", {}).get(str(found.get("service_number")))
             if not service_cfg:
-                c.send_message(msg_chat_id, f"❌ Не найден конфиг для service_number={found['service_number']}")
+                c.send_message(msg_chat_id, "Рефилл недоступен для этого заказа.\n\nВозможные причины:\nуслуга не поддерживает гарантию, заказ ещё выполняется или срок гарантии истёк.")
                 return
-            api_url = service_cfg["api_url"]
-            api_key = service_cfg["api_key"]
-            url_ = f"{api_url}?action=refill&order={order_num}&key={api_key}"
+            api_url = service_cfg.get("api_url")
+            api_key = service_cfg.get("api_key")
+            invalid_key_payload = _validate_api_key_for_action(found.get("service_number"), "refill", api_key)
+            if invalid_key_payload:
+                c.send_message(msg_chat_id, "Рефилл недоступен для этого заказа.\n\nВозможные причины:\nуслуга не поддерживает гарантию, заказ ещё выполняется или срок гарантии истёк.")
+                return
+            url_ = f"{api_url}?action=refill&order={panel_order_id}&key={api_key}"
             try:
-                rr = requests.get(url_)
+                rr = requests.get(url_, timeout=15)
                 rr.raise_for_status()
                 rdata = rr.json()
                 st_ = rdata.get("status", 0)
-                if str(st_) in ("1", "true"):
-                    c.send_message(msg_chat_id, "✅ Рефилл успешно запущен.")
+                if str(st_).lower() in ("1", "true", "success"):
+                    c.send_message(
+                        msg_chat_id,
+                        f"🔄 Рефилл запрошен.\n\nID заказа в сервисе: {panel_order_id}\n\nЕсли услуга поддерживает гарантию, панель обработает запрос автоматически.",
+                    )
                 else:
-                    c.send_message(msg_chat_id, f"❌ Рефилл отклонён (status={st_}).")
-            except Exception as ex:
-                c.send_message(msg_chat_id, f"Ошибка при запросе рефилла")
+                    c.send_message(msg_chat_id, "Рефилл недоступен для этого заказа.\n\nВозможные причины:\nуслуга не поддерживает гарантию, заказ ещё выполняется или срок гарантии истёк.")
+            except Exception:
+                c.send_message(msg_chat_id, "Не удалось запросить рефилл. Попробуйте позже или напишите продавцу.")
             return
 
-        for order_id, data in waiting_for_link.items():
-            if data["buyer_id"] == msg_author_id:
-                if data["step"] == "await_link":
-                    link_m = re.search(r'(https?://\S+)', msg_text)
-                    if not link_m:
-                        c.send_message(msg_chat_id, "❌ Неверная ссылка, повторите...")
-                        return
-                    link_ = link_m.group(0)
-                    ok, reason = is_valid_link(link_)
-                    if not ok:
-                        c.send_message(msg_chat_id, reason)
-                        return
-                    data["link"] = link_
-                    
-                    cfg = load_config()
-                    confirm_link = cfg.get("confirm_link", True)
-                    
-                    if confirm_link:
-                        data["step"] = "await_confirm"
-                        c.send_message(msg_chat_id, f"""✅ Ссылка получена: {link_}
-
-Подтвердите действие:
-➕ — да
-➖ — нет""")
-                        return
-                    else:
-                        process_link_without_confirmation(c, data)
-                    return
-
-                elif data["step"] == "await_confirm":
-                    if msg_text.lower() == "+":
-                        process_link_without_confirmation(c, data)
-                        return
-                    elif msg_text.lower() == "-":
-                        data["step"] = "await_link"
-                        c.send_message(msg_chat_id, "❌ Подтверждение отклонено. Введите другую ссылку.")
-                        return
-                    else:
-                        c.send_message(msg_chat_id, "❌ Используйте + или -. Повторите.")
-                        return
+        if _handle_buyer_flow_message(c, msg_text, msg_author_id, msg_chat_id):
+            return
 
     elif isinstance(e, NewOrderEvent):
         order_ = e.order
@@ -5919,17 +9023,60 @@ def auto_smm_handler(c: Cardinal, e, *args):
         logger.info(f"Новый заказ #{orderID}: {orderDesc}, x{orderAmount}")
 
         cfg = load_config()
-        found_lot = get_tg_id_by_description(orderDesc, orderAmount)
-        if found_lot is None:
-            logger.info("Лот не найден по описанию. Пропуск обработки.")
-            return
-
-        service_id, real_amount, srv_number = found_lot
 
         od_full = c.account.get_order(orderID)
         buyer_chat_id = od_full.chat_id
         buyer_id = od_full.buyer_id
         buyer_username = od_full.buyer_username
+
+        lot_result = resolve_lot_by_description(orderDesc, orderAmount)
+        if not lot_result.get("ok"):
+            error_code = str(lot_result.get("error") or "no_match")
+
+            if _is_lot_match_no_match(lot_result):
+                logger.info(
+                    "AUTO SMM SKIP NON-AUTOSMM ORDER: order=%s, description=%r",
+                    orderID,
+                    str(orderDesc or "")[:300],
+                )
+                return
+
+            stop_reason = "lot_match_ambiguous" if _is_lot_match_ambiguous(lot_result) else "lot_match_failed"
+            logger.warning(
+                "LOT MATCH MANUAL CHECK: order=%s, error=%s",
+                orderID,
+                error_code,
+            )
+            _upsert_buyer_flow_order_record(
+                chat_id=buyer_chat_id,
+                buyer_id=buyer_id,
+                buyer_username=buyer_username,
+                order_id_funpay=str(orderID),
+                lot_title=str(orderDesc or "SMM-заказ"),
+                order_price=orderPrice,
+                order_amount=orderAmount,
+                service_id=0,
+                real_amount=0,
+                service_number=0,
+                funpay_status="open",
+                state=BUYER_STATE_FAILED,
+                saved_link=None,
+            )
+            orders.update_order_fields(
+                str(orderID),
+                status="unknown",
+                buyer_flow_state=BUYER_STATE_FAILED,
+                status_stop_reason=stop_reason,
+                updated_at=_now_str(),
+            )
+            _send_lot_match_manual_alert(orderID, orderDesc, lot_result)
+            _send_buyer_message(c, buyer_chat_id, BUYER_LOT_MATCH_MANUAL_TEXT)
+            return
+
+        service_id = lot_result.get("service_id")
+        real_amount = lot_result.get("real_amount")
+        srv_number = lot_result.get("service_number", 1)
+        matched_lot_title = lot_result.get("lot_title") or orderDesc
         orders_info[orderID] = {
             "buyer_id": buyer_id,
             "chat_id": buyer_chat_id,
@@ -5937,73 +9084,75 @@ def auto_smm_handler(c: Cardinal, e, *args):
         }
 
         save_order_info(orderID, orderPrice, orderDesc, 0)
+        _upsert_buyer_flow_order_record(
+            chat_id=buyer_chat_id,
+            buyer_id=buyer_id,
+            buyer_username=buyer_username,
+            order_id_funpay=str(orderID),
+            lot_title=matched_lot_title,
+            order_price=orderPrice,
+            order_amount=orderAmount,
+            service_id=service_id,
+            real_amount=real_amount,
+            service_number=srv_number,
+            funpay_status="open",
+            state=BUYER_STATE_WAITING_LINK,
+        )
 
-        try:
-            msg_payment = cfg["messages"]["after_payment"].format(
-                buyer_username=buyer_username,
-                orderDesc=orderDesc,
-                orderPrice=orderPrice,
-                orderAmount=orderAmount
-            )
-        except KeyError as e:
-            logger.error(f"Ошибка в шаблоне сообщения: отсутствует переменная {e}")
-            msg_payment = "❤️ Спасибо за оплату! Укажите ссылку для запуска заказа."
-        
-        c.send_message(buyer_chat_id, msg_payment)
+        order_record = orders.get_order_data(str(orderID)) or {}
+        msg_payment = _render_template(
+            cfg.get("messages", {}).get("after_payment", "❤️ Спасибо за оплату! Укажите ссылку для запуска заказа."),
+            order_record,
+            {
+                "buyer_username": buyer_username,
+                "lot_title": matched_lot_title,
+                "orderDesc": matched_lot_title,
+                "order_id_funpay": orderID,
+                "order_price": orderPrice,
+                "orderPrice": orderPrice,
+                "order_amount": orderAmount,
+                "orderAmount": orderAmount,
+                "currency": "RUB",
+                "total_quantity": real_amount,
+                "done_quantity": 0,
+                "left_quantity": real_amount,
+                "progress_percent": 0,
+                "funpay_status": "open",
+                "panel_status": "",
+            },
+        )
+        _send_buyer_message(c, buyer_chat_id, msg_payment)
 
         waiting_for_link[str(orderID)] = {
             "buyer_id": buyer_id,
             "chat_id": buyer_chat_id,
+            "buyer_username": buyer_username,
             "service_id": service_id,
             "real_amount": real_amount,
-            "order_id_funpay": orderID,
+            "order_id_funpay": str(orderID),
             "price": orderPrice,
             "service_number": srv_number,
+            "lot_title": matched_lot_title,
+            "state": BUYER_STATE_WAITING_LINK,
             "step": "await_link"
         }
 
 
-def start_smm(message: types.Message):
-    global RUNNING, IS_STARTED, ORDER_CHECK_THREAD, AUTO_LOTS_SEND_THREAD, cardinal_instance
 
-    if RUNNING:
-        bot.send_message(message.chat.id, "✅ Плагин уже запущен.")
-        return
 
-    RUNNING = True
-    IS_STARTED = True
-    
-    c_ = cardinal_instance
-    
-    if not ORDER_CHECK_THREAD or not ORDER_CHECK_THREAD.is_alive():
-        ORDER_CHECK_THREAD = threading.Thread(target=start_order_checking, args=(c_,))
-        ORDER_CHECK_THREAD.daemon = True
-        ORDER_CHECK_THREAD.start()
-    
+
+def send_chat_id(message: types.Message):
     try:
-        cfg = load_config()
-        send_auto_lots = cfg.get("send_auto_lots", False)
-    except Exception:
-        send_auto_lots = False
-
-    if send_auto_lots:
-        if not AUTO_LOTS_SEND_THREAD or not AUTO_LOTS_SEND_THREAD.is_alive():
-            AUTO_LOTS_SEND_THREAD = threading.Thread(target=start_auto_lots_sender, args=(c_,))
-            AUTO_LOTS_SEND_THREAD.daemon = True
-            AUTO_LOTS_SEND_THREAD.start()
-    
-    bot.send_message(message.chat.id, "✅ Плагин успешно запущен.")
-
-
-def stop_smm(message: types.Message):
-    global RUNNING
-    
-    if not RUNNING:
-        bot.send_message(message.chat.id, "❌ Плагин не запущен.")
-        return
-
-    RUNNING = False
-    bot.send_message(message.chat.id, "✅ Плагин остановлен.")
+        bot.send_message(
+            message.chat.id,
+            f"🆔 <b>Chat ID</b>\n\n"
+            f"Текущий chat_id:\n"
+            f"<code>{h(message.chat.id)}</code>\n\n"
+            f"<i>Используйте его в настройках уведомлений AutoSMM.</i>",
+            parse_mode="HTML"
+        )
+    except Exception as ex:
+        logger.warning(f"CHATID COMMAND FAILED: {ex}")
 
 
 def init_commands(c_: Cardinal):
@@ -6012,32 +9161,45 @@ def init_commands(c_: Cardinal):
     cardinal_instance = c_
     bot = c_.telegram.bot
     
-    auto_started = auto_start_plugin(c_)
-    if auto_started:
-        logger.info("Плагин был автоматически запущен при инициализации")
-
     def handle_document_upload(message: types.Message):
         user_id = message.from_user.id
         logger.info(f"Получен документ от {user_id}. Проверка ожидания...")
-        if user_id not in waiting_for_lots_upload:
-            logger.info(f"Пользователь {user_id} не ожидает загрузки JSON")
-            bot.send_message(message.chat.id, "❌ Вы не активировали загрузку JSON. Используйте меню настроек.")
-            return
-        waiting_for_lots_upload.remove(user_id)
-        logger.info(f"Пользователь {user_id} удалён из ожидания. Обрабатываю файл...")
         file_id = message.document.file_id
         file_info = bot.get_file(file_id)
         downloaded_file = bot.download_file(file_info.file_path)
+
+        if user_id in waiting_for_backup_restore_upload:
+            waiting_for_backup_restore_upload.discard(user_id)
+            try:
+                data = json.loads(downloaded_file.decode('utf-8'))
+                ok, result_text = _restore_backup_wrapper(data)
+                kb_ = InlineKeyboardMarkup()
+                kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="files_menu"))
+                bot.send_message(message.chat.id, result_text, reply_markup=kb_)
+            except json.JSONDecodeError as e:
+                bot.send_message(message.chat.id, f"❌ Не удалось считать файл бэкапа. Проверьте JSON. ({e})")
+            except Exception as e:
+                bot.send_message(message.chat.id, f"❌ Произошла ошибка при восстановлении бэкапа: {e}")
+                logger.error(f"Неизвестная ошибка при восстановлении бэкапа: {e}")
+            return
+
+        if user_id not in waiting_for_lots_upload:
+            logger.info(f"Пользователь {user_id} не ожидает загрузки файла")
+            bot.send_message(message.chat.id, "❌ Вы не активировали загрузку файла. Используйте меню настроек.")
+            return
+        waiting_for_lots_upload.remove(user_id)
+        logger.info(f"Пользователь {user_id} удалён из ожидания. Обрабатываю файл настроек...")
         try:
             data = json.loads(downloaded_file.decode('utf-8'))
             if "lot_mapping" not in data:
-                bot.send_message(message.chat.id, "❌ Ошибка: в файле нет ключа 'lot_mapping'.")
+                bot.send_message(message.chat.id, "❌ Ошибка: в файле нет раздела с лотами.")
                 logger.error("JSON не содержит 'lot_mapping'")
                 return
+            _ensure_config_defaults(data)
             save_config(data)
             kb_ = InlineKeyboardMarkup()
             kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="files_menu"))
-            bot.send_message(message.chat.id, "✅ Новый auto_lots.json успешно загружен и сохранён!", reply_markup=kb_)
+            bot.send_message(message.chat.id, "✅ Файл настроек успешно загружен и сохранён!", reply_markup=kb_)
             logger.info("JSON успешно загружен и сохранён")
         except json.JSONDecodeError as e:
             bot.send_message(message.chat.id, f"❌ Ошибка: Не удалось считать JSON. Проверьте синтаксис. ({e})")
@@ -6050,21 +9212,48 @@ def init_commands(c_: Cardinal):
     config.update(cfg)
     lot_mapping.clear()
     lot_mapping.update(cfg.get("lot_mapping", {}))
+    global RUNNING, IS_STARTED, ORDER_CHECK_THREAD, AUTO_LOTS_SEND_THREAD
+    RUNNING = True
+    IS_STARTED = True
+    _recover_buyer_flow_runtime(c_)
+    if not ORDER_CHECK_THREAD or not ORDER_CHECK_THREAD.is_alive():
+        ORDER_CHECK_THREAD = threading.Thread(target=start_order_checking, args=(c_,), daemon=True)
+        ORDER_CHECK_THREAD.start()
+    try:
+        if bool(cfg.get("send_auto_lots", False)) and (not AUTO_LOTS_SEND_THREAD or not AUTO_LOTS_SEND_THREAD.is_alive()):
+            AUTO_LOTS_SEND_THREAD = threading.Thread(target=start_auto_lots_sender, args=(c_,), daemon=True)
+            AUTO_LOTS_SEND_THREAD.start()
+    except Exception as ex:
+        logger.warning(f"AUTO SMM AUTO LOTS THREAD START FAILED: {ex}")
     c_.add_telegram_commands(UUID, [
-        ("start_smm", "Включить автопродажу", True),
-        ("stop_smm", "Выключить автопродажу", True),
-        ("auto_smm_settings", "Настройки автопродажи", True),
+        ("autosmm", "Открыть AutoSMM", True),
+        ("chatid", "Показать chat_id", True),
             ])
 
 
 
     # --- Telegram handlers registration (NO decorators; Cardinal-safe) ---
     def _add_cb(_fn, **_kw):
+        def _guarded_callback(call):
+            data = str(getattr(call, "data", "") or "")
+            telemetry_allowed_callbacks = {
+                "autosmm_telemetry_accept",
+                "autosmm_telemetry_refuse",
+                "autosmm_telemetry_guest_24h",
+            }
+            if data not in telemetry_allowed_callbacks and not _telemetry_gate_allows_menu():
+                try:
+                    bot.answer_callback_query(call.id)
+                except Exception:
+                    pass
+                _show_telemetry_gate(call.message.chat.id, message_id=call.message.message_id)
+                return
+            return _fn(call)
         try:
-            bot.add_callback_query_handler(_fn, **_kw)
+            bot.add_callback_query_handler(_guarded_callback, **_kw)
         except Exception:
             try:
-                bot.register_callback_query_handler(_fn, **_kw)
+                bot.register_callback_query_handler(_guarded_callback, **_kw)
             except Exception:
                 pass
 
@@ -6082,8 +9271,12 @@ def init_commands(c_: Cardinal):
     _add_cb(change_fallback_snum_prompt, func=lambda call: call.data.startswith("change_fallback_snum_"))
     _add_cb(change_fallback_id_prompt, func=lambda call: call.data.startswith("change_fallback_id_"))
     _add_cb(manage_websites, func=lambda call: call.data == "manage_websites")
+    _add_cb(show_allowed_websites_list, func=lambda call: call.data == "show_allowed_websites_list")
     _add_cb(add_website_prompt, func=lambda call: call.data == "add_website")
+    _add_cb(reset_valid_links_prompt, func=lambda call: call.data == "reset_valid_links_prompt")
+    _add_cb(reset_valid_links_confirm, func=lambda call: call.data == "reset_valid_links_confirm")
     _add_cb(remove_website_prompt, func=lambda call: call.data.startswith("delete_website_"))
+    _add_cb(confirm_delete_website_callback, func=lambda call: call.data.startswith("confirm_delete_website_"))
     _add_cb(delete_all_lots_prompt, func=lambda call: call.data == "delete_all_lots")
     _add_cb(confirm_delete_all_lots, func=lambda call: call.data == "confirm_delete_all_lots")
     _add_cb(lot_settings, func=lambda call: call.data == "lot_settings")
@@ -6112,9 +9305,11 @@ def init_commands(c_: Cardinal):
     _add_cb(confirm_delete_orders, func=lambda call: call.data == "delete_orders")
     _add_cb(delete_orders_yes, func=lambda call: call.data == "delete_orders_yes")
     _add_cb(toggle_auto_refunds, func=lambda call: call.data == "toggle_auto_refunds")
+    _add_cb(enable_auto_refunds, func=lambda call: call.data == "enable_auto_refunds")
     _add_cb(toggle_confirm_link, func=lambda call: call.data == "toggle_confirm_link")
     _add_cb(toggle_send_auto_lots, func=lambda call: call.data == "toggle_send_auto_lots")
-    _add_cb(toggle_auto_start, func=lambda call: call.data == "toggle_auto_start")
+    _add_cb(toggle_buyer_cancel_before_panel, func=lambda call: call.data == "toggle_buyer_cancel_before_panel")
+    _add_cb(enable_buyer_cancel_before_panel, func=lambda call: call.data == "enable_buyer_cancel_before_panel")
     _add_cb(change_send_interval, func=lambda call: call.data == "change_send_interval")
     _add_cb(cancel_interval_change, func=lambda call: call.data == "cancel_interval_change")
     _add_cb(return_to_settings, func=lambda call: call.data == "return_to_settings")
@@ -6124,6 +9319,7 @@ def init_commands(c_: Cardinal):
     _add_cb(change_quantity, func=lambda call: call.data.startswith("change_quantity_"))
     _add_cb(change_snum, func=lambda call: call.data.startswith("change_snum_"))
     _add_cb(delete_one_lot_callback, func=lambda call: call.data.startswith("delete_one_lot_"))
+    _add_cb(confirm_delete_one_lot_callback, func=lambda call: call.data.startswith("confirm_delete_one_lot_"))
     _add_cb(api_settings_callback, func=lambda call: call.data == "api_settings")
     _add_cb(api_service_callback, func=lambda call: call.data.startswith("api_service_"))
     _add_cb(header_no_action_callback, func=lambda call: call.data == "header_no_action")
@@ -6143,12 +9339,32 @@ def init_commands(c_: Cardinal):
     _add_cb(misc_settings_callback, func=lambda call: call.data == "misc_settings")
     _add_cb(toggle_fallback, func=lambda call: call.data == "toggle_fallback")
     _add_cb(links_menu_callback, func=lambda call: call.data == "links_menu")
+    _add_cb(telemetry_accept_callback, func=lambda call: call.data == "autosmm_telemetry_accept")
+    _add_cb(telemetry_refuse_callback, func=lambda call: call.data == "autosmm_telemetry_refuse")
+    _add_cb(telemetry_guest_24h_callback, func=lambda call: call.data == "autosmm_telemetry_guest_24h")
+    _add_cb(buyer_flow_settings, func=lambda call: call.data == "buyer_flow_settings")
+    _add_cb(seller_notifications_settings, func=lambda call: call.data == "seller_notifications_settings")
+    _add_cb(use_current_chat_for_notifications, func=lambda call: call.data == "use_current_chat_for_notifications")
+    _add_cb(send_test_notification, func=lambda call: call.data == "send_test_notification")
+    _add_cb(disable_notifications, func=lambda call: call.data == "disable_notifications")
+    _add_cb(full_backup_prompt, func=lambda call: call.data == "full_backup_prompt")
+    _add_cb(full_backup_confirm, func=lambda call: call.data == "full_backup_confirm")
+    _add_cb(restore_backup_prompt, func=lambda call: call.data == "restore_backup_prompt")
+    _add_cb(autosmm_cleanup_menu, func=lambda call: call.data == "autosmm_cleanup_menu")
+    _add_cb(full_autosmm_delete_prompt, func=lambda call: call.data == "full_autosmm_delete_prompt")
+    _add_cb(full_autosmm_delete_confirm, func=lambda call: call.data == "full_autosmm_delete_confirm")
+    _add_cb(edit_msg_link_confirm, func=lambda call: call.data == "edit_msg_link_confirm")
+    _add_cb(edit_msg_completion, func=lambda call: call.data == "edit_msg_completion")
+    _add_cb(template_view_callback, func=lambda call: call.data.startswith("template_view_"))
+    _add_cb(template_edit_callback, func=lambda call: call.data.startswith("template_edit_"))
+    _add_cb(template_reset_prompt_callback, func=lambda call: call.data.startswith("template_reset_prompt_"))
+    _add_cb(template_reset_confirm_callback, func=lambda call: call.data.startswith("template_reset_confirm_"))
+    _add_cb(reset_message_texts_prompt, func=lambda call: call.data == "reset_message_texts_prompt")
+    _add_cb(reset_message_texts_confirm, func=lambda call: call.data == "reset_message_texts_confirm")
 
     # Telegram commands (Cardinal)
-    c_.telegram.msg_handler(start_smm, commands=["start_smm"])
-    c_.telegram.msg_handler(stop_smm, commands=["stop_smm"])
-    c_.telegram.msg_handler(auto_smm_settings, commands=["auto_smm_settings"])
-    c_.telegram.msg_handler(auto_smm_delete, commands=["auto_smm_delete"])
+    c_.telegram.msg_handler(auto_smm_settings, commands=["autosmm"])
+    c_.telegram.msg_handler(send_chat_id, commands=["chatid"])
 
 
 def start_order_checking_if_needed(c: Cardinal):
@@ -6158,11 +9374,11 @@ def start_order_checking_if_needed(c: Cardinal):
 
 def start_auto_lots_sender(c: Cardinal):
     """
-    Отправляет файл auto_lots.json на заданный chat_id с заданной периодичностью
+    Отправляет файл файл настроек на заданный chat_id с заданной периодичностью
     """
     global RUNNING
     
-    logger.info("Запуск потока отправки auto_lots.json")
+    logger.info("Запуск потока отправки файл настроек")
     
     while RUNNING:
         try:
@@ -6178,11 +9394,11 @@ def start_auto_lots_sender(c: Cardinal):
                             c.telegram.bot.send_document(
                                 chat_id, 
                                 file, 
-                                caption=f"📄 Автоматическая отправка файла auto_lots.json\n\n⏱️ Следующая отправка через {interval_minutes} минут"
+                                caption=f"📄 Автоматическая отправка файла файл настроек\n\n⏱️ Следующая отправка через {interval_minutes} минут"
                             )
-                            logger.info(f"Файл auto_lots.json отправлен на chat_id {chat_id}")
+                            logger.info(f"Файл файл настроек отправлен на chat_id {chat_id}")
                     except Exception as e:
-                        logger.error(f"Ошибка при отправке auto_lots.json: {e}")
+                        logger.error(f"Ошибка при отправке файл настроек: {e}")
             
             wait_time = interval_minutes * 60
             sleep_interval = 1
@@ -6193,44 +9409,9 @@ def start_auto_lots_sender(c: Cardinal):
                 time.sleep(sleep_interval)
                 
         except Exception as e:
-            logger.error(f"Ошибка в потоке отправки auto_lots.json: {e}")
+            logger.error(f"Ошибка в потоке отправки файл настроек: {e}")
             time.sleep(60)
 
-
-def auto_start_plugin(c: Cardinal):
-    """
-    Автоматический запуск плагина на основе настройки auto_start
-    """
-    cfg = load_config()
-    auto_start = cfg.get("auto_start", False)
-    
-    if auto_start:
-        logger.info("Автоматический запуск плагина SMM")
-        global RUNNING, IS_STARTED, ORDER_CHECK_THREAD, AUTO_LOTS_SEND_THREAD
-        RUNNING = True
-        IS_STARTED = True
-    
-        if not ORDER_CHECK_THREAD or not ORDER_CHECK_THREAD.is_alive():
-            ORDER_CHECK_THREAD = threading.Thread(target=start_order_checking, args=(c,))
-            ORDER_CHECK_THREAD.daemon = True
-            ORDER_CHECK_THREAD.start()
-        
-        try:
-            cfg2 = load_config()
-            send_auto_lots2 = cfg2.get("send_auto_lots", False)
-        except Exception:
-            send_auto_lots2 = False
-
-        if send_auto_lots2:
-            if not AUTO_LOTS_SEND_THREAD or not AUTO_LOTS_SEND_THREAD.is_alive():
-                AUTO_LOTS_SEND_THREAD = threading.Thread(target=start_auto_lots_sender, args=(c,))
-                AUTO_LOTS_SEND_THREAD.daemon = True
-                AUTO_LOTS_SEND_THREAD.start()
-            
-        logger.info("Плагин SMM успешно запущен автоматически")
-        return True
-    
-    return False
 
 
 BIND_TO_PRE_INIT = [init_commands]
