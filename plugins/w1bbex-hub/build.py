@@ -154,7 +154,7 @@ def build(out_file: Path | None = None) -> Path:
     meta = _read_runtime_metadata(SRC_DIR)
     rendered = _render_bundle(sources, meta)
     ast.parse(rendered, filename=str(target))
-    target.write_text(rendered, encoding="utf-8")
+    target.write_text(rendered, encoding="utf-8", newline="\n")
     return target
 
 

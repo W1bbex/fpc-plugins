@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .handlers import custom_init, init_cardinal, post_init_cardinal
+from .handlers import custom_init, init_cardinal, post_init_cardinal, stop_hub
 from .runtime import (
     COMMANDS,
     CREDITS,
@@ -17,7 +17,7 @@ from .runtime import (
 BIND_TO_PRE_INIT = [custom_init]
 BIND_TO_POST_INIT = [post_init_cardinal]
 BIND_TO_NEW_MESSAGE = []
-BIND_TO_DELETE = []
+BIND_TO_DELETE = [stop_hub]
 
 __all__ = [
     "NAME",
@@ -35,4 +35,5 @@ __all__ = [
     "custom_init",
     "post_init_cardinal",
     "init_cardinal",
+    "stop_hub",
 ]

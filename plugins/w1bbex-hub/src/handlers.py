@@ -66,13 +66,17 @@ if TYPE_CHECKING:
     from cardinal import Cardinal
 
 
+_UPDATE_THREAD_LOCK = threading.Lock()
+_UPDATE_THREAD: Optional[threading.Thread] = None
+
+
 def _is_authorized(tg: Any, user: Any) -> bool:
-    if user is None:
+    if tg is None or user is None:
         return False
     auth_users = getattr(tg, "authorized_users", None)
     if isinstance(auth_users, (dict, set, list, tuple)):
         return getattr(user, "id", None) in auth_users
-    return True
+    return False
 
 
 def _call_tg_html(invoke: Callable[[str], Any], text: str, ignore_not_modified: bool = False) -> Any:
@@ -416,7 +420,12 @@ class HubController:
     def install_plugin(self, c: CallbackQuery, plugin_name: Optional[str]) -> Any:
         if not plugin_name:
             return self._alert(c, "Некорректный идентификатор плагина")
-        plugin_info = next((x for x in get_plugins() if x.get("id") == plugin_name), None)
+        msg_obj = getattr(c, "message", None)
+        if msg_obj is None:
+            return self._alert(c, "Сообщение устарело. Откройте /hub заново.")
+
+        catalog = get_plugins()
+        plugin_info = next((x for x in catalog if x.get("id") == plugin_name), None)
         plugin_label = str(plugin_info.get("name", plugin_name)) if plugin_info else plugin_name
         is_free = bool(plugin_info.get("is_free")) if plugin_info else False
 
@@ -424,12 +433,24 @@ class HubController:
         installed = data.get("installed") if isinstance(data.get("installed"), dict) else {}
         was_installed = plugin_name in installed
         key = (data.get("keys") or {}).get(plugin_name)
+        if not plugin_info and not catalog and not key:
+            self._edit_html(
+                "⚠️ <b>Каталог плагинов временно недоступен.</b>\n\n"
+                "Не удалось проверить статус плагина. Повторите попытку позже или обновите каталог.",
+                msg_obj.chat.id,
+                msg_obj.id,
+                reply_markup=build_kb(
+                    ("🔄 Повторить", f"hub:install:{plugin_name}", None),
+                    ("🔙 В главное меню", "hub:main", None),
+                ),
+            )
+            return None
         if not key and not is_free:
             self._edit_html(
                 f"❌ У вас нет ключа для плагина <b>{esc(plugin_label)}</b>.\n\n"
                 f"Отправьте <code>!hub_key {esc(plugin_name)} ВАШ_КЛЮЧ</code> или получите Trial.",
-                c.message.chat.id,
-                c.message.id,
+                msg_obj.chat.id,
+                msg_obj.id,
                 reply_markup=build_kb(
                     ("🎁 Получить Trial", f"hub:trial:{plugin_name}", None),
                     ("🔙 Назад", f"hub:info:{plugin_name}", None),
@@ -437,17 +458,25 @@ class HubController:
             )
             return None
 
+        try:
+            self.bot.answer_callback_query(c.id, f"Скачиваю {plugin_label}...", show_alert=False)
+        except Exception:
+            logger.debug("Early callback ack failed for install:%s", plugin_name, exc_info=True)
+
         self._edit_html(
             f"⏳ <i>Скачиваю и устанавливаю {esc(plugin_label)}...</i>",
-            c.message.chat.id,
-            c.message.id,
+            msg_obj.chat.id,
+            msg_obj.id,
         )
         success, msg = download_plugin(self.cardinal, plugin_name, key, c.from_user)
         if success:
-            after_entry = (load_data().get("installed") or {}).get(plugin_name, {})
+            after_installed = load_data().get("installed")
+            after_entry = after_installed.get(plugin_name) if isinstance(after_installed, dict) else None
+            if not isinstance(after_entry, dict):
+                after_entry = {}
             _save_restart_marker(
                 action="update" if was_installed else "install",
-                chat_id=c.message.chat.id,
+                chat_id=msg_obj.chat.id,
                 plugin_id=plugin_name,
                 plugin_name=plugin_label,
                 target_version=str(after_entry.get("version") or (plugin_info or {}).get("latest_version") or ""),
@@ -455,8 +484,8 @@ class HubController:
             )
 
         text, kb = render_install_result(plugin_name, plugin_label, success, msg, is_update=was_installed)
-        self._edit_html(text, c.message.chat.id, c.message.id, reply_markup=kb)
-        return None
+        self._edit_html(text, msg_obj.chat.id, msg_obj.id, reply_markup=kb)
+        return CB_ANSWERED
 
     def trial_request(self, c: CallbackQuery, plugin_name: Optional[str]) -> Any:
         p = next((x for x in get_plugins() if x.get("id") == plugin_name), None)
@@ -579,7 +608,10 @@ class HubController:
                 target_version = get_disk_hub_pending_version() or ""
             elif pid:
                 p_info = next((x for x in get_plugins() if x.get("id") == pid), None)
-                installed_entry = (load_data().get("installed") or {}).get(pid, {})
+                installed_map = load_data().get("installed")
+                installed_entry = installed_map.get(pid) if isinstance(installed_map, dict) else None
+                if not isinstance(installed_entry, dict):
+                    installed_entry = {}
                 plugin_label = str((p_info or {}).get("name") or installed_entry.get("name") or pid)
                 expected_uuid = str((p_info or {}).get("uuid") or "")
                 target_version = str(installed_entry.get("version") or (p_info or {}).get("latest_version") or "")
@@ -649,7 +681,15 @@ class HubController:
         return CB_ANSWERED
 
     def hub_update_handler(self, c: CallbackQuery) -> Any:
-        self._edit_html("⏳ <i>Скачивание обновления Hub...</i>", c.message.chat.id, c.message.id)
+        msg_obj = getattr(c, "message", None)
+        if msg_obj is None:
+            return self._alert(c, "Сообщение устарело. Откройте /hub заново.")
+        try:
+            self.bot.answer_callback_query(c.id, "Скачивание обновления Hub...", show_alert=False)
+        except Exception:
+            logger.debug("Early callback ack failed for hub_update_handler", exc_info=True)
+
+        self._edit_html("⏳ <i>Скачивание обновления Hub...</i>", msg_obj.chat.id, msg_obj.id)
         ok, message = download_and_update_hub()
         if ok:
             disk_ver = None
@@ -657,14 +697,21 @@ class HubController:
                 disk_ver = extract_py_plugin_metadata(PATHS.hub_file).get("version")
             _save_restart_marker(
                 action="hub",
-                chat_id=c.message.chat.id,
+                chat_id=msg_obj.chat.id,
                 target_version=str(disk_ver or ""),
             )
             text, kb = render_hub_update_result(str(disk_ver) if disk_ver else None)
-            self._edit_html(text, c.message.chat.id, c.message.id, reply_markup=kb)
-            return None
-        self._alert(c, f"❌ {message[:180]}")
-        self.main_menu(c)
+            self._edit_html(text, msg_obj.chat.id, msg_obj.id, reply_markup=kb)
+            return CB_ANSWERED
+        self._edit_html(
+            f"❌ <b>Не удалось обновить Hub</b>\n\n{esc(message)}",
+            msg_obj.chat.id,
+            msg_obj.id,
+            reply_markup=build_kb(
+                ("🔄 Повторить", "hub:update_hub", None),
+                ("🔙 В главное меню", "hub:main", None),
+            ),
+        )
         return CB_ANSWERED
 
     def hub_command(self, message: Message) -> None:
@@ -705,11 +752,15 @@ class HubController:
         )
 
 
-def init_cardinal(cardinal: Cardinal) -> HubController:
+def init_cardinal(cardinal: Optional[Cardinal]) -> Optional[HubController]:
     """Register Cardinal commands, callback routes, and message handlers."""
     configure_file_logging()
+    tg = getattr(cardinal, "telegram", None)
+    bot = getattr(tg, "bot", None)
+    if cardinal is None or tg is None or bot is None:
+        logger.warning("Skipping W1bbex Hub Telegram registration: Telegram bot is disabled or unavailable")
+        return None
     controller = HubController(cardinal)
-    tg, bot = cardinal.telegram, cardinal.telegram.bot
 
     try:
         cardinal.add_telegram_commands(UUID, [("hub", "Управление W1bbex Hub", True)])
@@ -740,11 +791,14 @@ def init_cardinal(cardinal: Cardinal) -> HubController:
     )
     try:
         for cb_name, fn in exact_routes.items():
-            tg.cbq_handler(controller.wrap_cb(fn), func=lambda c, name=cb_name: c.data == name)
+            tg.cbq_handler(
+                controller.wrap_cb(fn),
+                func=lambda c, name=cb_name: isinstance(getattr(c, "data", None), str) and c.data == name,
+            )
         for prefix, fn in prefix_routes:
             tg.cbq_handler(
                 controller.wrap_cb(lambda c, p=prefix, h=fn: h(c, _parse_cb_arg(c.data, p))),
-                func=lambda c, p=prefix: bool(c.data and c.data.startswith(p)),
+                func=lambda c, p=prefix: isinstance(getattr(c, "data", None), str) and c.data.startswith(p),
             )
     except Exception:
         logger.exception("Hub callback registration error")
@@ -766,16 +820,27 @@ def init_cardinal(cardinal: Cardinal) -> HubController:
 
 def custom_init(cardinal: Cardinal) -> None:
     """Cardinal BIND_TO_PRE_INIT entry point."""
+    global _UPDATE_THREAD
     configure_file_logging()
     process_pending_deletions()
     init_cardinal(cardinal)
-    STOP_EVENT.clear()
-    threading.Thread(
-        target=_update_checker_loop,
-        args=(cardinal, STOP_EVENT),
-        name="W1bbexHubUpdateChecker",
-        daemon=True,
-    ).start()
+    with _UPDATE_THREAD_LOCK:
+        if _UPDATE_THREAD is not None and _UPDATE_THREAD.is_alive():
+            return
+        STOP_EVENT.clear()
+        thread = threading.Thread(
+            target=_update_checker_loop,
+            args=(cardinal, STOP_EVENT),
+            name="W1bbexHubUpdateChecker",
+            daemon=True,
+        )
+        _UPDATE_THREAD = thread
+        thread.start()
+
+
+def stop_hub(*_args: Any, **_kwargs: Any) -> None:
+    """Cardinal BIND_TO_DELETE entry point signaling background loops to stop."""
+    STOP_EVENT.set()
 
 
 def post_init_cardinal(cardinal: Cardinal) -> None:

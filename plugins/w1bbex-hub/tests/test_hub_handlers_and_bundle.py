@@ -400,3 +400,34 @@ def test_resources_menu_and_hub_update_restart_flow(
     upd_cbs = [btn.callback_data for row in upd_markup.keyboard for btn in row]
     assert "hub:restart:hub" in upd_cbs
     assert storage.load_data()["pending_restart"]["action"] == "hub"
+
+
+def test_hub_init_guards_missing_telegram_stop_hook_and_offline_catalog(
+    isolated_hub: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    assert handlers.init_cardinal(None) is None
+    assert handlers.init_cardinal(SimpleNamespace(telegram=None)) is None
+
+    runtime.STOP_EVENT.clear()
+    handlers.stop_hub()
+    assert runtime.STOP_EVENT.is_set()
+
+    built_path = hub_build.build(tmp_path / "W1bbexHub_check.py")
+    spec = importlib.util.spec_from_file_location("W1bbexHub_stop_check", built_path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert len(mod.BIND_TO_DELETE) == 1
+
+    # When catalog is unavailable and plugin is not free/known locally, report catalog outage instead of key error
+    cardinal = make_fake_cardinal(authorized_users={42})
+    controller = handlers.HubController(cardinal)
+    monkeypatch.setattr(handlers, "get_plugins", lambda: [])
+    cb = SimpleNamespace(
+        id="cb-offline",
+        from_user=SimpleNamespace(id=42, username="owner"),
+        message=SimpleNamespace(chat=SimpleNamespace(id=99), id=10),
+    )
+    controller.install_plugin(cb, "autosmm")
+    shown_text = cardinal.telegram.bot.edit_message_text.call_args.args[0]
+    assert "временно недоступен" in shown_text

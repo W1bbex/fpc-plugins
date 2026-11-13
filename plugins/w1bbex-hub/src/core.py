@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import copy
 from datetime import datetime
+import hashlib
 import json
 import os
 import platform
@@ -13,6 +14,7 @@ import shutil
 import sys
 import threading
 import time
+import uuid
 from typing import Any, Callable, Optional
 
 import requests
@@ -26,6 +28,7 @@ from .runtime import (
     LOADER_HEADER,
     NO_PROXY,
     PATHS,
+    PLUGIN_FS_LOCK,
     PLUGINS_CACHE,
     SUPPORTED_PLUGIN_EXTENSIONS,
     UUID as HUB_UUID,
@@ -80,16 +83,38 @@ def is_newer_version(latest: str, current: str) -> bool:
 
     try:
         from packaging.version import InvalidVersion, parse as parse_version
+    except ImportError:
+        InvalidVersion = None  # type: ignore[assignment,misc]
+        parse_version = None  # type: ignore[assignment]
 
-        return parse_version(norm_latest) > parse_version(norm_current)
-    except (ImportError, InvalidVersion):
-        def _key(ver: str) -> list[tuple[int, Any]]:
-            return [
-                (0, int(tok)) if tok.isdigit() else (1, tok.lower())
-                for tok in re.split(r"[._-]+", ver)
-            ]
+    if parse_version is not None:
+        try:
+            return parse_version(norm_latest) > parse_version(norm_current)
+        except InvalidVersion:  # type: ignore[misc]
+            pass
 
-        return _key(norm_latest) > _key(norm_current)
+    pre_ranks = {"dev": -4, "a": -3, "alpha": -3, "b": -2, "beta": -2, "rc": -1, "c": -1}
+    semver_re = re.compile(
+        r"^([0-9]+(?:\.[0-9]+)*)(?:[._-]?(dev|alpha|beta|rc|a|b|c)[._-]?([0-9]*))?$",
+        re.IGNORECASE,
+    )
+
+    def _key(ver: str) -> tuple[Any, ...]:
+        m = semver_re.match(ver)
+        if m:
+            nums = tuple(int(part) for part in m.group(1).split("."))
+            tag = (m.group(2) or "").lower()
+            if not tag:
+                return (1, nums, 0, 0)
+            return (1, nums, pre_ranks[tag], int(m.group(3) or 0))
+        tokens = [
+            (0, int(tok)) if tok.isdigit() else (-1, tok.lower())
+            for tok in re.split(r"[._-]+", ver)
+            if tok
+        ]
+        return (0, tuple(tokens))
+
+    return _key(norm_latest) > _key(norm_current)
 
 
 def get_plugins(force_refresh: bool = False) -> list[dict[str, Any]]:
@@ -243,7 +268,9 @@ def remove_hub_stub(stub_path: Optional[str]) -> tuple[bool, Optional[str]]:
 
 def clean_old_plugin(plugin_name: str, new_stub_path: Optional[str] = None) -> None:
     """Remove old stub file when a plugin's stub path changes during an update."""
-    old_stub = (load_data().get("installed") or {}).get(plugin_name, {}).get("stub_path")
+    installed = load_data().get("installed")
+    entry = installed.get(plugin_name) if isinstance(installed, dict) else None
+    old_stub = entry.get("stub_path") if isinstance(entry, dict) else None
     if old_stub and (
         new_stub_path is None
         or os.path.normcase(os.path.abspath(old_stub)) != os.path.normcase(os.path.abspath(new_stub_path))
@@ -399,6 +426,7 @@ def generate_loader(
     loader_code = (
         f"{LOADER_HEADER}\n"
         "import os\n"
+        "import sys\n"
         "import importlib.util\n"
         "import uuid\n\n"
         f"base_dir = os.path.join(os.path.dirname(__file__), 'w1bbex', {repr(safe_folder)})\n"
@@ -415,7 +443,12 @@ def generate_loader(
         "if spec is None or spec.loader is None:\n"
         "    raise ImportError(f'Не удалось создать загрузчик для {pyd_path}')\n"
         "module = importlib.util.module_from_spec(spec)\n"
-        "spec.loader.exec_module(module)\n\n"
+        "sys.modules[spec.name] = module\n"
+        "try:\n"
+        "    spec.loader.exec_module(module)\n"
+        "except Exception:\n"
+        "    sys.modules.pop(spec.name, None)\n"
+        "    raise\n\n"
         "for name in dir(module):\n"
         "    if not name.startswith('__'):\n"
         "        globals()[name] = getattr(module, name)\n\n"
@@ -423,8 +456,10 @@ def generate_loader(
         f"VERSION = {repr(api_version)}\n"
         f"DESCRIPTION = {repr(api_desc)}\n"
         f"CREDITS = getattr(module, 'CREDITS', {repr(CREDITS)})\n"
-        "UUID = getattr(module, 'UUID', str(uuid.uuid4()))\n"
+        f"_FALLBACK_UUID = str(uuid.uuid5(uuid.NAMESPACE_URL, {repr(f'w1bbex:{plugin_name}')}))\n"
+        "UUID = getattr(module, 'UUID', _FALLBACK_UUID)\n"
         "SETTINGS_PAGE = getattr(module, 'SETTINGS_PAGE', False)\n"
+        "BIND_TO_DELETE = getattr(module, 'BIND_TO_DELETE', None)\n"
     )
     atomic_write_bytes(loader_path, loader_code.encode("utf-8"))
     return loader_path
@@ -479,8 +514,32 @@ def download_plugin(
         filename = f"{sanitize_segment(base_filename[:-len(ext)], plugin_name)}{ext}"
 
     plugin_info = next((x for x in get_plugins() if x.get("id") == plugin_name), None)
-    plugin_label = plugin_label_from_info(plugin_name, plugin_info)
-    version = str(plugin_info.get("latest_version", "v1.0")) if plugin_info else "v1.0"
+    installed_map = load_data().get("installed")
+    old_entry = installed_map.get(plugin_name) if isinstance(installed_map, dict) else None
+    if not isinstance(old_entry, dict):
+        old_entry = {}
+
+    expected_sha = (
+        resp.headers.get("X-File-SHA256")
+        or resp.headers.get("X-SHA256")
+        or (plugin_info.get("sha256") if isinstance(plugin_info, dict) else None)
+    )
+    if expected_sha:
+        actual_sha = hashlib.sha256(resp.content).hexdigest().lower()
+        if actual_sha != str(expected_sha).strip().lower():
+            return False, "Контрольная сумма (SHA-256) загруженного файла не совпадает."
+
+    if filename.lower().endswith(".py"):
+        try:
+            source_text = resp.content.decode("utf-8")
+            ast.parse(source_text, filename=filename)
+        except UnicodeDecodeError:
+            return False, "Загруженный .py файл поврежден (некорректная кодировка UTF-8)."
+        except SyntaxError as exc:
+            return False, f"Загруженный .py файл содержит синтаксическую ошибку (строка {exc.lineno})."
+
+    plugin_label = str(old_entry.get("name") or plugin_name) if not plugin_info else plugin_label_from_info(plugin_name, plugin_info)
+    version = str(plugin_info.get("latest_version") or old_entry.get("version") or "v1.0") if plugin_info else str(old_entry.get("version") or "v1.0")
     if filename.lower().endswith(".py"):
         folder_name = sanitize_segment(plugin_label, sanitize_segment(plugin_name, "plugin"))
     else:
@@ -493,42 +552,43 @@ def download_plugin(
         if plugin_info
         else "Загружено через W1bbex Hub"
     )
-    old_bin_dir = (load_data().get("installed") or {}).get(plugin_name, {}).get("bin_dir")
+    old_bin_dir = old_entry.get("bin_dir")
 
     try:
-        atomic_write_bytes(save_path, resp.content)
-        save_abs = os.path.normcase(os.path.abspath(save_path))
-        if os.path.isdir(plugin_dir):
-            for entry_name in os.listdir(plugin_dir):
-                if entry_name.lower().endswith(SUPPORTED_PLUGIN_EXTENSIONS):
-                    candidate = os.path.join(plugin_dir, entry_name)
-                    if os.path.normcase(os.path.abspath(candidate)) != save_abs and os.path.isfile(candidate):
-                        try:
-                            os.remove(candidate)
-                        except OSError:
-                            logger.warning("Could not remove stale plugin file %s", candidate, exc_info=True)
+        with PLUGIN_FS_LOCK:
+            atomic_write_bytes(save_path, resp.content)
+            save_abs = os.path.normcase(os.path.abspath(save_path))
+            if os.path.isdir(plugin_dir):
+                for entry_name in os.listdir(plugin_dir):
+                    if entry_name.lower().endswith(SUPPORTED_PLUGIN_EXTENSIONS):
+                        candidate = os.path.join(plugin_dir, entry_name)
+                        if os.path.normcase(os.path.abspath(candidate)) != save_abs and os.path.isfile(candidate):
+                            try:
+                                os.remove(candidate)
+                            except OSError:
+                                logger.warning("Could not remove stale plugin file %s", candidate, exc_info=True)
 
-        extracted_meta = extract_py_plugin_metadata(save_path) if save_path.lower().endswith(".py") else {}
-        target_uuid = (plugin_info.get("uuid") if plugin_info else None) or extracted_meta.get("uuid")
-        target_credits = (
-            (plugin_info.get("credits") if plugin_info else None)
-            or extracted_meta.get("credits")
-            or "@w1bbex"
-        )
-        archived_files = archive_legacy_plugins(target_uuid=target_uuid, expected_credits=target_credits)
-
-        loader_path = generate_loader(plugin_name, plugin_label, folder_name, api_name, version, api_desc)
-        clean_old_plugin(plugin_name, new_stub_path=loader_path)
-        if old_bin_dir and os.path.normcase(os.path.abspath(old_bin_dir)) != os.path.normcase(
-            os.path.abspath(plugin_dir)
-        ):
-            queue_pending_deletion(old_bin_dir)
-        update_data(
-            lambda d: d.setdefault("installed", {}).__setitem__(
-                plugin_name,
-                {"name": plugin_label, "version": version, "stub_path": loader_path, "bin_dir": plugin_dir},
+            extracted_meta = extract_py_plugin_metadata(save_path) if save_path.lower().endswith(".py") else {}
+            target_uuid = (plugin_info.get("uuid") if plugin_info else None) or extracted_meta.get("uuid")
+            target_credits = (
+                (plugin_info.get("credits") if plugin_info else None)
+                or extracted_meta.get("credits")
+                or "@w1bbex"
             )
-        )
+            archived_files = archive_legacy_plugins(target_uuid=target_uuid, expected_credits=target_credits)
+
+            loader_path = generate_loader(plugin_name, plugin_label, folder_name, api_name, version, api_desc)
+            clean_old_plugin(plugin_name, new_stub_path=loader_path)
+            if old_bin_dir and os.path.normcase(os.path.abspath(old_bin_dir)) != os.path.normcase(
+                os.path.abspath(plugin_dir)
+            ):
+                queue_pending_deletion(old_bin_dir)
+            update_data(
+                lambda d: d.setdefault("installed", {}).__setitem__(
+                    plugin_name,
+                    {"name": plugin_label, "version": version, "stub_path": loader_path, "bin_dir": plugin_dir},
+                )
+            )
     except PermissionError:
         logger.exception("Plugin binary locked during reinstall of %s", plugin_name)
         return (
@@ -611,9 +671,10 @@ def collect_pending_updates(data: dict[str, Any], plugins: list[dict[str, Any]],
 
     for p in plugins:
         pid = p.get("id", "")
-        if pid not in installed or not p.get("notify_users", True):
+        entry = installed.get(pid)
+        if not isinstance(entry, dict) or not p.get("notify_users", True):
             continue
-        curr_ver = str(installed[pid].get("version", "v1.0"))
+        curr_ver = str(entry.get("version", "v1.0"))
         latest = str(p.get("latest_version", "v1.0"))
         if not is_newer_version(latest, curr_ver):
             continue
@@ -812,35 +873,36 @@ def inspect_plugin_state(
 
 def delete_plugin_files(plugin_name: str) -> dict[str, Any]:
     """Remove Hub loader stub, delete or defer plugin binaries, and preserve license/user storage."""
-    data = load_data()
-    installed = data.get("installed") if isinstance(data.get("installed"), dict) else {}
-    keys = data.get("keys") if isinstance(data.get("keys"), dict) else {}
-    if plugin_name not in installed:
-        return {"ok": False, "error": "Плагин не установлен или уже удален."}
+    with PLUGIN_FS_LOCK:
+        data = load_data()
+        installed = data.get("installed") if isinstance(data.get("installed"), dict) else {}
+        keys = data.get("keys") if isinstance(data.get("keys"), dict) else {}
+        info = installed.get(plugin_name)
+        if not isinstance(info, dict):
+            return {"ok": False, "error": "Плагин не установлен или уже удален."}
 
-    info = installed[plugin_name]
-    stub_path = info.get("stub_path")
-    bin_dir = info.get("bin_dir")
+        stub_path = info.get("stub_path")
+        bin_dir = info.get("bin_dir")
 
-    stub_ok, denial_reason = remove_hub_stub(stub_path)
-    if not stub_ok and denial_reason:
-        return {"ok": False, "error": denial_reason}
+        stub_ok, denial_reason = remove_hub_stub(stub_path)
+        if not stub_ok and denial_reason:
+            return {"ok": False, "error": denial_reason}
 
-    locked = queue_pending_deletion(bin_dir)
-    update_data(lambda cur: (cur.get("installed") or {}).pop(plugin_name, None))
+        locked = queue_pending_deletion(bin_dir)
+        update_data(lambda cur: (cur.get("installed") or {}).pop(plugin_name, None))
 
-    return {
-        "ok": True,
-        "plugin_id": plugin_name,
-        "plugin_name": str(info.get("name") or plugin_name),
-        "version": str(info.get("version") or ""),
-        "stub_path": str(stub_path or ""),
-        "stub_name": os.path.basename(str(stub_path)) if stub_path else "",
-        "bin_dir": str(bin_dir or ""),
-        "bin_dir_name": os.path.basename(str(bin_dir)) if bin_dir else "",
-        "bin_deferred": locked,
-        "kept_key": bool(keys.get(plugin_name)),
-    }
+        return {
+            "ok": True,
+            "plugin_id": plugin_name,
+            "plugin_name": str(info.get("name") or plugin_name),
+            "version": str(info.get("version") or ""),
+            "stub_path": str(stub_path or ""),
+            "stub_name": os.path.basename(str(stub_path)) if stub_path else "",
+            "bin_dir": str(bin_dir or ""),
+            "bin_dir_name": os.path.basename(str(bin_dir)) if bin_dir else "",
+            "bin_deferred": locked,
+            "kept_key": bool(keys.get(plugin_name)),
+        }
 
 
 def trigger_cardinal_restart(

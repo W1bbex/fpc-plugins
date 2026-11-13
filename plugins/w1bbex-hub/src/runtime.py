@@ -33,6 +33,7 @@ UPDATE_CHECK_INTERVAL_SECONDS = 1800.0
 UPDATE_CHECK_INITIAL_DELAY_SECONDS = 10.0
 
 DELETE_LOCK = threading.RLock()
+PLUGIN_FS_LOCK = threading.RLock()
 CACHE_LOCK = threading.RLock()
 DATA_LOCK = threading.RLock()
 LOG_LOCK = threading.Lock()

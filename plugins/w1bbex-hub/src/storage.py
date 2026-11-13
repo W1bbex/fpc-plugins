@@ -39,6 +39,19 @@ def atomic_write_json(target_path: str, payload: Any) -> None:
     atomic_write_bytes(target_path, raw)
 
 
+def _is_within_managed_plugins_dir(target_path: Optional[str]) -> bool:
+    """Return True only when target_path points to a subdirectory inside plugins/w1bbex/."""
+    if not target_path or not isinstance(target_path, str):
+        return False
+    w1bbex_root = os.path.realpath(os.path.join(PATHS.plugins_dir, "w1bbex"))
+    target_real = os.path.realpath(target_path)
+    try:
+        common = os.path.commonpath([w1bbex_root, target_real])
+    except ValueError:
+        return False
+    return common == w1bbex_root and target_real != w1bbex_root
+
+
 def process_pending_deletions() -> None:
     """Retry removing plugin directories deferred while binary files were locked."""
     pending_file = PATHS.pending_delete_file
@@ -56,6 +69,9 @@ def process_pending_deletions() -> None:
         still_pending: list[str] = []
         for path in pending:
             if isinstance(path, str) and path and os.path.exists(path):
+                if not _is_within_managed_plugins_dir(path):
+                    logger.warning("Refusing deferred deletion outside plugins/w1bbex/: %s", path)
+                    continue
                 try:
                     shutil.rmtree(path)
                     logger.info("Removed deferred plugin folder: %s", path)
@@ -76,14 +92,18 @@ def queue_pending_deletion(target_dir: Optional[str]) -> bool:
     """Delete target_dir immediately or queue for next startup if locked. Returns True if deferred."""
     if not target_dir or not os.path.exists(target_dir):
         return False
-    try:
-        shutil.rmtree(target_dir)
+    if not _is_within_managed_plugins_dir(target_dir):
+        logger.warning("Refusing deletion outside plugins/w1bbex/: %s", target_dir)
         return False
-    except OSError as exc:
-        logger.warning("Deferring deletion of locked folder %s: %s", target_dir, exc)
 
     pending_file = PATHS.pending_delete_file
     with DELETE_LOCK:
+        try:
+            shutil.rmtree(target_dir)
+            return False
+        except OSError as exc:
+            logger.warning("Deferring deletion of locked folder %s: %s", target_dir, exc)
+
         pending: list[str] = []
         if os.path.exists(pending_file):
             try:
@@ -96,11 +116,11 @@ def queue_pending_deletion(target_dir: Optional[str]) -> bool:
         if target_dir not in pending:
             pending.append(target_dir)
         atomic_write_json(pending_file, pending)
-    return True
+        return True
 
 
 def load_data() -> dict[str, Any]:
-    """Load Hub config from disk, backing up corrupt JSON files instead of silently wiping them."""
+    """Load Hub config from disk, moving corrupt JSON aside once instead of re-copying every read."""
     data_file = PATHS.data_file
     with DATA_LOCK:
         if not os.path.exists(data_file):
@@ -122,10 +142,15 @@ def load_data() -> dict[str, Any]:
 
         corrupt_backup = f"{data_file}.corrupt.{int(time.time())}"
         try:
-            shutil.copy2(data_file, corrupt_backup)
+            os.replace(data_file, corrupt_backup)
         except OSError:
-            logger.warning("Failed to backup corrupt config to %s", corrupt_backup, exc_info=True)
-        return {"keys": {}}
+            logger.warning("Failed to isolate corrupt config to %s", corrupt_backup, exc_info=True)
+        default_data = {"keys": {}}
+        try:
+            atomic_write_json(data_file, default_data)
+        except OSError:
+            logger.warning("Could not reset corrupt config at %s", data_file, exc_info=True)
+        return default_data
 
 
 def save_data(data: dict[str, Any]) -> None:

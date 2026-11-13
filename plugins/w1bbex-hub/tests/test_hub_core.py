@@ -410,3 +410,84 @@ def test_invoke_plugin_command_dispatches_and_blocks_disabled(isolated_hub: Path
     assert cmd == "autosmm"
     assert received == [("/autosmm", 42)]
     assert base_msg.text == "menu"
+
+
+def test_generated_loader_supports_future_annotations_dataclass_and_defaults(isolated_hub: Path) -> None:
+    import sys
+
+    plugin_dir = isolated_hub / "plugins" / "w1bbex" / "DataclassPlugin"
+    plugin_dir.mkdir(parents=True, exist_ok=True)
+    (plugin_dir / "dc_plugin.py").write_text(
+        "from __future__ import annotations\n"
+        "from dataclasses import dataclass\n\n"
+        "@dataclass\n"
+        "class Item:\n"
+        "    title: str\n"
+        "    qty: int = 1\n",
+        encoding="utf-8",
+    )
+
+    loader_a = core.generate_loader("dc_plugin", "DataclassPlugin", "DataclassPlugin", "DC", "1.0", "Desc")
+    loader_b = core.generate_loader("dc_plugin", "DataclassPlugin", "DataclassPlugin", "DC", "1.0", "Desc")
+
+    mods = []
+    for idx, lpath in enumerate((loader_a, loader_b)):
+        mod_name = f"test_dc_stub_{idx}"
+        try:
+            spec = importlib.util.spec_from_file_location(mod_name, lpath)
+            assert spec is not None and spec.loader is not None
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            mods.append(mod)
+        finally:
+            sys.modules.pop(mod_name, None)
+            sys.modules.pop("DataclassPlugin", None)
+
+    assert mods[0].Item(title="ok").qty == 1
+    assert mods[0].UUID == mods[1].UUID
+    assert hasattr(mods[0], "BIND_TO_DELETE")
+
+
+def test_download_plugin_rejects_broken_py_and_sha256_mismatch(
+    isolated_hub: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hashlib
+
+    runtime.PLUGINS_CACHE["items"] = [
+        {"id": "demo", "name": "Demo", "latest_version": "1.0", "is_free": True, "sha256": hashlib.sha256(b"NAME = 'Demo'\n").hexdigest()}
+    ]
+    runtime.PLUGINS_CACHE["fetched_at"] = 9e12
+
+    bad_html = MagicMock(status_code=200, headers={"Content-Type": "text/plain", "X-Filename": "demo.py"}, content=b"<html>bad</html>")
+    bad_sha_resp = MagicMock(
+        status_code=200,
+        headers={"Content-Type": "text/plain", "X-Filename": "demo.py"},
+        content=b"NAME = 'Tampered'\n",
+    )
+    monkeypatch.setattr(core.requests, "post", lambda *a, **kw: bad_sha_resp)
+    ok_sha, msg_sha = core.download_plugin(make_fake_cardinal(), "demo", None, SimpleNamespace(id=1, username="u"))
+    assert ok_sha is False
+    assert "SHA-256" in msg_sha
+
+    runtime.PLUGINS_CACHE["items"][0].pop("sha256")
+    monkeypatch.setattr(core.requests, "post", lambda *a, **kw: bad_html)
+    ok_py, _ = core.download_plugin(make_fake_cardinal(), "demo", None, SimpleNamespace(id=1, username="u"))
+    assert ok_py is False
+    assert not (isolated_hub / "plugins" / "Demo.py").exists()
+
+
+def test_is_newer_version_prerelease_fallback_without_packaging(monkeypatch: pytest.MonkeyPatch) -> None:
+    import builtins
+
+    real_import = builtins.__import__
+
+    def no_packaging(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "packaging.version":
+            raise ImportError("missing packaging")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", no_packaging)
+    assert core.is_newer_version("1.0.0", "1.0.0a1") is True
+    assert core.is_newer_version("1.0.0a1", "1.0.0") is False
+    assert core.is_newer_version("1.0.1", "1.0.0") is True
+    assert core.is_newer_version("0.3.0", "0.3.0") is False

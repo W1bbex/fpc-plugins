@@ -88,3 +88,25 @@ def test_pending_restart_persistence_and_ttl_expiry(isolated_hub: Path, monkeypa
     now[0] = 1500.0
     assert storage.pop_pending_restart(300.0) is None
     assert "pending_restart" not in storage.load_data()
+
+
+def test_corrupt_json_creates_single_backup_and_rejects_outside_deletions(isolated_hub: Path) -> None:
+    data_path = Path(runtime.PATHS.data_file)
+    data_path.parent.mkdir(parents=True, exist_ok=True)
+    data_path.write_text("{corrupt json", encoding="utf-8")
+    assert storage.load_data() == {"keys": {}}
+    assert storage.load_data() == {"keys": {}}
+    backups = list(Path(runtime.PATHS.hub_folder).glob("config.json.corrupt.*"))
+    assert len(backups) == 1
+
+    outside_dir = isolated_hub / "storage" / "w1bbex" / "ImportantData"
+    outside_dir.mkdir(parents=True, exist_ok=True)
+    secret_file = outside_dir / "keep.txt"
+    secret_file.write_text("precious", encoding="utf-8")
+
+    assert storage.queue_pending_deletion(str(outside_dir)) is False
+    assert secret_file.is_file()
+
+    Path(runtime.PATHS.pending_delete_file).write_text(json.dumps([str(outside_dir)]), encoding="utf-8")
+    storage.process_pending_deletions()
+    assert secret_file.is_file()
