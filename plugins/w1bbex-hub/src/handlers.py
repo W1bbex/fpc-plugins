@@ -40,34 +40,53 @@ from .runtime import (
     logger,
 )
 from .storage import (
+    clear_pending_restart,
     load_data,
-    pop_pending_restart,
+    peek_pending_restart,
     process_pending_deletions,
     save_pending_restart,
     update_data,
 )
 from .ui import (
-    build_kb,
     esc,
+    has_styled_buttons,
+    rebuild_notification_toggle_markup,
+    render_activate_key_prompt,
+    render_catalog_unavailable,
+    render_delete_confirm,
     render_delete_result,
+    render_hub_update_error,
     render_hub_update_result,
     render_install_result,
+    render_key_activated,
     render_licenses,
     render_main_menu,
+    render_missing_key_notice,
     render_plugin_info,
     render_plugins_menu,
     render_post_restart_report,
     render_resources,
+    render_restart_in_progress,
+    render_trial_activated,
     render_trial_prompt,
     render_update_notification,
+    strip_button_styles,
 )
 
 if TYPE_CHECKING:
     from cardinal import Cardinal
 
 
+POST_RESTART_FALLBACK_DELAY_SECONDS = 8.0
+
 _UPDATE_THREAD_LOCK = threading.Lock()
 _UPDATE_THREAD: Optional[threading.Thread] = None
+_POST_RESTART_LOCK = threading.Lock()
+_POST_RESTART_ACTIVE = False
+_POST_INIT_EVENT = threading.Event()
+_POST_RESTART_WAKE_EVENT = threading.Event()
+_FALLBACK_THREAD_LOCK = threading.Lock()
+_FALLBACK_THREAD: Optional[threading.Thread] = None
 
 
 def _is_authorized(tg: Any, user: Any) -> bool:
@@ -79,16 +98,31 @@ def _is_authorized(tg: Any, user: Any) -> bool:
     return False
 
 
-def _call_tg_html(invoke: Callable[[str], Any], text: str, ignore_not_modified: bool = False) -> Any:
+def _call_tg_html(
+    invoke: Callable[[str, Any], Any],
+    text: str,
+    reply_markup: Any = None,
+    ignore_not_modified: bool = False,
+) -> Any:
+    """Invoke a Telegram HTML send/edit callable with entity-escape and style fallbacks."""
     try:
-        return invoke(text)
+        return invoke(text, reply_markup)
     except Exception as exc:
         lower = str(exc).lower()
         if ignore_not_modified and "message is not modified" in lower:
             return None
         if "can't parse entities" in lower:
             logger.warning("Telegram rejected HTML markup; retrying escaped text: %s", exc)
-            return invoke(html.escape(text))
+            try:
+                return invoke(html.escape(text), reply_markup)
+            except Exception as exc2:
+                if reply_markup is not None and "style" in str(exc2).lower() and has_styled_buttons(reply_markup):
+                    logger.warning("Telegram rejected button style; retrying plain markup: %s", exc2)
+                    return invoke(html.escape(text), strip_button_styles(reply_markup))
+                raise
+        if reply_markup is not None and "style" in lower and has_styled_buttons(reply_markup):
+            logger.warning("Telegram rejected button style; retrying without style: %s", exc)
+            return invoke(text, strip_button_styles(reply_markup))
         raise
 
 
@@ -119,6 +153,7 @@ def _save_restart_marker(
     expected_uuid: str = "",
     stub_path: str = "",
     bin_dir: str = "",
+    message_id: Any = None,
 ) -> None:
     if not chat_id:
         return
@@ -127,6 +162,7 @@ def _save_restart_marker(
             {
                 "action": action,
                 "chat_id": chat_id,
+                "message_id": message_id,
                 "plugin_id": plugin_id,
                 "plugin_name": plugin_name,
                 "target_version": target_version,
@@ -174,11 +210,16 @@ def run_update_check_cycle(cardinal: Any) -> int:
         return 0
 
     bot = cardinal.telegram.bot
+    notify_enabled = bool(data.get("notify_updates", True))
     sent_count = 0
     for update in pending:
-        text, kb = render_update_notification(update)
+        text, kb = render_update_notification(update, notify_enabled=notify_enabled)
         try:
-            _call_tg_html(lambda t: bot.send_message(tg_id, t, parse_mode="HTML", reply_markup=kb), text)
+            _call_tg_html(
+                lambda t, rm: bot.send_message(tg_id, t, parse_mode="HTML", reply_markup=rm),
+                text,
+                reply_markup=kb,
+            )
         except Exception as exc:
             logger.error("Failed sending update notification for %s: %s", update["id"], exc)
             continue
@@ -205,72 +246,127 @@ def _update_checker_loop(cardinal: Any, stop_event: threading.Event) -> None:
             break
 
 
-def process_post_restart_notice(cardinal: Any) -> bool:
-    """Consume pending_restart, verify live Cardinal/disk state, and notify the owner in Telegram."""
-    try:
-        pending = pop_pending_restart(RESTART_NOTICE_TTL_SECONDS)
-    except OSError:
-        logger.exception("Failed reading pending_restart during post_init")
-        return False
-    if not pending:
-        return False
+def process_post_restart_notice(cardinal: Any, retry_delay: float = 2.0) -> bool:
+    """Inspect pending_restart, verify Cardinal/disk state, notify the owner, then clear marker."""
+    global _POST_RESTART_ACTIVE
+    configure_file_logging()
 
-    data = load_data()
-    chat_id = pending.get("chat_id") or data.get("owner_tg_id")
-    if not chat_id:
-        return False
-
-    action = str(pending.get("action") or "general")
-    pid = str(pending.get("plugin_id") or "")
-    installed = data.get("installed") if isinstance(data.get("installed"), dict) else {}
-    keys = data.get("keys") if isinstance(data.get("keys"), dict) else {}
-
-    state: Optional[dict[str, Any]] = None
-    disk_still_exists = False
-
-    if action == "hub":
-        target_ver = str(pending.get("target_version") or "")
-        pending["hub_mismatch"] = bool(target_ver and is_newer_version(target_ver, VERSION))
-    elif pid:
-        catalog = get_plugins()
-        p_info = next((x for x in catalog if x.get("id") == pid), None) or {
-            "id": pid,
-            "name": pending.get("plugin_name") or pid,
-            "uuid": pending.get("expected_uuid") or "",
-            "latest_version": pending.get("target_version") or "",
-        }
-        state = inspect_plugin_state(cardinal, p_info, installed, keys)
-        if action == "delete":
-            disk_still_exists = any(
-                bool(path and os.path.exists(str(path)))
-                for path in (pending.get("stub_path"), pending.get("bin_dir"))
-            )
-
-    text, kb = render_post_restart_report(
-        pending=pending,
-        state=state,
-        running_hub_version=VERSION,
-        disk_still_exists=disk_still_exists,
-    )
-    bot = getattr(getattr(cardinal, "telegram", None), "bot", None)
-    if bot is None:
-        return False
+    with _POST_RESTART_LOCK:
+        if _POST_RESTART_ACTIVE:
+            return False
+        try:
+            pending = peek_pending_restart(RESTART_NOTICE_TTL_SECONDS)
+        except OSError:
+            logger.exception("Failed reading pending_restart during post_init")
+            return False
+        if not pending:
+            return False
+        _POST_RESTART_ACTIVE = True
 
     try:
-        _call_tg_html(
-            lambda t: bot.send_message(
-                chat_id,
-                t,
-                parse_mode="HTML",
-                reply_markup=kb,
-                disable_web_page_preview=True,
-            ),
-            text,
-        )
-        return True
-    except Exception:
-        logger.exception("Failed sending post-restart Hub report to chat %s", chat_id)
+        try:
+            data = load_data()
+            chat_id = pending.get("chat_id") or data.get("owner_tg_id")
+            if not chat_id:
+                clear_pending_restart()
+                return False
+
+            bot = getattr(getattr(cardinal, "telegram", None), "bot", None)
+            if bot is None:
+                logger.warning("Post-restart Hub report deferred: Telegram bot unavailable")
+                return False
+
+            action = str(pending.get("action") or "general")
+            pid = str(pending.get("plugin_id") or "")
+            installed = data.get("installed") if isinstance(data.get("installed"), dict) else {}
+            keys = data.get("keys") if isinstance(data.get("keys"), dict) else {}
+
+            state: Optional[dict[str, Any]] = None
+            disk_still_exists = False
+
+            if action == "hub":
+                target_ver = str(pending.get("target_version") or "")
+                pending["hub_mismatch"] = bool(target_ver and is_newer_version(target_ver, VERSION))
+            elif pid:
+                catalog = get_plugins()
+                p_info = next((x for x in catalog if x.get("id") == pid), None) or {
+                    "id": pid,
+                    "name": pending.get("plugin_name") or pid,
+                    "uuid": pending.get("expected_uuid") or "",
+                    "latest_version": pending.get("target_version") or "",
+                }
+                state = inspect_plugin_state(cardinal, p_info, installed, keys)
+                if action == "delete":
+                    disk_still_exists = any(
+                        bool(path and os.path.exists(str(path)))
+                        for path in (pending.get("stub_path"), pending.get("bin_dir"))
+                    )
+
+            if (action == "hub" and not pending.get("hub_mismatch")) or (action == "general" and not pid):
+                banner = (
+                    f"✅ <b>W1bbex Hub обновлён до v{esc(VERSION)}</b>"
+                    if action == "hub"
+                    else "✅ <b>FunPay Cardinal перезапущен</b>"
+                )
+                plugin_states, cur_data = _build_plugin_states(cardinal)
+                cur_keys = cur_data.get("keys") if isinstance(cur_data.get("keys"), dict) else {}
+                text, kb = render_main_menu(
+                    plugin_states=plugin_states,
+                    sys_info=get_sys_info(),
+                    notify_updates=bool(cur_data.get("notify_updates", True)),
+                    hub_latest_version=VERSION,
+                    has_hub_update=False,
+                    hub_pending_version=get_disk_hub_pending_version(),
+                    keys_count=len(cur_keys),
+                    notice_banner=banner,
+                )
+            else:
+                text, kb = render_post_restart_report(
+                    pending=pending,
+                    state=state,
+                    running_hub_version=VERSION,
+                    disk_still_exists=disk_still_exists,
+                )
+        except Exception:
+            logger.exception("Failed preparing post-restart Hub report")
+            return False
+
+        old_msg_id = pending.get("message_id")
+        if old_msg_id:
+            try:
+                bot.delete_message(chat_id, old_msg_id)
+            except Exception:
+                logger.debug("Could not delete transient restart message %s", old_msg_id, exc_info=True)
+
+        for attempt in range(2):
+            try:
+                _call_tg_html(
+                    lambda t, rm: bot.send_message(
+                        chat_id,
+                        t,
+                        parse_mode="HTML",
+                        reply_markup=rm,
+                        disable_web_page_preview=True,
+                    ),
+                    text,
+                    reply_markup=kb,
+                )
+                try:
+                    clear_pending_restart()
+                except OSError:
+                    logger.exception("Failed clearing pending_restart after successful delivery")
+                logger.info("Sent post-restart Hub notice action=%s pid=%s chat_id=%s", action, pid or "-", chat_id)
+                return True
+            except Exception:
+                if attempt == 0 and retry_delay > 0:
+                    logger.warning("Retrying post-restart Hub notice delivery to chat %s", chat_id, exc_info=True)
+                    time.sleep(retry_delay)
+                else:
+                    logger.exception("Failed sending post-restart Hub report to chat %s", chat_id)
         return False
+    finally:
+        with _POST_RESTART_LOCK:
+            _POST_RESTART_ACTIVE = False
 
 
 class HubController:
@@ -286,17 +382,45 @@ class HubController:
         return CB_ANSWERED
 
     def _send_html(self, chat_id: int, text: str, **kw: Any) -> Any:
-        return _call_tg_html(lambda t: self.bot.send_message(chat_id, t, parse_mode="HTML", **kw), text)
+        markup = kw.pop("reply_markup", None)
+        return _call_tg_html(
+            lambda t, rm: self.bot.send_message(
+                chat_id,
+                t,
+                parse_mode="HTML",
+                **({**kw, "reply_markup": rm} if rm is not None else kw),
+            ),
+            text,
+            reply_markup=markup,
+        )
 
     def _edit_html(self, text: str, chat_id: int, message_id: int, **kw: Any) -> Any:
+        markup = kw.pop("reply_markup", None)
         return _call_tg_html(
-            lambda t: self.bot.edit_message_text(t, chat_id, message_id, parse_mode="HTML", **kw),
+            lambda t, rm: self.bot.edit_message_text(
+                t,
+                chat_id,
+                message_id,
+                parse_mode="HTML",
+                **({**kw, "reply_markup": rm} if rm is not None else kw),
+            ),
             text,
+            reply_markup=markup,
             ignore_not_modified=True,
         )
 
     def _reply_html(self, message: Any, text: str, **kw: Any) -> Any:
-        return _call_tg_html(lambda t: self.bot.reply_to(message, t, parse_mode="HTML", **kw), text)
+        markup = kw.pop("reply_markup", None)
+        return _call_tg_html(
+            lambda t, rm: self.bot.reply_to(
+                message,
+                t,
+                parse_mode="HTML",
+                **({**kw, "reply_markup": rm} if rm is not None else kw),
+            ),
+            text,
+            reply_markup=markup,
+        )
 
     def wrap_cb(self, func: Callable[[CallbackQuery], Any]) -> Callable[[CallbackQuery], None]:
         def wrapper(c: CallbackQuery) -> None:
@@ -337,12 +461,8 @@ class HubController:
         self.main_menu(c)
 
     def activate_key_handler(self, c: CallbackQuery) -> None:
-        msg = self._send_html(
-            c.message.chat.id,
-            "🔑 <b>Активация ключа</b>\n\nВведите ваш лицензионный ключ в чат:\n"
-            "<i>(Сервер автоматически определит, для какого плагина ключ)</i>",
-            reply_markup=build_kb(("⬅️ Отмена", "hub:cancel_step", None)),
-        )
+        text, kb = render_activate_key_prompt()
+        msg = self._send_html(c.message.chat.id, text, reply_markup=kb)
         self.bot.register_next_step_handler(msg, lambda m: self._process_key_input(m, c))
 
     def _process_key_input(self, message: Message, orig_callback: CallbackQuery) -> None:
@@ -391,16 +511,8 @@ class HubController:
             self._reply_html(message, f"❌ <b>Ошибка сохранения ключа:</b> {esc(exc)}")
             return
 
-        kb = build_kb(
-            (f"⬇️ Скачать {plugin_label}", f"hub:install:{plugin_name}", None),
-            ("🔙 Главное меню", "hub:main", None),
-        )
-        self._reply_html(
-            message,
-            f"✅ <b>Ключ активирован!</b>\n\n🔌 Плагин: <b>{esc(plugin_label)}</b>\n"
-            f"🔑 Ключ: <code>{esc(key)}</code>\n\nМожете сразу скачать плагин:",
-            reply_markup=kb,
-        )
+        text, kb = render_key_activated(plugin_name, plugin_label, key)
+        self._reply_html(message, text, reply_markup=kb)
 
     def plugin_info_menu(self, c: CallbackQuery, plugin_name: Optional[str]) -> Any:
         p = next((x for x in get_plugins() if x.get("id") == plugin_name), None)
@@ -434,28 +546,12 @@ class HubController:
         was_installed = plugin_name in installed
         key = (data.get("keys") or {}).get(plugin_name)
         if not plugin_info and not catalog and not key:
-            self._edit_html(
-                "⚠️ <b>Каталог плагинов временно недоступен.</b>\n\n"
-                "Не удалось проверить статус плагина. Повторите попытку позже или обновите каталог.",
-                msg_obj.chat.id,
-                msg_obj.id,
-                reply_markup=build_kb(
-                    ("🔄 Повторить", f"hub:install:{plugin_name}", None),
-                    ("🔙 В главное меню", "hub:main", None),
-                ),
-            )
+            text, kb = render_catalog_unavailable(plugin_name)
+            self._edit_html(text, msg_obj.chat.id, msg_obj.id, reply_markup=kb)
             return None
         if not key and not is_free:
-            self._edit_html(
-                f"❌ У вас нет ключа для плагина <b>{esc(plugin_label)}</b>.\n\n"
-                f"Отправьте <code>!hub_key {esc(plugin_name)} ВАШ_КЛЮЧ</code> или получите Trial.",
-                msg_obj.chat.id,
-                msg_obj.id,
-                reply_markup=build_kb(
-                    ("🎁 Получить Trial", f"hub:trial:{plugin_name}", None),
-                    ("🔙 Назад", f"hub:info:{plugin_name}", None),
-                ),
-            )
+            text, kb = render_missing_key_notice(plugin_name, plugin_label)
+            self._edit_html(text, msg_obj.chat.id, msg_obj.id, reply_markup=kb)
             return None
 
         try:
@@ -512,12 +608,26 @@ class HubController:
             logger.exception("Failed saving trial key for %s", plugin_name)
             return self._alert(c, f"❌ Ошибка сохранения ключа: {exc}")
 
-        self._edit_html(
-            f"✅ <b>Trial выдан!</b>\n\n🔑 Ключ: <code>{esc(result)}</code>\n\nМожете сразу скачать плагин:",
-            c.message.chat.id,
-            c.message.id,
-            reply_markup=build_kb((f"⬇️ Скачать {plugin_label}", f"hub:install:{plugin_name}", None)),
-        )
+        text, kb = render_trial_activated(plugin_name, plugin_label, result)
+        self._edit_html(text, c.message.chat.id, c.message.id, reply_markup=kb)
+        return None
+
+    def delete_confirm_handler(self, c: CallbackQuery, plugin_name: Optional[str]) -> Any:
+        if not plugin_name:
+            return self._alert(c, "Плагин не установлен или уже удален")
+
+        data = load_data()
+        installed = data.get("installed") if isinstance(data.get("installed"), dict) else {}
+        if plugin_name not in installed:
+            return self._alert(c, "Плагин не установлен или уже удален")
+
+        p_info = next((x for x in get_plugins() if x.get("id") == plugin_name), None) or {
+            "id": plugin_name,
+            "name": installed[plugin_name].get("name") or plugin_name,
+        }
+        state = inspect_plugin_state(self.cardinal, p_info, installed, data.get("keys"))
+        text, kb = render_delete_confirm(state)
+        self._edit_html(text, c.message.chat.id, c.message.id, reply_markup=kb)
         return None
 
     def delete_plugin_handler(self, c: CallbackQuery, plugin_name: Optional[str]) -> Any:
@@ -586,6 +696,7 @@ class HubController:
         parts = (arg or "general").split(":", 1)
         action = parts[0] or "general"
         pid = parts[1] if len(parts) > 1 else ""
+        msg_id = getattr(getattr(c, "message", None), "id", None)
 
         existing = load_data().get("pending_restart")
         if (
@@ -595,6 +706,7 @@ class HubController:
         ):
             payload = dict(existing)
             payload["chat_id"] = c.message.chat.id
+            payload["message_id"] = msg_id
             payload["created_at"] = time.time()
             try:
                 save_pending_restart(payload)
@@ -618,15 +730,22 @@ class HubController:
             _save_restart_marker(
                 action=action,
                 chat_id=c.message.chat.id,
+                message_id=msg_id,
                 plugin_id=pid,
                 plugin_name=plugin_label,
                 target_version=target_version,
                 expected_uuid=expected_uuid,
             )
 
+        logger.info(
+            "Restarting Cardinal via Hub (action=%s pid=%s chat_id=%s msg_id=%s)",
+            action,
+            pid or "-",
+            c.message.chat.id,
+            msg_id,
+        )
         self._edit_html(
-            "🔄 <b>Перезагружаю FunPay Cardinal...</b>\n\n"
-            "<i>Обычно это занимает 3–10 секунд. После запуска я сразу проверю статус и верну меню Hub.</i>",
+            render_restart_in_progress(),
             c.message.chat.id,
             c.message.id,
         )
@@ -668,16 +787,20 @@ class HubController:
             "Уведомления включены!" if enabled else "Уведомления отключены!",
             show_alert=False,
         )
-        kb = c.message.reply_markup
-        if kb:
-            for row in kb.keyboard:
-                for btn in row:
-                    if btn.callback_data == "hub:toggle_notify_from_msg":
-                        btn.text = "🔕 Выключить уведомления Hub'a" if enabled else "🔔 Включить уведомления Hub'a"
+        rebuilt = rebuild_notification_toggle_markup(c.message.reply_markup, enabled)
+        if rebuilt is not None:
             try:
-                self.bot.edit_message_reply_markup(c.message.chat.id, c.message.id, reply_markup=kb)
-            except Exception:
-                logger.debug("Could not update notification button markup", exc_info=True)
+                self.bot.edit_message_reply_markup(c.message.chat.id, c.message.id, reply_markup=rebuilt)
+            except Exception as exc:
+                if "style" in str(exc).lower() and has_styled_buttons(rebuilt):
+                    try:
+                        self.bot.edit_message_reply_markup(
+                            c.message.chat.id, c.message.id, reply_markup=strip_button_styles(rebuilt)
+                        )
+                    except Exception:
+                        logger.debug("Could not update notification button markup", exc_info=True)
+                else:
+                    logger.debug("Could not update notification button markup", exc_info=True)
         return CB_ANSWERED
 
     def hub_update_handler(self, c: CallbackQuery) -> Any:
@@ -698,20 +821,15 @@ class HubController:
             _save_restart_marker(
                 action="hub",
                 chat_id=msg_obj.chat.id,
+                message_id=msg_obj.id,
                 target_version=str(disk_ver or ""),
             )
+            logger.info("Downloaded Hub update v%s; saved pending_restart marker", disk_ver or "?")
             text, kb = render_hub_update_result(str(disk_ver) if disk_ver else None)
             self._edit_html(text, msg_obj.chat.id, msg_obj.id, reply_markup=kb)
             return CB_ANSWERED
-        self._edit_html(
-            f"❌ <b>Не удалось обновить Hub</b>\n\n{esc(message)}",
-            msg_obj.chat.id,
-            msg_obj.id,
-            reply_markup=build_kb(
-                ("🔄 Повторить", "hub:update_hub", None),
-                ("🔙 В главное меню", "hub:main", None),
-            ),
-        )
+        text, kb = render_hub_update_error(message)
+        self._edit_html(text, msg_obj.chat.id, msg_obj.id, reply_markup=kb)
         return CB_ANSWERED
 
     def hub_command(self, message: Message) -> None:
@@ -745,11 +863,8 @@ class HubController:
 
         p = next((x for x in get_plugins() if x.get("id") == plugin), None)
         plugin_label = str(p.get("name", plugin)) if p else plugin
-        self._reply_html(
-            message,
-            f"✅ Ключ для <b>{esc(plugin)}</b> сохранен!\nВы можете скачать плагин с помощью кнопки ниже:",
-            reply_markup=build_kb((f"📥 Скачать {plugin_label}", f"hub:install:{plugin}", None)),
-        )
+        text, kb = render_key_activated(plugin, plugin_label, key)
+        self._reply_html(message, text, reply_markup=kb)
 
 
 def init_cardinal(cardinal: Optional[Cardinal]) -> Optional[HubController]:
@@ -784,6 +899,7 @@ def init_cardinal(cardinal: Optional[Cardinal]) -> Optional[HubController]:
         ("hub:install:", controller.install_plugin),
         ("hub:trial:", controller.trial_request),
         ("hub:trial_confirm:", controller.trial_confirm),
+        ("hub:delete_confirm:", controller.delete_confirm_handler),
         ("hub:delete:", controller.delete_plugin_handler),
         ("hub:remind:", controller.remind_handler),
         ("hub:restart:", controller.restart_cardinal_handler),
@@ -815,7 +931,72 @@ def init_cardinal(cardinal: Optional[Cardinal]) -> Optional[HubController]:
         bot.message_handler(func=lambda m: bool(getattr(m, "text", None) and m.text.startswith("!hub_key")))(
             controller.set_key_command
         )
+    logger.info("Initialized W1bbex Hub v%s (pre_init)", VERSION)
     return controller
+
+
+def _post_restart_fallback_watcher(
+    cardinal: Any,
+    delay_seconds: float = POST_RESTART_FALLBACK_DELAY_SECONDS,
+    post_init_event: Optional[threading.Event] = None,
+    wake_event: Optional[threading.Event] = None,
+    stop_event: Optional[threading.Event] = None,
+) -> bool:
+    """Wait briefly for Cardinal BIND_TO_POST_INIT; send notice early if another plugin stalls startup."""
+    post_ev = post_init_event or _POST_INIT_EVENT
+    wake_ev = wake_event or _POST_RESTART_WAKE_EVENT
+    stop_ev = stop_event or STOP_EVENT
+
+    if delay_seconds > 0 and not post_ev.is_set() and not stop_ev.is_set():
+        wake_ev.wait(timeout=delay_seconds)
+
+    if stop_ev.is_set() or post_ev.is_set():
+        return False
+
+    try:
+        pending = peek_pending_restart(RESTART_NOTICE_TTL_SECONDS)
+    except OSError:
+        logger.exception("Failed checking pending_restart in fallback watcher")
+        return False
+    if not pending:
+        return False
+
+    logger.info(
+        "BIND_TO_POST_INIT did not reach W1bbex Hub within %.1fs; dispatching post-restart notice from pre_init fallback",
+        delay_seconds,
+    )
+    return process_post_restart_notice(cardinal)
+
+
+def _arm_post_restart_fallback(cardinal: Any) -> bool:
+    """Spawn a daemon fallback watcher when pending_restart exists at pre_init."""
+    global _FALLBACK_THREAD
+    try:
+        pending = peek_pending_restart(RESTART_NOTICE_TTL_SECONDS)
+    except OSError:
+        logger.exception("Failed checking pending_restart on pre_init")
+        return False
+    if not pending:
+        return False
+
+    with _FALLBACK_THREAD_LOCK:
+        if _FALLBACK_THREAD is not None and _FALLBACK_THREAD.is_alive():
+            return False
+        thread = threading.Thread(
+            target=_post_restart_fallback_watcher,
+            args=(cardinal,),
+            name="W1bbexHubPostRestartFallback",
+            daemon=True,
+        )
+        _FALLBACK_THREAD = thread
+        thread.start()
+        logger.info(
+            "Armed pre_init post-restart fallback watcher (action=%s pid=%s delay=%.1fs)",
+            pending.get("action"),
+            pending.get("plugin_id") or "-",
+            POST_RESTART_FALLBACK_DELAY_SECONDS,
+        )
+        return True
 
 
 def custom_init(cardinal: Cardinal) -> None:
@@ -823,30 +1004,47 @@ def custom_init(cardinal: Cardinal) -> None:
     global _UPDATE_THREAD
     configure_file_logging()
     process_pending_deletions()
-    init_cardinal(cardinal)
+    _POST_INIT_EVENT.clear()
+    _POST_RESTART_WAKE_EVENT.clear()
+    STOP_EVENT.clear()
+    controller = init_cardinal(cardinal)
     with _UPDATE_THREAD_LOCK:
-        if _UPDATE_THREAD is not None and _UPDATE_THREAD.is_alive():
-            return
-        STOP_EVENT.clear()
-        thread = threading.Thread(
-            target=_update_checker_loop,
-            args=(cardinal, STOP_EVENT),
-            name="W1bbexHubUpdateChecker",
-            daemon=True,
-        )
-        _UPDATE_THREAD = thread
-        thread.start()
+        if _UPDATE_THREAD is None or not _UPDATE_THREAD.is_alive():
+            thread = threading.Thread(
+                target=_update_checker_loop,
+                args=(cardinal, STOP_EVENT),
+                name="W1bbexHubUpdateChecker",
+                daemon=True,
+            )
+            _UPDATE_THREAD = thread
+            thread.start()
+    if controller is not None:
+        _arm_post_restart_fallback(cardinal)
 
 
 def stop_hub(*_args: Any, **_kwargs: Any) -> None:
     """Cardinal BIND_TO_DELETE entry point signaling background loops to stop."""
     STOP_EVENT.set()
+    _POST_RESTART_WAKE_EVENT.set()
 
 
 def post_init_cardinal(cardinal: Cardinal) -> None:
     """Cardinal BIND_TO_POST_INIT entry point sending verified post-restart UI report."""
-    if not isinstance(load_data().get("pending_restart"), dict):
+    configure_file_logging()
+    _POST_INIT_EVENT.set()
+    _POST_RESTART_WAKE_EVENT.set()
+    try:
+        pending = peek_pending_restart(RESTART_NOTICE_TTL_SECONDS)
+    except OSError:
+        logger.exception("Failed checking pending_restart on post_init")
         return
+    if not pending:
+        return
+    logger.info(
+        "Detected pending_restart on post_init (action=%s pid=%s); scheduling report",
+        pending.get("action"),
+        pending.get("plugin_id") or "-",
+    )
     timer = threading.Timer(1.0, process_post_restart_notice, args=(cardinal,))
     timer.daemon = True
     timer.start()

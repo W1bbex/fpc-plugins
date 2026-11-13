@@ -187,7 +187,7 @@ def test_built_w1bbex_hub_bundle_matches_cardinal_and_server_contracts(tmp_path:
 
     fake_cardinal = make_fake_cardinal(authorized_users={1})
     controller = mod.init_cardinal(fake_cardinal)
-    assert len(fake_cardinal.telegram.cbq_routes) == 18
+    assert len(fake_cardinal.telegram.cbq_routes) == 19
     assert len(fake_cardinal.telegram.msg_routes) == 2
     assert controller is not None
     assert (cardinal_root / "storage" / "w1bbex" / "Hub" / "logs" / "w1bbex_hub.log").exists()
@@ -431,3 +431,116 @@ def test_hub_init_guards_missing_telegram_stop_hook_and_offline_catalog(
     controller.install_plugin(cb, "autosmm")
     shown_text = cardinal.telegram.bot.edit_message_text.call_args.args[0]
     assert "временно недоступен" in shown_text
+
+
+def test_post_restart_preserves_marker_on_send_failure_and_delivers_hub_main_menu(
+    isolated_hub: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cardinal = make_fake_cardinal(authorized_users={42})
+    controller = handlers.HubController(cardinal)
+    monkeypatch.setattr(handlers, "trigger_cardinal_restart", lambda: True)
+    monkeypatch.setattr(handlers, "get_plugins", lambda: [])
+
+    cb = SimpleNamespace(
+        id="cb-restart-hub",
+        from_user=SimpleNamespace(id=42, username="owner"),
+        message=SimpleNamespace(chat=SimpleNamespace(id=777), id=321),
+    )
+    controller.restart_cardinal_handler(cb, "hub")
+
+    saved_pending = storage.peek_pending_restart(300)
+    assert saved_pending is not None
+    assert saved_pending["action"] == "hub"
+    assert saved_pending["message_id"] == 321
+    edited_text = cardinal.telegram.bot.edit_message_text.call_args.args[0]
+    assert "3–10 секунд" not in edited_text
+
+    # First delivery fails on both internal attempts -> marker must survive
+    cardinal.telegram.bot.send_message.side_effect = RuntimeError("Temporary Telegram timeout")
+    assert handlers.process_post_restart_notice(cardinal, retry_delay=0.0) is False
+    assert storage.peek_pending_restart(300) is not None
+    cardinal.telegram.bot.delete_message.assert_called_with(777, 321)
+
+    # Subsequent delivery succeeds -> main menu with banner is sent and marker is cleared
+    storage.save_pending_restart(
+        {
+            "action": "hub",
+            "chat_id": 777,
+            "message_id": 321,
+            "target_version": runtime.VERSION,
+        }
+    )
+    cardinal.telegram.bot.send_message.side_effect = None
+    assert handlers.process_post_restart_notice(cardinal, retry_delay=0.0) is True
+    assert storage.peek_pending_restart(300) is None
+
+    delivered_text = cardinal.telegram.bot.send_message.call_args.args[1]
+    delivered_kb = cardinal.telegram.bot.send_message.call_args.kwargs["reply_markup"]
+    delivered_btns = {btn.callback_data: btn for row in delivered_kb.keyboard for btn in row}
+    assert f"W1bbex Hub обновлён до v{runtime.VERSION}" in delivered_text
+    assert getattr(delivered_btns["hub:plugins_menu"], "style", None) == "success"
+    assert getattr(delivered_btns["hub:activate_key"], "style", None) == "primary"
+
+
+def test_pre_init_fallback_delivers_when_post_init_is_stalled_and_skips_when_normal(
+    isolated_hub: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cardinal = make_fake_cardinal(authorized_users={42})
+    monkeypatch.setattr(handlers, "get_plugins", lambda: [])
+
+    # 1. If post_init_cardinal completes normally, fallback must exit without sending duplicates
+    storage.save_pending_restart(
+        {"action": "hub", "chat_id": 777, "target_version": runtime.VERSION}
+    )
+    post_ev = threading.Event()
+    wake_ev = threading.Event()
+    stop_ev = threading.Event()
+    post_ev.set()
+    wake_ev.set()
+    assert (
+        handlers._post_restart_fallback_watcher(
+            cardinal,
+            delay_seconds=0.05,
+            post_init_event=post_ev,
+            wake_event=wake_ev,
+            stop_event=stop_ev,
+        )
+        is False
+    )
+    assert cardinal.telegram.bot.send_message.call_count == 0
+    assert storage.peek_pending_restart(300) is not None
+
+    # 2. If another plugin stalls BIND_TO_POST_INIT, fallback delivers once and clears marker
+    post_ev.clear()
+    wake_ev.clear()
+    assert (
+        handlers._post_restart_fallback_watcher(
+            cardinal,
+            delay_seconds=0.01,
+            post_init_event=post_ev,
+            wake_event=wake_ev,
+            stop_event=stop_ev,
+        )
+        is True
+    )
+    assert cardinal.telegram.bot.send_message.call_count == 1
+    assert storage.peek_pending_restart(300) is None
+
+    # Delayed post_init arriving later must not re-send anything
+    assert handlers.process_post_restart_notice(cardinal, retry_delay=0.0) is False
+    assert cardinal.telegram.bot.send_message.call_count == 1
+
+    # 3. Concurrent entry while delivery is in flight is rejected without waiting on network lock
+    storage.save_pending_restart(
+        {"action": "general", "chat_id": 777, "target_version": runtime.VERSION}
+    )
+    concurrent_results: list[bool] = []
+    orig_send = cardinal.telegram.bot.send_message.side_effect
+
+    def slow_send(chat_id: int, text: str, **kw):
+        concurrent_results.append(handlers.process_post_restart_notice(cardinal, retry_delay=0.0))
+        return orig_send(chat_id, text, **kw)
+
+    cardinal.telegram.bot.send_message.side_effect = slow_send
+    assert handlers.process_post_restart_notice(cardinal, retry_delay=0.0) is True
+    assert concurrent_results == [False]

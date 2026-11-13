@@ -175,19 +175,43 @@ def save_pending_restart(payload: dict[str, Any]) -> None:
     update_data(lambda d: d.__setitem__("pending_restart", record))
 
 
+def _validate_pending_restart(raw: Any, max_age_seconds: float) -> Optional[dict[str, Any]]:
+    """Return shallow copy when pending_restart is a valid dict within max_age_seconds."""
+    if not isinstance(raw, dict):
+        return None
+    try:
+        created_at = float(raw.get("created_at", 0.0))
+    except (TypeError, ValueError):
+        return None
+    if max_age_seconds > 0 and (time.time() - created_at) > max_age_seconds:
+        return None
+    return dict(raw)
+
+
+def clear_pending_restart() -> None:
+    """Remove pending_restart metadata from disk under DATA_LOCK."""
+    update_data(lambda d: d.pop("pending_restart", None))
+
+
+def peek_pending_restart(max_age_seconds: float) -> Optional[dict[str, Any]]:
+    """Inspect pending_restart non-destructively, pruning only corrupt or expired markers."""
+    with DATA_LOCK:
+        data = load_data()
+        if "pending_restart" not in data:
+            return None
+        valid = _validate_pending_restart(data.get("pending_restart"), max_age_seconds)
+        if valid is None:
+            data.pop("pending_restart", None)
+            save_data(data)
+            return None
+        return valid
+
+
 def pop_pending_restart(max_age_seconds: float) -> Optional[dict[str, Any]]:
     """Atomically pop pending_restart if present and within max_age_seconds."""
     def _pop(data: dict[str, Any]) -> Optional[dict[str, Any]]:
         raw = data.pop("pending_restart", None)
-        if not isinstance(raw, dict):
-            return None
-        try:
-            created_at = float(raw.get("created_at", 0.0))
-        except (TypeError, ValueError):
-            return None
-        if max_age_seconds > 0 and (time.time() - created_at) > max_age_seconds:
-            return None
-        return raw
+        return _validate_pending_restart(raw, max_age_seconds)
 
     _, popped = update_data(_pop)
     return popped

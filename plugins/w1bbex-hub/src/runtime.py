@@ -11,7 +11,7 @@ import threading
 from typing import Any, Optional
 
 NAME = "W1bbex Hub"
-VERSION = "0.3.0"
+VERSION = "0.4.2"
 DESCRIPTION = "Официальный менеджер и загрузчик плагинов от W1bbex."
 CREDITS = "@W1bbex"
 PLUGIN_ID = "w1bbex_hub"
