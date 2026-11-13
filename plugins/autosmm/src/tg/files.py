@@ -27,12 +27,14 @@ from .common import (
     _safe_answer_callback,
     _safe_edit_message_text,
     _set_tg_state,
+    h,
     register_navigation_target,
 )
 
+MAX_BACKUP_UPLOAD_BYTES = 20 * 1024 * 1024
 
-def files_menu(call: types.CallbackQuery) -> None:
-    _safe_answer_callback(call)
+
+def _render_files_menu(call: types.CallbackQuery) -> None:
     _clear_step_handler(call.message.chat.id)
     _clear_navigation_states(call.message.chat.id)
     _clear_tg_state(call.message.chat.id, getattr(getattr(call, "from_user", None), "id", None))
@@ -52,20 +54,32 @@ def files_menu(call: types.CallbackQuery) -> None:
     _safe_edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb_)
 
 
+def files_menu(call: types.CallbackQuery) -> None:
+    _safe_answer_callback(call)
+    _render_files_menu(call)
+
+
 def files_menu_callback(call: types.CallbackQuery) -> None:
     files_menu(call)
 
 
 def auto_smm_delete(message: types.Message) -> None:
     """Полная очистка данных AutoSMM после аварийного бэкапа."""
+    prev_running = rt.RUNNING
     rt.RUNNING = False
 
-    backup_path = _create_full_backup(reason="before_delete")
+    try:
+        backup_path = _create_full_backup(reason="before_delete")
+    except Exception as ex:
+        rt.logger.exception(f"Не удалось создать аварийный бэкап перед очисткой: {ex}")
+        backup_path = None
     if not backup_path:
+        rt.RUNNING = prev_running
         rt.bot.send_message(
             message.chat.id,
             "❌ Не удалось создать аварийный бэкап. Очистка отменена.",
             reply_markup=_files_back_kb(),
+            parse_mode="HTML",
         )
         return
 
@@ -78,10 +92,10 @@ def auto_smm_delete(message: types.Message) -> None:
     wipe_all_autosmm_data()
 
     filename = os.path.basename(backup_path)
-    txt = f"✅ Данные AutoSMM очищены.\n\nПеред очисткой создан аварийный бэкап:\n{filename}\n\nРекомендуется перезапустить Cardinal."
+    txt = f"✅ Данные AutoSMM очищены.\n\nПеред очисткой создан аварийный бэкап:\n<code>{h(filename)}</code>\n\nРекомендуется перезапустить Cardinal."
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("◀️ В меню", callback_data="return_to_settings"))
-    rt.bot.send_message(message.chat.id, txt, reply_markup=kb)
+    rt.bot.send_message(message.chat.id, txt, reply_markup=kb, parse_mode="HTML")
 
 
 def full_backup_prompt(call: types.CallbackQuery) -> None:
@@ -174,6 +188,15 @@ def full_autosmm_delete_prompt(call: types.CallbackQuery) -> None:
 
 def full_autosmm_delete_confirm(call: types.CallbackQuery) -> None:
     _safe_answer_callback(call)
+    try:
+        _safe_edit_message_text(
+            "⏳ <b>Выполняю очистку данных AutoSMM...</b>",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="HTML",
+        )
+    except Exception as exc:
+        rt.logger.debug(f"Could not clear cleanup confirmation keyboard: {exc}")
 
     class _Msg:
         chat = call.message.chat
@@ -190,7 +213,10 @@ def _send_log_file_async(chat_id: int, caption_prefix: str, on_empty_text: str =
                 rt.logger.debug(f"Не удалось сбросить буфер обработчика логов: {flush_exc}")
 
         if not os.path.exists(rt.LOG_PATH) or os.path.getsize(rt.LOG_PATH) == 0:
-            rt.bot.send_message(chat_id, on_empty_text, reply_markup=_files_back_kb())
+            try:
+                rt.bot.send_message(chat_id, h(on_empty_text), reply_markup=_files_back_kb(), parse_mode="HTML")
+            except Exception as exc:
+                rt.logger.debug(f"Failed notifying empty logs to chat {chat_id}: {exc}")
             return
 
         try:
@@ -206,7 +232,15 @@ def _send_log_file_async(chat_id: int, caption_prefix: str, on_empty_text: str =
             rt.logger.debug(f"[LOG EXPORT] Log document sent to chat_id={chat_id}")
         except Exception as ex:
             rt.logger.error(f"[LOG EXPORT ERROR] chat_id={chat_id}: {ex}")
-            rt.bot.send_message(chat_id, f"❌ Ошибка отправки лог-файла: {ex}", reply_markup=_files_back_kb())
+            try:
+                rt.bot.send_message(
+                    chat_id,
+                    f"❌ Ошибка отправки лог-файла: {h(ex)}",
+                    reply_markup=_files_back_kb(),
+                    parse_mode="HTML",
+                )
+            except Exception as notify_exc:
+                rt.logger.debug(f"Failed sending log export error to chat {chat_id}: {notify_exc}")
 
     threading.Thread(target=_worker, daemon=True).start()
 
@@ -214,7 +248,7 @@ def _send_log_file_async(chat_id: int, caption_prefix: str, on_empty_text: str =
 def export_errors(call: types.CallbackQuery) -> None:
     _send_log_file_async(call.message.chat.id, "📝 <b>Логи AutoSMM</b>", on_empty_text="Логи ошибок пока не найдены.")
     _safe_answer_callback(call, "Логи отправляются...")
-    files_menu(call)
+    _render_files_menu(call)
 
 
 def _files_back_kb() -> InlineKeyboardMarkup:
@@ -226,7 +260,6 @@ def _files_back_kb() -> InlineKeyboardMarkup:
 def _receive_tg_json_document(message: types.Message, *, context_label: str) -> Tuple[bool, Any]:
     chat_id = getattr(getattr(message, "chat", None), "id", None)
     user_id = getattr(getattr(message, "from_user", None), "id", None)
-    _clear_tg_state(chat_id, user_id)
 
     if not _is_authorized_tg_user(user_id):
         rt.logger.warning(f"Отклонена неавторизованная загрузка {context_label}: user_id={user_id}")
@@ -234,8 +267,20 @@ def _receive_tg_json_document(message: types.Message, *, context_label: str) -> 
 
     document = getattr(message, "document", None)
     if document is None:
-        rt.bot.send_message(chat_id, "❌ Отправьте JSON-файл документом.", reply_markup=_files_back_kb())
+        rt.bot.send_message(chat_id, "❌ Отправьте JSON-файл документом.", reply_markup=_files_back_kb(), parse_mode="HTML")
         return False, None
+
+    file_size = getattr(document, "file_size", None)
+    if isinstance(file_size, int) and file_size > MAX_BACKUP_UPLOAD_BYTES:
+        rt.bot.send_message(
+            chat_id,
+            "❌ Файл бэкапа слишком большой (лимит 20 МБ).",
+            reply_markup=_files_back_kb(),
+            parse_mode="HTML",
+        )
+        return False, None
+
+    _clear_tg_state(chat_id, user_id)
 
     try:
         file_info = rt.bot.get_file(document.file_id)
@@ -245,16 +290,18 @@ def _receive_tg_json_document(message: types.Message, *, context_label: str) -> 
     except json.JSONDecodeError as e:
         rt.bot.send_message(
             chat_id,
-            f"❌ Ошибка: не удалось считать {context_label}. Проверьте JSON. ({e})",
+            f"❌ Ошибка: не удалось считать {h(context_label)}. Проверьте JSON. ({h(e)})",
             reply_markup=_files_back_kb(),
+            parse_mode="HTML",
         )
         rt.logger.error(f"Ошибка декодирования JSON ({context_label}): {e}")
         return False, None
     except Exception as e:
         rt.bot.send_message(
             chat_id,
-            f"❌ Произошла ошибка при загрузке {context_label}: {e}",
+            f"❌ Произошла ошибка при загрузке {h(context_label)}: {h(e)}",
             reply_markup=_files_back_kb(),
+            parse_mode="HTML",
         )
         rt.logger.error(f"Ошибка загрузки документа ({context_label}): {e}")
         return False, None
@@ -268,12 +315,13 @@ def handle_backup_restore_upload(message: types.Message) -> None:
 
     try:
         _ok, result_text = _restore_backup_wrapper(data)
-        rt.bot.send_message(message.chat.id, result_text, reply_markup=_files_back_kb())
+        rt.bot.send_message(message.chat.id, h(result_text), reply_markup=_files_back_kb(), parse_mode="HTML")
     except Exception as e:
         rt.bot.send_message(
             message.chat.id,
-            f"❌ Произошла ошибка при восстановлении бэкапа: {e}",
+            f"❌ Произошла ошибка при восстановлении бэкапа: {h(e)}",
             reply_markup=_files_back_kb(),
+            parse_mode="HTML",
         )
         rt.logger.error(f"Неизвестная ошибка при восстановлении бэкапа: {e}")
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import html
 import re
+import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -15,6 +16,8 @@ from .. import runtime as rt
 
 _NAVIGATION_TARGETS: Dict[str, Callable[[types.CallbackQuery], Any]] = {}
 _NAVIGATION_PREFIXES: List[Tuple[str, Callable[[types.CallbackQuery, str], Any]]] = []
+_CALLBACK_TOKENS_LOCK = threading.Lock()
+_CALLBACK_TOKENS_MAX = 1000
 
 STATE_RESTORE_BACKUP = "autosmm:restore_backup"
 
@@ -94,7 +97,7 @@ def _edit_screen_if_revision_matches(
     if rt.get_screen_revision(chat_id, message_id) != expected_revision:
         return False
     edit_kwargs: Dict[str, Any] = {"reply_markup": kb}
-    if parse_mode:
+    if parse_mode is not None:
         edit_kwargs["parse_mode"] = parse_mode
     try:
         _safe_edit_message_text(text_value, chat_id, message_id, **edit_kwargs)
@@ -325,6 +328,15 @@ def _register_guarded_step_handler(
             )
             rt.bot.register_next_step_handler(message, _guarded_step)
             return None
+        raw_text = getattr(message, "text", None)
+        if isinstance(raw_text, str) and raw_text.lstrip().startswith("/"):
+            chat_id = getattr(getattr(message, "chat", None), "id", None)
+            sender_id = getattr(getattr(message, "from_user", None), "id", None)
+            if chat_id is not None:
+                _clear_step_handler(chat_id)
+                _clear_navigation_states(chat_id)
+            _clear_tg_state(chat_id, sender_id)
+            return None
         return next_handler(message, *handler_args)
 
     rt.bot.register_next_step_handler(anchor_message, _guarded_step)
@@ -337,16 +349,21 @@ def _encode_callback_value(prefix: str, raw_value: str, *, max_bytes: int = 64) 
         return full
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
     token = f"t_{digest}"
-    if len(rt.CALLBACK_TOKENS) > 1000:
-        rt.CALLBACK_TOKENS.clear()
-    rt.CALLBACK_TOKENS[token] = value
+    with _CALLBACK_TOKENS_LOCK:
+        if token in rt.CALLBACK_TOKENS:
+            rt.CALLBACK_TOKENS.pop(token, None)
+        while len(rt.CALLBACK_TOKENS) >= _CALLBACK_TOKENS_MAX:
+            oldest_key = next(iter(rt.CALLBACK_TOKENS))
+            rt.CALLBACK_TOKENS.pop(oldest_key, None)
+        rt.CALLBACK_TOKENS[token] = value
     return f"{prefix}{token}"
 
 
 def _decode_callback_value(raw_arg: str) -> str:
     arg = str(raw_arg or "")
     if arg.startswith("t_"):
-        return str(rt.CALLBACK_TOKENS.get(arg) or "")
+        with _CALLBACK_TOKENS_LOCK:
+            return str(rt.CALLBACK_TOKENS.get(arg) or "")
     return arg
 
 
@@ -431,9 +448,9 @@ def _is_authorized_tg_user(user_id: Optional[int]) -> bool:
         return False
     tg = getattr(rt.cardinal_instance, "telegram", None)
     auth_users = getattr(tg, "authorized_users", None)
-    if isinstance(auth_users, (dict, set, list, tuple)) and len(auth_users) > 0:
+    if isinstance(auth_users, (dict, set, list, tuple)):
         return user_id in auth_users
-    return True
+    return False
 
 
 def _clear_screen_state(call: types.CallbackQuery) -> None:

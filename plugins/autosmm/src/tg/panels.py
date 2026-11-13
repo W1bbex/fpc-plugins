@@ -17,7 +17,7 @@ from ..core.panel_api import (
     _normalize_api_key,
     _panel_api_json,
 )
-from ..storage.storage import load_config, rename_panel_service, save_config
+from ..storage.storage import CONFIG_LOCK, load_config, rename_panel_service, save_config
 from .common import (
     _clear_navigation_states,
     _clear_step_handler,
@@ -28,9 +28,12 @@ from .common import (
     _safe_answer_callback,
     _safe_edit_message_text,
     _start_ui_input_flow,
+    h,
     register_navigation_prefix,
     register_navigation_target,
 )
+
+MAX_PANEL_SERVICE_NUMBER = 999999
 
 PANEL_BALANCE_CACHE_TTL_SECONDS = core_panel_balances.PANEL_BALANCE_CACHE_TTL_SECONDS
 normalize_api_url = core_panel_balances.normalize_api_url
@@ -141,10 +144,10 @@ def render_api_menu(cfg: Dict, *, use_cache_only: bool = True) -> Tuple[str, Inl
         service_rows.append((srv_num, srv_data or {}, payload, display_name))
 
     total_balance_text = core_panel_balances.compute_total_balance_text(services, cached_by_key)
-    lines = ["🔌 Интеграция API", "", f"Общий баланс: {total_balance_text}", "", "Подключённые сервисы:", ""]
+    lines = ["🔌 Интеграция API", "", f"Общий баланс: {h(total_balance_text)}", "", "Подключённые сервисы:", ""]
     if service_rows:
         for idx, (_, _, payload, display_name) in enumerate(service_rows):
-            lines.append(f"📡 {display_name}")
+            lines.append(f"📡 {h(display_name)}")
             lines.append(f"Состояние подключения: {payload.get('status_emoji', '❌')}")
             if idx != len(service_rows) - 1:
                 lines.append("")
@@ -188,11 +191,11 @@ def render_api_service_card(
     )
 
     lines = [
-        f"📡 {display_name}",
+        f"📡 {h(display_name)}",
         "",
-        f"Ключ: {mask_api_key(service_cfg.get('api_key'))}",
+        f"Ключ: {h(mask_api_key(service_cfg.get('api_key')))}",
         f"Состояние подключения: {balance_payload.get('status_emoji', '❌')}",
-        f"Баланс: {balance_payload.get('balance_text', 'недоступно')}",
+        f"Баланс: {h(balance_payload.get('balance_text', 'недоступно'))}",
     ]
     if _is_api_key_length_suspicious(service_cfg.get("api_key")):
         lines.extend([
@@ -215,9 +218,9 @@ def render_api_service_card(
 
 def _send_or_edit_plain(chat_id: int, text_: str, kb: InlineKeyboardMarkup, message_id: Optional[int] = None) -> Optional[int]:
     if message_id is None:
-        sent = rt.bot.send_message(chat_id, text_, reply_markup=kb)
+        sent = rt.bot.send_message(chat_id, text_, parse_mode="HTML", reply_markup=kb)
         return getattr(sent, "message_id", None)
-    _safe_edit_message_text(text_, chat_id, message_id, reply_markup=kb)
+    _safe_edit_message_text(text_, chat_id, message_id, parse_mode="HTML", reply_markup=kb)
     return int(message_id)
 
 
@@ -247,7 +250,7 @@ def _open_api_menu(
                 target_msg_id,
                 expected_rev,
                 lambda: render_api_menu(load_config(), use_cache_only=True),
-                parse_mode=None,
+                parse_mode="HTML",
             )
             if updated
             else None
@@ -284,7 +287,7 @@ def _open_api_service_card(
                 target_msg_id,
                 expected_rev,
                 lambda: render_api_service_card(load_config(), service_idx, use_cache_only=True),
-                parse_mode=None,
+                parse_mode="HTML",
             )
             if updated
             else None
@@ -304,14 +307,28 @@ def _panels_back_kb() -> InlineKeyboardMarkup:
     return _inline_kb(("◀️ Назад", "api_settings"))
 
 
-def process_apiurl_change(message: types.Message, service_idx: int) -> None:
-    cfg = load_config()
-    service_cfg = (cfg.get("services") or {}).get(str(service_idx))
-    if not service_cfg:
-        _clear_ui_input_state(message.chat.id)
-        rt.bot.send_message(message.chat.id, "❌ Сервис не найден.", reply_markup=_panels_back_kb())
-        return
+def _parse_service_idx(call: types.CallbackQuery) -> Optional[int]:
+    try:
+        idx = int(str(getattr(call, "data", "") or "").rsplit("_", 1)[-1])
+    except (ValueError, TypeError):
+        _safe_answer_callback(call)
+        api_settings_menu(call)
+        return None
+    return idx
 
+
+def _abort_if_service_missing(chat_id: int, service_idx: int) -> bool:
+    cfg = load_config()
+    if (cfg.get("services") or {}).get(str(service_idx)):
+        return False
+    _clear_ui_input_state(chat_id)
+    rt.bot.send_message(chat_id, "❌ Сервис не найден.", reply_markup=_panels_back_kb())
+    return True
+
+
+def process_apiurl_change(message: types.Message, service_idx: int) -> None:
+    if _abort_if_service_missing(message.chat.id, service_idx):
+        return
     try:
         normalized_url = normalize_api_url(str(getattr(message, "text", None) or "").strip())
     except ValueError as ex:
@@ -321,19 +338,33 @@ def process_apiurl_change(message: types.Message, service_idx: int) -> None:
         _repeat_ui_input_flow(message.chat.id, "❌ Ошибка: не удалось обработать ссылку.")
         return
 
-    old_url = str(service_cfg.get("api_url") or "").strip()
-    old_name = service_cfg.get("name")
-    service_cfg["api_url"] = normalized_url
-    if _service_name_is_default(old_name, service_idx, old_url):
-        service_cfg["name"] = build_service_display_name(service_idx, normalized_url, None)
+    found = True
+    with CONFIG_LOCK:
+        cfg = load_config()
+        service_cfg = (cfg.get("services") or {}).get(str(service_idx))
+        if not service_cfg:
+            found = False
+        else:
+            old_url = str(service_cfg.get("api_url") or "").strip()
+            old_name = service_cfg.get("name")
+            service_cfg["api_url"] = normalized_url
+            if _service_name_is_default(old_name, service_idx, old_url):
+                service_cfg["name"] = build_service_display_name(service_idx, normalized_url, None)
+            save_config(cfg)
 
-    save_config(cfg)
+    if not found:
+        _clear_ui_input_state(message.chat.id)
+        rt.bot.send_message(message.chat.id, "❌ Сервис не найден.", reply_markup=_panels_back_kb())
+        return
+
     _invalidate_balance_cache()
     _clear_ui_input_state(message.chat.id)
     _open_api_service_card(message.chat.id, service_idx)
 
 
 def process_apikey_change(message: types.Message, service_idx: int) -> None:
+    if _abort_if_service_missing(message.chat.id, service_idx):
+        return
     new_key = _normalize_api_key(getattr(message, "text", None))
     if not new_key or _is_placeholder_api_key(new_key):
         _repeat_ui_input_flow(message.chat.id, "❌ API ключ не может быть пустым.")
@@ -351,35 +382,49 @@ def process_apikey_change(message: types.Message, service_idx: int) -> None:
         )
         return
 
-    cfg = load_config()
-    service_cfg = (cfg.get("services") or {}).get(str(service_idx))
-    if not service_cfg:
+    found = True
+    with CONFIG_LOCK:
+        cfg = load_config()
+        service_cfg = (cfg.get("services") or {}).get(str(service_idx))
+        if not service_cfg:
+            found = False
+        else:
+            service_cfg["api_key"] = new_key
+            save_config(cfg)
+
+    if not found:
         _clear_ui_input_state(message.chat.id)
         rt.bot.send_message(message.chat.id, "❌ Сервис не найден.", reply_markup=_panels_back_kb())
         return
 
-    service_cfg["api_key"] = new_key
-    save_config(cfg)
     _invalidate_balance_cache()
     _clear_ui_input_state(message.chat.id)
     _open_api_service_card(message.chat.id, service_idx)
 
 
 def process_apiname_change(message: types.Message, service_idx: int) -> None:
+    if _abort_if_service_missing(message.chat.id, service_idx):
+        return
     new_name = re.sub(r"\s+", " ", str(getattr(message, "text", None) or "").strip())
     if not new_name:
         _repeat_ui_input_flow(message.chat.id, "❌ Название сервиса не может быть пустым.")
         return
 
-    cfg = load_config()
-    service_cfg = (cfg.get("services") or {}).get(str(service_idx))
-    if not service_cfg:
+    found = True
+    with CONFIG_LOCK:
+        cfg = load_config()
+        service_cfg = (cfg.get("services") or {}).get(str(service_idx))
+        if not service_cfg:
+            found = False
+        else:
+            service_cfg["name"] = new_name
+            save_config(cfg)
+
+    if not found:
         _clear_ui_input_state(message.chat.id)
         rt.bot.send_message(message.chat.id, "❌ Сервис не найден.", reply_markup=_panels_back_kb())
         return
 
-    service_cfg["name"] = new_name
-    save_config(cfg)
     _clear_ui_input_state(message.chat.id)
     _open_api_service_card(message.chat.id, service_idx)
 
@@ -387,10 +432,13 @@ def process_apiname_change(message: types.Message, service_idx: int) -> None:
 def process_apinum_change(message: types.Message, service_idx: int) -> None:
     try:
         new_service_idx = int(str(getattr(message, "text", None) or "").strip())
-        if new_service_idx < 1:
+        if not (1 <= new_service_idx <= MAX_PANEL_SERVICE_NUMBER):
             raise ValueError
     except ValueError:
-        _repeat_ui_input_flow(message.chat.id, "❌ Ошибка: номер сервиса должен быть положительным числом.")
+        _repeat_ui_input_flow(
+            message.chat.id,
+            f"❌ Ошибка: номер сервиса должен быть числом от 1 до {MAX_PANEL_SERVICE_NUMBER}.",
+        )
         return
 
     cfg = load_config()
@@ -445,7 +493,9 @@ def api_settings_callback(call: types.CallbackQuery) -> None:
 
 
 def api_service_callback(call: types.CallbackQuery) -> None:
-    idx_ = int(call.data.split("_")[-1])
+    idx_ = _parse_service_idx(call)
+    if idx_ is None:
+        return
     _safe_answer_callback(call)
     _clear_step_handler(call.message.chat.id)
     _clear_navigation_states(call.message.chat.id)
@@ -453,13 +503,15 @@ def api_service_callback(call: types.CallbackQuery) -> None:
 
 
 def edit_apiurl(call: types.CallbackQuery) -> None:
+    idx_ = _parse_service_idx(call)
+    if idx_ is None:
+        return
     _safe_answer_callback(call)
-    idx_ = int(call.data.split("_")[-1])
     service_cfg = ((load_config().get("services") or {}).get(str(idx_))) or {}
     current_url = str(service_cfg.get("api_url") or "").strip() or "не задан"
     _start_ui_input_flow(
         call,
-        f"Введите ссылку или домен для сервиса #{idx_}:\n\nТекущий URL: {current_url}",
+        f"Введите ссылку или домен для сервиса #{idx_}:\n\nТекущий URL: {h(current_url)}",
         process_apiurl_change,
         idx_,
         back_target=f"api_service_{idx_}",
@@ -467,19 +519,23 @@ def edit_apiurl(call: types.CallbackQuery) -> None:
 
 
 def edit_apikey(call: types.CallbackQuery) -> None:
+    idx_ = _parse_service_idx(call)
+    if idx_ is None:
+        return
     _safe_answer_callback(call)
-    idx_ = int(call.data.split("_")[-1])
     _start_ui_input_flow(call, f"Введите новый ключ для сервиса #{idx_}:", process_apikey_change, idx_, back_target=f"api_service_{idx_}")
 
 
 def edit_apiname(call: types.CallbackQuery) -> None:
+    idx_ = _parse_service_idx(call)
+    if idx_ is None:
+        return
     _safe_answer_callback(call)
-    idx_ = int(call.data.split("_")[-1])
     service_cfg = ((load_config().get("services") or {}).get(str(idx_))) or {}
     current_name = build_service_display_name(idx_, service_cfg.get("api_url"), service_cfg.get("name"))
     _start_ui_input_flow(
         call,
-        f"Введите новое название сервиса #{idx_}:\n\nТекущее название: {current_name}",
+        f"Введите новое название сервиса #{idx_}:\n\nТекущее название: {h(current_name)}",
         process_apiname_change,
         idx_,
         back_target=f"api_service_{idx_}",
@@ -487,13 +543,18 @@ def edit_apiname(call: types.CallbackQuery) -> None:
 
 
 def edit_apinum(call: types.CallbackQuery) -> None:
+    idx_ = _parse_service_idx(call)
+    if idx_ is None:
+        return
     _safe_answer_callback(call)
-    idx_ = int(call.data.split("_")[-1])
     _start_ui_input_flow(call, f"Введите новый номер для сервиса #{idx_}:", process_apinum_change, idx_, back_target=f"api_service_{idx_}")
 
 
 def check_balance(call: types.CallbackQuery) -> None:
-    check_balance_func(call, int(call.data.split("_")[-1]))
+    idx_ = _parse_service_idx(call)
+    if idx_ is None:
+        return
+    check_balance_func(call, idx_)
 
 
 def add_service(call: types.CallbackQuery) -> None:
@@ -509,26 +570,30 @@ def delete_service(call: types.CallbackQuery) -> None:
 def process_add_service(message: types.Message) -> None:
     try:
         srv_num = int(str(getattr(message, "text", None) or "").strip())
-        if srv_num < 1:
+        if not (1 <= srv_num <= MAX_PANEL_SERVICE_NUMBER):
             raise ValueError
     except ValueError:
-        _repeat_ui_input_flow(message.chat.id, "❌ Ошибка: Номер сервиса должен быть положительным числом.")
+        _repeat_ui_input_flow(
+            message.chat.id,
+            f"❌ Ошибка: Номер сервиса должен быть числом от 1 до {MAX_PANEL_SERVICE_NUMBER}.",
+        )
         return
 
-    cfg = load_config()
-    services = cfg.get("services", {}) or {}
-    service_key = str(srv_num)
-    if service_key in services:
-        _repeat_ui_input_flow(message.chat.id, f"❌ Сервис #{srv_num} уже существует.")
-        return
+    with CONFIG_LOCK:
+        cfg = load_config()
+        services = cfg.get("services", {}) or {}
+        service_key = str(srv_num)
+        if service_key in services:
+            _repeat_ui_input_flow(message.chat.id, f"❌ Сервис #{srv_num} уже существует.")
+            return
 
-    services[service_key] = {
-        "name": build_service_display_name(srv_num, "https://example.com/api/v2", None),
-        "api_url": "https://example.com/api/v2",
-        "api_key": "YOUR_API_KEY",
-    }
-    cfg["services"] = {k: v for k, v in _sort_service_items(services)}
-    save_config(cfg)
+        services[service_key] = {
+            "name": build_service_display_name(srv_num, "https://example.com/api/v2", None),
+            "api_url": "https://example.com/api/v2",
+            "api_key": "YOUR_API_KEY",
+        }
+        cfg["services"] = {k: v for k, v in _sort_service_items(services)}
+        save_config(cfg)
     _invalidate_balance_cache()
     _clear_ui_input_state(message.chat.id)
     _open_api_service_card(message.chat.id, srv_num)
@@ -541,16 +606,17 @@ def process_delete_service(message: types.Message) -> None:
         _repeat_ui_input_flow(message.chat.id, "❌ Ошибка: Номер сервиса должен быть числом.")
         return
 
-    cfg = load_config()
-    services = cfg.get("services", {}) or {}
-    service_key = str(srv_num)
-    if service_key not in services:
-        _repeat_ui_input_flow(message.chat.id, f"❌ Сервис #{srv_num} не существует.")
-        return
+    with CONFIG_LOCK:
+        cfg = load_config()
+        services = cfg.get("services", {}) or {}
+        service_key = str(srv_num)
+        if service_key not in services:
+            _repeat_ui_input_flow(message.chat.id, f"❌ Сервис #{srv_num} не существует.")
+            return
 
-    del services[service_key]
-    cfg["services"] = {k: v for k, v in _sort_service_items(services)}
-    save_config(cfg)
+        del services[service_key]
+        cfg["services"] = {k: v for k, v in _sort_service_items(services)}
+        save_config(cfg)
     _invalidate_balance_cache()
     _clear_ui_input_state(message.chat.id)
     _open_api_menu(message.chat.id)

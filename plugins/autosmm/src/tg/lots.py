@@ -9,7 +9,7 @@ from telebot import types
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from .. import runtime as rt
-from ..storage.storage import load_config, reindex_lots, save_config
+from ..storage.storage import CONFIG_LOCK, load_config, reindex_lots, save_config
 from .common import (
     _clear_lot_input_state,
     _clear_navigation_states,
@@ -110,17 +110,17 @@ def _render_search_results(
         if nav_buttons:
             kb.row(*nav_buttons)
         page_suffix = f" (стр. {current_page + 1}/{total_pages})" if total_pages > 1 else ""
-        text_ = f"🔍 Результаты поиска для '{term}'{page_suffix}:"
+        text_ = f"🔍 Результаты поиска для '{h(term)}'{page_suffix}:"
     else:
-        text_ = f"❌ Лоты по запросу '{term}' не найдены."
+        text_ = f"❌ Лоты по запросу '{h(term)}' не найдены."
 
     kb.add(InlineKeyboardButton("🔍 Новый поиск", callback_data="search_lot"))
     kb.add(InlineKeyboardButton("◀️ Назад", callback_data="lot_settings"))
 
     if message_id is not None:
-        _safe_edit_message_text(text_, chat_id, message_id, reply_markup=kb)
+        _safe_edit_message_text(text_, chat_id, message_id, parse_mode="HTML", reply_markup=kb)
     else:
-        rt.bot.send_message(chat_id, text_, reply_markup=kb)
+        rt.bot.send_message(chat_id, text_, parse_mode="HTML", reply_markup=kb)
 
 
 def search_results_back(call: types.CallbackQuery) -> None:
@@ -292,21 +292,6 @@ def _start_lot_edit_flow(call: types.CallbackQuery, lot_key: str, mode: str, pro
     _register_guarded_step_handler(msg_, next_handler, lot_key, expected_user_id=initiator_user_id)
 
 
-def _repeat_lot_edit_flow(chat_id: int, error_text: str = "") -> None:
-    rt.logger.debug(f"[TG STEP REPEAT] chat_id={chat_id}, error='{error_text}'")
-    state = _get_lot_input_state(chat_id)
-    if not state:
-        return
-    text_ = f"{error_text}\n\n{state['prompt_text']}" if error_text else state["prompt_text"]
-    msg_ = rt.bot.send_message(chat_id, text_, reply_markup=_build_lot_input_keyboard())
-    _register_guarded_step_handler(
-        msg_,
-        state["next_handler"],
-        state["lot_key"],
-        expected_user_id=state.get("initiator_user_id"),
-    )
-
-
 def lot_input_back_callback(call: types.CallbackQuery) -> None:
     _safe_answer_callback(call)
     state = _get_lot_input_state(call.message.chat.id)
@@ -361,30 +346,37 @@ def edit_lot(call: types.CallbackQuery, lot_key: str) -> None:
 
 
 def delete_one_lot(call: types.CallbackQuery, lot_key: str) -> None:
-    cfg = load_config()
-    lot_map = cfg.get("lot_mapping", {})
-    if lot_key in lot_map:
-        del lot_map[lot_key]
-        cfg["lot_mapping"] = lot_map
-        reindex_lots(cfg)
-        total_lots = len(cfg.get("lot_mapping", {}))
-        max_page = max(0, ((total_lots - 1) // 10)) if total_lots else 0
-        page_ = min(_get_lot_page_context(call.message.chat.id), max_page)
-        _set_lot_page_context(call.message.chat.id, page_)
+    removed = False
+    with CONFIG_LOCK:
+        cfg = load_config()
+        lot_map = cfg.get("lot_mapping", {})
+        if lot_key in lot_map:
+            del lot_map[lot_key]
+            cfg["lot_mapping"] = lot_map
+            reindex_lots(cfg)
+            total_lots = len(cfg.get("lot_mapping", {}))
+            max_page = max(0, ((total_lots - 1) // 10)) if total_lots else 0
+            page_ = min(_get_lot_page_context(call.message.chat.id), max_page)
+            _set_lot_page_context(call.message.chat.id, page_)
+            removed = True
+        else:
+            page_ = _get_lot_page_context(call.message.chat.id)
+    if removed:
         _safe_answer_callback(call, "Лот удалён")
         _safe_edit_message_text(
-            f"✅ Лот {lot_key} удалён и лоты переиндексированы.",
+            f"✅ Лот {h(lot_key)} удалён и лоты переиндексированы.",
             call.message.chat.id,
             call.message.message_id,
+            parse_mode="HTML",
             reply_markup=generate_lots_keyboard(page_),
         )
     else:
         _safe_answer_callback(call, "Лот не найден")
-        page_ = _get_lot_page_context(call.message.chat.id)
         _safe_edit_message_text(
-            f"❌ Лот {lot_key} не найден.",
+            f"❌ Лот {h(lot_key)} не найден.",
             call.message.chat.id,
             call.message.message_id,
+            parse_mode="HTML",
             reply_markup=generate_lots_keyboard(page_),
         )
 
@@ -396,7 +388,7 @@ def _finish_lot_edit(message: types.Message, lot_key: str, success_text: str) ->
     )
     state = _get_lot_input_state(message.chat.id) or {}
     _clear_lot_input_state(message.chat.id)
-    rt.bot.send_message(message.chat.id, success_text)
+    rt.bot.send_message(message.chat.id, success_text, parse_mode="HTML")
     _show_lot_card(
         message.chat.id,
         lot_key,
@@ -411,7 +403,7 @@ def _repeat_lot_edit_flow(chat_id: int, error_text: str = "") -> None:
     if not state:
         return
     text_ = f"{error_text}\n\n{state['prompt_text']}" if error_text else state["prompt_text"]
-    msg_ = rt.bot.send_message(chat_id, text_, reply_markup=_build_lot_input_keyboard())
+    msg_ = rt.bot.send_message(chat_id, text_, parse_mode="HTML", reply_markup=_build_lot_input_keyboard())
     _register_guarded_step_handler(
         msg_,
         state["next_handler"],
@@ -428,24 +420,26 @@ def _apply_lot_field_update(
     success_text: str,
     require_service_exists: bool = False,
 ) -> None:
-    cfg = load_config()
-    if require_service_exists and str(value) not in cfg.get("services", {}):
-        _repeat_lot_edit_flow(message.chat.id, f"❌ Ошибка: панель #{value} не существует.")
-        return
-    lot_map = cfg.get("lot_mapping", {})
-    if lot_key not in lot_map:
-        _clear_lot_input_state(message.chat.id)
-        rt.bot.send_message(
-            message.chat.id,
-            f"❌ Лот {lot_key} не найден.",
-            reply_markup=_inline_kb(("◀️ Назад", "lot_settings")),
-        )
-        return
-    target_lot = lot_map[lot_key]
-    target_lot[field_name] = value
-    cfg["lot_mapping"] = lot_map
-    reindex_lots(cfg)
-    updated_key = next((k for k, v in (cfg.get("lot_mapping") or {}).items() if v is target_lot), lot_key)
+    with CONFIG_LOCK:
+        cfg = load_config()
+        if require_service_exists and str(value) not in cfg.get("services", {}):
+            _repeat_lot_edit_flow(message.chat.id, f"❌ Ошибка: панель #{h(value)} не существует.")
+            return
+        lot_map = cfg.get("lot_mapping", {})
+        if lot_key not in lot_map:
+            _clear_lot_input_state(message.chat.id)
+            rt.bot.send_message(
+                message.chat.id,
+                f"❌ Лот {h(lot_key)} не найден.",
+                parse_mode="HTML",
+                reply_markup=_inline_kb(("◀️ Назад", "lot_settings")),
+            )
+            return
+        target_lot = lot_map[lot_key]
+        target_lot[field_name] = value
+        cfg["lot_mapping"] = lot_map
+        reindex_lots(cfg)
+        updated_key = next((k for k, v in (cfg.get("lot_mapping") or {}).items() if v is target_lot), lot_key)
     _finish_lot_edit(message, updated_key, success_text)
 
 
@@ -466,7 +460,13 @@ def process_name_change(message: types.Message, lot_key: str) -> None:
     if not new_name:
         _repeat_lot_edit_flow(message.chat.id, "❌ Ошибка: Название не может быть пустым.")
         return
-    _apply_lot_field_update(message, lot_key, "name", new_name, f"✅ Название лота {lot_key} изменено на {new_name}.")
+    _apply_lot_field_update(
+        message,
+        lot_key,
+        "name",
+        new_name,
+        f"✅ Название лота {h(lot_key)} изменено на {h(new_name)}.",
+    )
 
 
 def process_id_change(message: types.Message, lot_key: str) -> None:
@@ -519,40 +519,38 @@ def process_new_lot_id_step(message: types.Message) -> None:
         lot_fields = rt.cardinal_instance.account.get_lot_fields(lot_id)
         name = lot_fields.fields.get("fields[summary][ru]", "Без названия")
     except Exception as e:
-        _repeat_ui_input_flow(message.chat.id, f"❌ Не удалось получить данные лота: {e}")
+        _repeat_ui_input_flow(message.chat.id, f"❌ Не удалось получить данные лота: {h(e)}")
         return
 
-    cfg = load_config()
-    reindex_lots(cfg)
-    cfg = load_config()
-    lot_map = cfg.get("lot_mapping", {})
+    with CONFIG_LOCK:
+        cfg = load_config()
+        lot_map = cfg.get("lot_mapping", {})
 
-    lot_indices = []
-    for lot_key in lot_map.keys():
-        if str(lot_key).startswith("lot_"):
-            try:
-                lot_indices.append(int(str(lot_key).split("_", 1)[1]))
-            except Exception:
-                continue
-    new_lot_key = f"lot_{max(lot_indices, default=0) + 1}"
+        lot_indices = []
+        for lot_key in lot_map.keys():
+            if str(lot_key).startswith("lot_"):
+                try:
+                    lot_indices.append(int(str(lot_key).split("_", 1)[1]))
+                except Exception:
+                    continue
+        new_lot_key = f"lot_{max(lot_indices, default=0) + 1}"
 
-    new_lot_entry = {
-        "name": name,
-        "service_id": 1,
-        "quantity": 1,
-        "service_number": 1,
-        "fallback_service_number": None,
-        "fallback_service_id": None,
-    }
-    lot_map[new_lot_key] = new_lot_entry
-    cfg["lot_mapping"] = lot_map
-    reindex_lots(cfg)
-    final_lot_key = next((k for k, v in (cfg.get("lot_mapping") or {}).items() if v is new_lot_entry), new_lot_key)
+        new_lot_entry = {
+            "name": name,
+            "service_id": 1,
+            "quantity": 1,
+            "service_number": 1,
+            "fallback_service_number": None,
+            "fallback_service_id": None,
+        }
+        lot_map[new_lot_key] = new_lot_entry
+        cfg["lot_mapping"] = lot_map
+        reindex_lots(cfg)
+        final_lot_key = next((k for k, v in (cfg.get("lot_mapping") or {}).items() if v is new_lot_entry), new_lot_key)
+        page_ = max(0, ((len(cfg.get("lot_mapping") or lot_map) - 1) // 10))
     _clear_ui_input_state(message.chat.id)
-
-    page_ = max(0, ((len(cfg.get("lot_mapping") or lot_map) - 1) // 10))
     _set_lot_page_context(message.chat.id, page_)
-    rt.bot.send_message(message.chat.id, f"✅ Добавлен новый лот {final_lot_key} с названием: {name}")
+    rt.bot.send_message(message.chat.id, f"✅ Добавлен новый лот {h(final_lot_key)} с названием: {h(name)}", parse_mode="HTML")
     _show_lot_card(
         message.chat.id,
         final_lot_key,

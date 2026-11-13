@@ -19,7 +19,7 @@ from ..services.telemetry import (
     _telemetry_consent_accepted,
     _telemetry_gate_allows_menu,
 )
-from ..storage.storage import load_config, load_valid_links, reset_valid_links_to_defaults, save_config, save_valid_links
+from ..storage.storage import CONFIG_LOCK, load_config, load_valid_links, reset_valid_links_to_defaults, save_config, save_valid_links
 from .common import (
     _build_ui_input_keyboard, _clear_navigation_states, _clear_screen_state, _clear_step_handler,
     _clear_ui_input_state, _decode_callback_value, _edit_html_screen, _edit_screen_if_revision_matches,
@@ -191,11 +191,12 @@ AutoSMM может отправлять продавцу уведомления 
 
 
 def _update_config_value(key: str, value: Any) -> Dict[str, Any]:
-    cfg = load_config()
-    cfg[key] = value
-    save_config(cfg)
-    rt.config[key] = value
-    return cfg
+    with CONFIG_LOCK:
+        cfg = load_config()
+        cfg[key] = value
+        save_config(cfg)
+        rt.config[key] = value
+        return cfg
 
 
 def use_current_chat_for_notifications(call: types.CallbackQuery) -> None:
@@ -232,11 +233,12 @@ def _toggle_bool_setting(
     default: bool,
     refresh_screen: Callable[[types.CallbackQuery], Any],
 ) -> None:
-    cfg = load_config()
-    new_value = not bool(cfg.get(key, default))
-    cfg[key] = new_value
-    save_config(cfg)
-    rt.config[key] = new_value
+    with CONFIG_LOCK:
+        cfg = load_config()
+        new_value = not bool(cfg.get(key, default))
+        cfg[key] = new_value
+        save_config(cfg)
+        rt.config[key] = new_value
     _safe_answer_callback(call)
     refresh_screen(call)
 

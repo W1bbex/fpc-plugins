@@ -15,7 +15,7 @@ from ..storage.defaults import (
     DEFAULT_LINK_CONFIRM_TEMPLATE,
     _ensure_config_defaults,
 )
-from ..storage.storage import load_config, save_config
+from ..storage.storage import CONFIG_LOCK, load_config, save_config
 from .common import (
     _clear_navigation_states,
     _clear_step_handler,
@@ -139,26 +139,47 @@ def _get_current_template_text(template_key: str) -> str:
     return str(messages.get(template_key) or meta.get("default") or "")
 
 
+def _truncate_escaped_pre_body(raw_text: str, suffix_builder: Any) -> Tuple[str, str]:
+    escaped_full = html.escape(raw_text)
+    if len(suffix_builder(escaped_full, "")) <= 4096:
+        return escaped_full, ""
+    warning = "\n\n⚠️ Текст очень длинный, показана часть шаблона."
+    lo, hi = 0, len(raw_text)
+    best_escaped = ""
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        candidate_escaped = html.escape(raw_text[:mid].rstrip())
+        if len(suffix_builder(candidate_escaped, warning)) <= 4096:
+            best_escaped = candidate_escaped
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best_escaped, warning
+
+
 def _render_template_view_text(template_key: str) -> str:
     meta = _get_template_editor_def(template_key) or {}
     title = meta.get("title", "Текст сообщения")
-    template_for_view = _get_current_template_text(template_key)
-    warning = ""
-    if len(template_for_view) > 3500:
-        template_for_view = template_for_view[:3500].rstrip()
-        warning = "\n\n⚠️ Текст очень длинный, показаны первые 3500 символов."
+    raw_template = _get_current_template_text(template_key)
     variables = "\n".join(meta.get("variables") or [])
-    return f"""{html.escape(title)}
+    escaped_title = html.escape(title)
+    escaped_vars = html.escape(variables)
+
+    def _assemble(pre_body: str, warning: str) -> str:
+        return f"""{escaped_title}
 
 Текущий текст:
 
-<pre>{html.escape(template_for_view)}</pre>{warning}
+<pre>{pre_body}</pre>{warning}
 
 Доступные переменные:
-{html.escape(variables)}
+{escaped_vars}
 
 Полный список переменных:
 https://teletype.in/@w1bbex/AutoSMM""".strip()
+
+    pre_body, warning = _truncate_escaped_pre_body(raw_template, _assemble)
+    return _assemble(pre_body, warning)
 
 
 def _show_template_editor_screen(chat_id: int, message_id: Optional[int], template_key: str) -> None:
@@ -185,8 +206,10 @@ def _extract_template_meta(call: types.CallbackQuery, prefix: str) -> Tuple[str,
 
 
 def template_view_callback(call: types.CallbackQuery) -> None:
-    template_key = call.data.split("template_view_", 1)[1]
     _safe_answer_callback(call)
+    template_key, meta = _extract_template_meta(call, "template_view_")
+    if not meta:
+        return
     _show_template_editor_screen(call.message.chat.id, call.message.message_id, template_key)
 
 
@@ -225,9 +248,10 @@ def template_reset_confirm_callback(call: types.CallbackQuery) -> None:
     template_key, meta = _extract_template_meta(call, "template_reset_confirm_")
     if not meta:
         return
-    cfg = load_config()
-    cfg.setdefault("messages", {})[template_key] = meta.get("default") or ""
-    save_config(cfg)
+    with CONFIG_LOCK:
+        cfg = load_config()
+        cfg.setdefault("messages", {})[template_key] = meta.get("default") or ""
+        save_config(cfg)
     _safe_answer_callback(call, "Текст сброшен")
     _show_template_editor_screen(call.message.chat.id, call.message.message_id, template_key)
 
@@ -241,9 +265,10 @@ def process_template_text_change(message: types.Message, template_key: str) -> N
         _clear_ui_input_state(message.chat.id)
         rt.bot.send_message(message.chat.id, "❌ Неизвестный текст сообщения.", reply_markup=_inline_kb(("◀️ Назад", "edit_messages")))
         return
-    cfg = load_config()
-    cfg.setdefault("messages", {})[template_key] = new_text
-    save_config(cfg)
+    with CONFIG_LOCK:
+        cfg = load_config()
+        cfg.setdefault("messages", {})[template_key] = new_text
+        save_config(cfg)
     _clear_ui_input_state(message.chat.id)
     rt.bot.send_message(message.chat.id, "✅ Текст обновлён.")
     _show_template_editor_screen(message.chat.id, None, template_key)
@@ -276,12 +301,13 @@ def reset_message_texts_prompt(call: types.CallbackQuery) -> None:
 
 
 def reset_message_texts_confirm(call: types.CallbackQuery) -> None:
-    cfg = load_config()
-    cfg.setdefault("messages", {})
-    for key, meta in TEMPLATE_EDITOR_DEFS.items():
-        cfg["messages"][key] = meta.get("default") or ""
-    _ensure_config_defaults(cfg)
-    save_config(cfg)
+    with CONFIG_LOCK:
+        cfg = load_config()
+        cfg.setdefault("messages", {})
+        for key, meta in TEMPLATE_EDITOR_DEFS.items():
+            cfg["messages"][key] = meta.get("default") or ""
+        _ensure_config_defaults(cfg)
+        save_config(cfg)
     _safe_answer_callback(call, "Тексты сброшены")
     edit_messages_menu(call)
 
