@@ -99,6 +99,29 @@ _BACKUP_FILE_EXPECTED_TYPES: Dict[str, Any] = {
 }
 
 
+MAX_BACKUP_FILES_TO_KEEP = 20
+
+
+def _prune_old_backups(backups_dir: str, max_keep: int = MAX_BACKUP_FILES_TO_KEEP) -> None:
+    if max_keep < 1 or not os.path.isdir(backups_dir):
+        return
+    try:
+        entries = [
+            os.path.join(backups_dir, name)
+            for name in os.listdir(backups_dir)
+            if name.startswith(("autosmm_backup_", "autosmm_emergency_backup_")) and name.endswith(".json")
+        ]
+        entries = [path for path in entries if os.path.isfile(path)]
+        entries.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        for stale_path in entries[max_keep:]:
+            try:
+                os.remove(stale_path)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 def _create_full_backup(reason: str = "manual_export") -> Optional[str]:
     try:
         os.makedirs(rt.AUTOSMM_BACKUPS_DIR, exist_ok=True)
@@ -107,6 +130,7 @@ def _create_full_backup(reason: str = "manual_export") -> Optional[str]:
         payload = _build_full_backup_payload(reason=reason)
         if not _safe_write_json(backup_path, payload):
             return None
+        _prune_old_backups(rt.AUTOSMM_BACKUPS_DIR)
         return backup_path
     except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
         logger.error(f"Не удалось создать полный бэкап AutoSMM: {exc}")

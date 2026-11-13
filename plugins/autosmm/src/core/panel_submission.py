@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     from cardinal import Cardinal
 
 from .. import runtime as rt
-from ..models import is_order_refundedish as _is_order_refundedish
+from ..models import is_order_refundedish as _is_order_refundedish, normalize_chat_id as _normalize_chat_id
 from ..services.notifications import (
     _send_admin_order_alert,
     _send_transport_error_after_add_alert,
@@ -111,11 +111,13 @@ def _persist_created_order_records(
     with ORDERS_LOCK:
         existing = get_order_data(order_id_funpay)
         already_refunded = bool(existing and _is_order_refundedish(existing))
+        resolved_status = (existing.get("status") or "canceled") if already_refunded else "pending"
+        resolved_panel_status = (existing.get("panel_status") or "canceled") if already_refunded else "pending"
         upsert_order_data(
             buyer_chat_id,
             order_id_funpay,
             panel_order_id,
-            "pending",
+            resolved_status,
             float(lot_price),
             link_,
             real_amount,
@@ -128,7 +130,7 @@ def _persist_created_order_records(
             order_id_funpay,
             buyer_flow_state=BUYER_STATE_REFUNDED if already_refunded else BUYER_STATE_PANEL_CREATED,
             panel_order_id=panel_order_id,
-            panel_status="pending",
+            panel_status=resolved_panel_status,
             saved_link=None,
             status_stop_reason=None,
             status_last_error=None,
@@ -156,7 +158,8 @@ def _mark_persist_failure_after_add(
         f"PERSIST FAILED AFTER PANEL ADD: order=#{order_id_str}, panel_order_id={panel_order_id}, "
         f"service=#{service_number}, link={link_}, error={exc}"
     )
-    rt.waiting_for_link.pop(order_id_str, None)
+    with rt.CONTEXT_LOCK:
+        rt.waiting_for_link.pop(order_id_str, None)
     try:
         update_order_fields(
             order_id_str,
@@ -175,7 +178,9 @@ def _mark_persist_failure_after_add(
         rt.logger.error(f"Не удалось обновить статус persist_failed_after_add для #{order_id_str}: {inner_ex}")
 
     try:
-        _send_buyer_message(c, int(buyer_chat_id), BUYER_ADD_TRANSPORT_MANUAL_TEXT)
+        resolved_chat_id = _normalize_chat_id(buyer_chat_id)
+        if resolved_chat_id is not None:
+            _send_buyer_message(c, resolved_chat_id, BUYER_ADD_TRANSPORT_MANUAL_TEXT)
     except Exception as buyer_ex:
         rt.logger.warning(f"Не удалось отправить buyer manual text по persist-failure #{order_id_str}: {buyer_ex}")
 
@@ -263,7 +268,8 @@ def _finalize_created_order(
         )
         return
 
-    rt.waiting_for_link.pop(str(order_id_funpay), None)
+    with rt.CONTEXT_LOCK:
+        rt.waiting_for_link.pop(str(order_id_funpay), None)
     try:
         schedule_single_panel_balance_refresh(int(service_number or 1), cfg=cfg)
     except Exception as balance_ex:
@@ -289,7 +295,6 @@ def _finalize_created_order(
                 c,
                 order_id_funpay,
                 panel_order_id,
-                link_,
                 api_url,
                 api_key,
                 lot_price,
@@ -344,7 +349,7 @@ def _handle_transport_error_after_add(
                 saved_link=link_,
                 service_number=int(service_number or 1),
                 seed_fields={
-                    "chat_id": int(buyer_chat_id),
+                    "chat_id": _normalize_chat_id(buyer_chat_id),
                     "lot_title": lot_title or "—",
                     "service_id": int(service_id or 0),
                     "quantity": int(real_amount or 0),
@@ -368,10 +373,13 @@ def _handle_transport_error_after_add(
     if fallback_reason:
         update_kwargs["fallback_reason"] = fallback_reason
     update_order_fields(order_id_str, **update_kwargs)
-    rt.waiting_for_link.pop(order_id_str, None)
+    with rt.CONTEXT_LOCK:
+        rt.waiting_for_link.pop(order_id_str, None)
 
     try:
-        _send_buyer_message(c, int(buyer_chat_id), BUYER_ADD_TRANSPORT_MANUAL_TEXT)
+        resolved_chat_id = _normalize_chat_id(buyer_chat_id)
+        if resolved_chat_id is not None:
+            _send_buyer_message(c, resolved_chat_id, BUYER_ADD_TRANSPORT_MANUAL_TEXT)
     except Exception as ex:
         rt.logger.warning(f"Не удалось отправить buyer manual text по transport-error #{order_id_str}: {ex}")
 
@@ -574,7 +582,10 @@ def _handle_unclaimed_submission(
     claim_reason: str,
     current_order: Optional[Dict[str, Any]],
 ) -> None:
-    rt.waiting_for_link.pop(order_id_funpay, None)
+    with rt.CONTEXT_LOCK:
+        rt.waiting_for_link.pop(order_id_funpay, None)
+    if buyer_chat_id is None:
+        return
     if claim_reason == "refunded":
         _apply_refund_gate(c, current_order or {"order_id": order_id_funpay, "funpay_status": "refunded"}, notify_chat_id=buyer_chat_id, force_check=False)
         return
@@ -602,10 +613,12 @@ def process_link_without_confirmation(c: "Cardinal", data: Dict) -> None:
     existing_order = get_order_data(order_id_str)
 
     if existing_order and _apply_refund_gate(c, existing_order, notify_chat_id=buyer_chat_id, force_check=True):
-        rt.waiting_for_link.pop(order_id_str, None)
+        with rt.CONTEXT_LOCK:
+            rt.waiting_for_link.pop(order_id_str, None)
         return
     if existing_order and _has_panel_order(existing_order):
-        rt.waiting_for_link.pop(order_id_str, None)
+        with rt.CONTEXT_LOCK:
+            rt.waiting_for_link.pop(order_id_str, None)
         _send_buyer_message(c, buyer_chat_id, BUYER_PANEL_CREATED_BLOCK_TEXT)
         return
 
@@ -636,10 +649,13 @@ def process_link_without_confirmation(c: "Cardinal", data: Dict) -> None:
             },
         )
     except Exception as exc:
-        rt.waiting_for_link.pop(order_id_str, None)
+        with rt.CONTEXT_LOCK:
+            rt.waiting_for_link.pop(order_id_str, None)
         rt.logger.exception(f"PRE-ADD CLAIM FAILED (ORDER ABORTED WITHOUT PANEL CALL): order=#{order_id_str}, error={exc}")
         try:
-            _send_buyer_message(c, int(buyer_chat_id), BUYER_ADD_TRANSPORT_MANUAL_TEXT)
+            resolved_chat_id = _normalize_chat_id(buyer_chat_id)
+            if resolved_chat_id is not None:
+                _send_buyer_message(c, resolved_chat_id, BUYER_ADD_TRANSPORT_MANUAL_TEXT)
         except Exception as notify_exc:
             rt.logger.debug(
                 "Pre-add claim buyer notification failed for order #%s: %s",
@@ -648,9 +664,11 @@ def process_link_without_confirmation(c: "Cardinal", data: Dict) -> None:
             )
         return
 
-    rt.waiting_for_link.pop(order_id_str, None)
+    with rt.CONTEXT_LOCK:
+        rt.waiting_for_link.pop(order_id_str, None)
     if not claimed:
-        _handle_unclaimed_submission(c, order_id_str, int(buyer_chat_id), claim_reason, current_order)
+        resolved_chat_id = _normalize_chat_id(buyer_chat_id)
+        _handle_unclaimed_submission(c, order_id_str, resolved_chat_id, claim_reason, current_order)
         return
 
     balance_before = _get_panel_balance_for_risk_check(service_number)

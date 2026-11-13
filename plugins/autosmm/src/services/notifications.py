@@ -19,7 +19,6 @@ if TYPE_CHECKING:
 
 from .. import runtime as rt
 from ..core.buyer_messages import _render_template
-from ..core.engine import BUYER_STATE_COMPLETED
 from ..core.panel_api import (
     _build_transport_error_balance_note,
     _panel_api_json,
@@ -86,8 +85,9 @@ def _send_manual_check_alert_once(
         return
 
     claimed, snapshot = db_orders.claim_manual_check_alert(order_id_funpay)
-    if not claimed and snapshot is not None:
-        order_record["manual_check_alert_sent"] = bool(snapshot.get("manual_check_alert_sent", True))
+    if not claimed:
+        if snapshot is not None:
+            order_record["manual_check_alert_sent"] = bool(snapshot.get("manual_check_alert_sent", True))
         return
 
     sent = _send_admin_order_alert(
@@ -141,6 +141,12 @@ def _fetch_start_notification_charge(
         )
         if invalid_json or not isinstance(status_data, dict):
             raise ValueError("панель не вернула JSON статуса")
+        if status_data.get("error") or status_data.get("charge") in (None, ""):
+            rt.logger.warning(
+                f"START NOTIFICATION CHARGE UNAVAILABLE: order=#{order_id_funpay}, "
+                f"panel_order_id={panel_order_id}, error={status_data.get('error')}"
+            )
+            return None, None, None, None, None
 
         charge = safe_float(status_data.get("charge"), 0.0)
         currency = normalize_currency_code(status_data.get("currency", "USD"))
@@ -237,7 +243,6 @@ def send_order_started_notification(
     c: "Cardinal",
     order_id_funpay: str,
     panel_order_id: int,
-    link: str,
     api_url: str,
     api_key: str,
     lot_price: float,

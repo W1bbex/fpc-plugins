@@ -221,7 +221,7 @@ def _get_buyer_flow_state(order_record: Optional[Dict]) -> str:
     if _has_panel_order(order_record):
         if panel_status == "completed":
             return BUYER_STATE_COMPLETED
-        if panel_status in ("fail", "failed", "canceled", "cancelled", "unknown"):
+        if panel_status in ("fail", "failed", "canceled", "cancelled", "partial", "unknown"):
             return BUYER_STATE_FAILED
         return BUYER_STATE_PANEL_CREATED
 
@@ -231,8 +231,12 @@ def _get_buyer_flow_state(order_record: Optional[Dict]) -> str:
 
 
 def _find_lot_matches_by_description(description: Any) -> List[Tuple[str, Dict]]:
-    return _engine_find_lot_matches_by_description(description, mapping=rt.lot_mapping)
+    with CONFIG_LOCK:
+        mapping_copy = dict(rt.lot_mapping)
+    return _engine_find_lot_matches_by_description(description, mapping=mapping_copy)
 
 
 def resolve_lot_by_description(description: str, order_amount: int) -> Dict[str, Any]:
-    return _engine_resolve_lot_by_description(description, order_amount, mapping=rt.lot_mapping)
+    with CONFIG_LOCK:
+        mapping_copy = dict(rt.lot_mapping)
+    return _engine_resolve_lot_by_description(description, order_amount, mapping=mapping_copy)

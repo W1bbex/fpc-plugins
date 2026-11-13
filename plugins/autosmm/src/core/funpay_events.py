@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import TYPE_CHECKING, Any, Dict
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 if TYPE_CHECKING:
     from cardinal import Cardinal
@@ -74,6 +74,24 @@ _REFILL_UNAVAILABLE_TEXT = (
 )
 
 
+def _resolve_buyer_command_order(
+    c: Cardinal,
+    raw_ref: str,
+    msg_author_id: Any,
+    msg_chat_id: int,
+) -> Optional[Dict[str, Any]]:
+    found = _find_order_by_any_order_ref(
+        raw_ref,
+        buyer_id=msg_author_id,
+        buyer_chat_id=msg_chat_id,
+        access_checker=_buyer_can_access_order,
+    )
+    if not found or not _buyer_can_access_order(found, msg_author_id, msg_chat_id):
+        c.send_message(msg_chat_id, ORDER_NOT_FOUND_TEXT)
+        return None
+    return found
+
+
 def _handle_buyer_check_command(
     c: Cardinal,
     msg_text: str,
@@ -84,10 +102,8 @@ def _handle_buyer_check_command(
     if not match:
         return False
 
-    raw_ref = match.group(1).strip()
-    found = _find_order_by_any_order_ref(raw_ref)
-    if not found or not _buyer_can_access_order(found, msg_author_id, msg_chat_id):
-        c.send_message(msg_chat_id, ORDER_NOT_FOUND_TEXT)
+    found = _resolve_buyer_command_order(c, match.group(1).strip(), msg_author_id, msg_chat_id)
+    if not found:
         return True
 
     if _is_order_refundedish(found):
@@ -145,10 +161,8 @@ def _handle_buyer_refill_command(
     if not match:
         return False
 
-    raw_ref = match.group(1).strip()
-    found = _find_order_by_any_order_ref(raw_ref)
-    if not found or not _buyer_can_access_order(found, msg_author_id, msg_chat_id):
-        c.send_message(msg_chat_id, ORDER_NOT_FOUND_TEXT)
+    found = _resolve_buyer_command_order(c, match.group(1).strip(), msg_author_id, msg_chat_id)
+    if not found:
         return True
     if _apply_refund_gate(c, found, notify_chat_id=msg_chat_id, force_check=True):
         return True
@@ -158,15 +172,21 @@ def _handle_buyer_refill_command(
         c.send_message(msg_chat_id, "Заказ ещё не запущен. Рефилл будет доступен только после запуска заказа.")
         return True
 
-    cfg = load_config()
-    service_cfg = cfg.get("services", {}).get(str(found.get("service_number")))
-    if not service_cfg:
+    service_number = _safe_int(found.get("service_number"))
+    if service_number is None:
         c.send_message(msg_chat_id, _REFILL_UNAVAILABLE_TEXT)
         return True
 
-    api_url = service_cfg.get("api_url")
+    cfg = load_config()
+    services = cfg.get("services") if isinstance(cfg, dict) else None
+    service_cfg = services.get(str(service_number)) if isinstance(services, dict) else None
+    if not isinstance(service_cfg, dict):
+        c.send_message(msg_chat_id, _REFILL_UNAVAILABLE_TEXT)
+        return True
+
+    api_url = str(service_cfg.get("api_url") or "").strip()
     api_key = _normalize_api_key(service_cfg.get("api_key"))
-    if _validate_api_key_for_action(found.get("service_number"), "refill", api_key):
+    if not api_url or _validate_api_key_for_action(service_number, "refill", api_key):
         c.send_message(msg_chat_id, _REFILL_UNAVAILABLE_TEXT)
         return True
 
@@ -351,20 +371,21 @@ def _persist_and_notify_matched_order(
     )
     _send_buyer_message(c, buyer_chat_id, msg_payment)
 
-    rt.waiting_for_link[str(order_id)] = {
-        "buyer_id": buyer_id,
-        "chat_id": buyer_chat_id,
-        "buyer_username": buyer_username,
-        "service_id": service_id,
-        "real_amount": real_amount,
-        "order_id_funpay": str(order_id),
-        "price": order_price,
-        "service_number": srv_number,
-        "lot_key": matched_lot_key,
-        "lot_title": matched_lot_title,
-        "state": BUYER_STATE_WAITING_LINK,
-        "step": "await_link",
-    }
+    with rt.CONTEXT_LOCK:
+        rt.waiting_for_link[str(order_id)] = {
+            "buyer_id": buyer_id,
+            "chat_id": buyer_chat_id,
+            "buyer_username": buyer_username,
+            "service_id": service_id,
+            "real_amount": real_amount,
+            "order_id_funpay": str(order_id),
+            "price": order_price,
+            "service_number": srv_number,
+            "lot_key": matched_lot_key,
+            "lot_title": matched_lot_title,
+            "state": BUYER_STATE_WAITING_LINK,
+            "step": "await_link",
+        }
 
 
 def _resolve_buyer_chat_target(c: Cardinal, order_: Any) -> tuple[Any, Any, str]:
@@ -455,7 +476,8 @@ def auto_smm_handler(c: Cardinal, e: Any, *args: Any) -> None:
     if not rt.RUNNING:
         return
     if isinstance(e, NewMessageEvent):
-        _handle_new_message_event(c, e, c.account.id)
+        my_id = getattr(getattr(c, "account", None), "id", None)
+        _handle_new_message_event(c, e, my_id)
     elif isinstance(e, NewOrderEvent):
         _handle_new_order_event(c, e)
     elif OrderStatusChangedEvent is not None and isinstance(e, OrderStatusChangedEvent):

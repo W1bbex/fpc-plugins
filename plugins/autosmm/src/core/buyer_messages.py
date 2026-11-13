@@ -219,6 +219,8 @@ def _buyer_status_label(order_record: Dict) -> str:
     if state == BUYER_STATE_COMPLETED:
         return "выполнен"
     if state == BUYER_STATE_FAILED:
+        if str(order_record.get("panel_status") or order_record.get("status") or "").strip().lower() == "partial":
+            return "выполнен частично (требует проверки)"
         return "требует проверки"
     if state == BUYER_STATE_REFUNDED:
         return "недоступен после возврата"

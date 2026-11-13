@@ -24,6 +24,7 @@ from ..storage.storage import (
     load_config,
     update_order_fields,
 )
+from .buyer_messages import _send_buyer_message
 from .engine import (
     BUYER_STATE_FAILED,
     BUYER_STATE_REFUNDED,
@@ -135,7 +136,8 @@ def mark_order_refunded(order_id_funpay: str, detected_at: str | None = None, so
             return False
         if not updated:
             return False
-        rt.waiting_for_link.pop(str(order_id_funpay), None)
+        with rt.CONTEXT_LOCK:
+            rt.waiting_for_link.pop(str(order_id_funpay), None)
 
     # Release ORDERS_LOCK before performing external SMM panel HTTP calls.
     _attempt_panel_cancel_after_funpay_refund(order_snapshot, source=source or "refund_mark")
@@ -212,10 +214,11 @@ def refund_order(
                 f"REFUND STATE PERSIST FAILED: заказ #{order_id_funpay} возвращён на FunPay, "
                 f"но обновление SQLite вернуло False."
             )
-        rt.waiting_for_link.pop(str(order_id_funpay), None)
+        with rt.CONTEXT_LOCK:
+            rt.waiting_for_link.pop(str(order_id_funpay), None)
 
         try:
-            c.send_message(buyer_chat_id, f"❌ Ваши средства возвращены по причине: {reason}")
+            _send_buyer_message(c, buyer_chat_id, f"❌ Ваши средства возвращены по причине: {reason}")
         except Exception as msg_ex:
             rt.logger.warning(f"Не удалось уведомить покупателя о возврате #{order_id_funpay}: {msg_ex}")
 

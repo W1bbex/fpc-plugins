@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from enum import Enum
 import re
 from typing import Any, Dict, List, Mapping, Optional
@@ -64,6 +64,21 @@ def safe_int(value: Any) -> Optional[int]:
             return int(float(text))
         except (ValueError, OverflowError):
             return None
+
+
+def normalize_chat_id(value: Any) -> Any:
+    """Normalize numeric chat_id to int while preserving opaque FunPay string IDs (e.g. users-...)."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return text
 
 
 def safe_float(value: Any, default: float = 0.0) -> float:
@@ -174,27 +189,26 @@ def is_plausible_allowed_domain(domain_value: Any) -> bool:
 def extract_progress_values(order_record: Optional[Mapping[str, Any]]) -> Dict[str, int]:
     """Compute consistent total/done/left/progress_percent counters for an order."""
     rec = order_record or {}
-    total = (
-        safe_int(
-            rec.get("total_quantity")
-            or rec.get("quantity")
-            or rec.get("real_amount")
-            or rec.get("order_amount")
-        )
-        or 0
-    )
+    total: Optional[int] = None
+    for key in ("total_quantity", "quantity", "real_amount", "order_amount"):
+        parsed = safe_int(rec.get(key))
+        if parsed is not None:
+            total = parsed
+            break
+    if total is None:
+        total = 0
     done = safe_int(rec.get("done_quantity"))
     left = safe_int(rec.get("left_quantity"))
     if left is None:
         left = safe_int(rec.get("remains"))
-    if done is None and total and left is not None:
+    if done is None and total > 0 and left is not None:
         done = max(0, total - max(0, left))
-    if left is None and total and done is not None:
+    if left is None and total > 0 and done is not None:
         left = max(0, total - max(0, done))
     if done is None:
         done = 0
     if left is None:
-        left = max(0, total - done) if total else 0
+        left = max(0, total - done) if total > 0 else 0
     progress_percent = int(max(0, min(100, round((done / total) * 100)))) if total > 0 else 0
     return {
         "total_quantity": total,
@@ -209,7 +223,7 @@ class OrderRecord:
     """Unified persisted domain representation of an AutoSMM order."""
 
     order_id: str
-    chat_id: Optional[int] = None
+    chat_id: Any = None
     buyer_id: Any = None
     buyer_username: str = ""
     lot_title: str = ""
@@ -270,7 +284,7 @@ class OrderRecord:
         parsed_service_num = safe_int(raw.get("service_number"))
         return cls(
             order_id=str(raw.get("order_id") or ""),
-            chat_id=safe_int(raw.get("chat_id")),
+            chat_id=normalize_chat_id(raw.get("chat_id")),
             buyer_id=raw.get("buyer_id"),
             buyer_username=str(raw.get("buyer_username") or ""),
             lot_title=str(raw.get("lot_title") or ""),
@@ -357,7 +371,3 @@ class LotMatchResult:
             "error": self.error or "no_match",
             "matches": list(self.matches or []),
         }
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Serialize to dict format expected by buyer_flow and orders."""
-        return asdict(self)

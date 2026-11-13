@@ -11,7 +11,6 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 from .. import runtime as rt
 from ..models import (
     BuyerFlowState,
-    OrderRecord,
     extract_progress_values,
     get_effective_funpay_status,
     is_refunded_funpay_status,
@@ -19,6 +18,7 @@ from ..models import (
     optional_float,
     resolve_panel_order_id,
     safe_float,
+    normalize_chat_id,
     safe_int,
 )
 from .db import _connect, _json_dumps_optional, _json_loads_optional
@@ -185,7 +185,7 @@ def _row_to_order_dict(row: sqlite3.Row) -> Dict[str, Any]:
     if row["fx_rate_to_rub"] is not None:
         data["fx_rate_to_rub"] = float(row["fx_rate_to_rub"])
     if row["chat_id"] is not None:
-        data["chat_id"] = int(row["chat_id"])
+        data["chat_id"] = normalize_chat_id(row["chat_id"])
     if row["service_id"] is not None:
         data["service_id"] = int(row["service_id"])
 
@@ -234,7 +234,7 @@ def _prepare_order_params(raw: Mapping[str, Any]) -> Optional[Tuple[Any, ...]]:
 
     return (
         order_id,
-        safe_int(raw.get("chat_id")),
+        normalize_chat_id(raw.get("chat_id")),
         None if buyer_raw is None else str(buyer_raw),
         _json_dumps_optional(buyer_raw),
         str(raw.get("buyer_username") or ""),
@@ -392,6 +392,7 @@ def upsert_order(
             )
 
         existing_summa = safe_float(existing.get("summa"), 0.0)
+        existing_spent = safe_float(existing.get("spent"), 0.0)
         existing_chistota = safe_float(existing.get("chistota"), 0.0)
         incoming_chistota = safe_float(chistota, 0.0)
 
@@ -399,7 +400,7 @@ def upsert_order(
         merged.update(
             {
                 "order_id": target_id,
-                "chat_id": chat_id,
+                "chat_id": normalize_chat_id(chat_id),
                 "panel_order_id": panel_order_id,
                 "id_zakaz": panel_order_id,
                 "status": status,
@@ -408,8 +409,8 @@ def upsert_order(
                 "service_number": service_number,
                 "funpay_status": normalized_funpay_status,
                 "summa": existing_summa if existing_summa > 0.0 else incoming_chistota,
-                "spent": safe_float(existing.get("spent"), 0.0),
-                "chistota": existing_chistota if existing_chistota > 0.0 else incoming_chistota,
+                "spent": existing_spent,
+                "chistota": existing_chistota if (existing_chistota != 0.0 or existing_spent > 0.0) else incoming_chistota,
                 "currency": str(existing.get("currency") or "RUB"),
                 "created_at": safe_int(existing.get("created_at")) or now_ts,
                 "completed_notification_sent": bool(existing.get("completed_notification_sent", False)),

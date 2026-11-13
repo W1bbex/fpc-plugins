@@ -113,6 +113,8 @@ def _panel_api_request(
     SocPanel PHP examples). GET is a compatibility fallback for older panels.
     """
     url = str(api_url or "").strip()
+    if not url:
+        raise ValueError("не указан API URL панели")
     data = _stringify_panel_params(params)
     action = str(data.get("action") or "")
     post_error: Optional[Exception] = None

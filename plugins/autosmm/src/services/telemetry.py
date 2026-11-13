@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from cardinal import Cardinal
 
 from .. import runtime as rt
-from ..storage.storage import STATE_LOCK, _load_autosmm_state, _save_autosmm_state, load_config
+from ..storage.storage import STATE_LOCK, _load_autosmm_state, _save_autosmm_state, load_config, update_state_fields
 
 TELEMETRY_URL = "https://api.w1bbex.ru/v1/autosmm/telemetry"
 TELEMETRY_PING_INTERVAL_SECONDS = 86400
@@ -131,11 +131,8 @@ def _telemetry_get_funpay_identity(c: Optional[Cardinal] = None, *, fallback) ->
 
 
 def _set_telemetry_state_fields(**updates: Any) -> None:
-    """Atomically apply state field updates under STATE_LOCK."""
-    with STATE_LOCK:
-        state = _load_autosmm_state()
-        state.update(updates)
-        _save_autosmm_state(state)
+    """Atomically apply state field updates in kv_state."""
+    update_state_fields(**updates)
 
 
 def _get_telemetry_consent_state() -> Optional[bool]:
@@ -199,10 +196,6 @@ def _remember_telemetry_chat_id(chat_id: Optional[int]) -> None:
 def _telemetry_guest_active() -> bool:
     remaining = _get_telemetry_guest_remaining_seconds()
     return bool(remaining is not None and remaining > 0)
-
-
-def _telemetry_allows_ping() -> bool:
-    return _telemetry_consent_accepted()
 
 
 def _telemetry_gate_allows_menu() -> bool:
@@ -351,26 +344,12 @@ def _get_anonymous_install_id(c: Optional[Cardinal] = None) -> str:
         cached_hash = str(state.get("telemetry_identity_hash") or "").strip().lower()
     if cached_hash and not _looks_like_anonymous_install_id(cached_hash):
         cached_hash = ""
+    if cached_hash:
+        return cached_hash
 
     # Resolve identity outside STATE_LOCK in case account inspection touches network/API state.
     username, user_id, source = _get_funpay_identity(c)
     new_hash = build_anonymous_install_id(username, user_id)
-
-    if cached_hash:
-        if cached_hash == new_hash:
-            return cached_hash
-        _set_telemetry_state_fields(
-            telemetry_identity_debug={
-                "last_mismatch_at": rt.now_str(),
-                "cached_hash_prefix": cached_hash[:8],
-                "new_hash_prefix": new_hash[:8],
-                "source": source,
-            }
-        )
-        rt.logger.warning(
-            "TELEMETRY IDENTITY MISMATCH: cached hash differs from current FunPay identity hash; using cached hash"
-        )
-        return cached_hash
 
     _set_telemetry_state_fields(
         telemetry_identity_hash=new_hash,

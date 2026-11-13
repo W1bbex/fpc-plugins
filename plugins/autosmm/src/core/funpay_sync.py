@@ -26,6 +26,7 @@ from .. import runtime as rt
 from ..models import (
     get_effective_funpay_status as _get_effective_funpay_status,
     is_order_refundedish as _is_order_refundedish,
+    normalize_chat_id as _normalize_chat_id,
     normalize_funpay_status as _normalize_funpay_status,
     safe_int as _safe_int,
 )
@@ -145,7 +146,20 @@ def _apply_funpay_status_update(
     if not normalized_status:
         return dict(order_record)
 
-    previous_funpay_status = _get_effective_funpay_status(order_record)
+    previous_funpay_status = _get_effective_funpay_status(get_order_data(order_id_funpay)) or _get_effective_funpay_status(order_record)
+    if previous_funpay_status == "refunded" and normalized_status != "refunded":
+        rt.logger.info(
+            f"FUNPAY STATUS REGRESSION BLOCKED: order=#{order_id_funpay}, "
+            f"{previous_funpay_status}->{normalized_status}, source={source}"
+        )
+        return dict(order_record)
+    if previous_funpay_status == "partially_refunded" and normalized_status == "open":
+        rt.logger.info(
+            f"FUNPAY STATUS REGRESSION BLOCKED: order=#{order_id_funpay}, "
+            f"{previous_funpay_status}->{normalized_status}, source={source}"
+        )
+        return dict(order_record)
+
     fields: Dict[str, Any] = {
         "funpay_status": normalized_status,
         "funpay_status_checked_at": checked_at,
@@ -160,7 +174,8 @@ def _apply_funpay_status_update(
                 "updated_at": checked_at,
             }
         )
-        rt.waiting_for_link.pop(str(order_id_funpay), None)
+        with rt.CONTEXT_LOCK:
+            rt.waiting_for_link.pop(str(order_id_funpay), None)
 
     try:
         update_order_fields(order_id_funpay, **fields)
@@ -196,8 +211,8 @@ def _sync_funpay_status_from_event(c: Optional["Cardinal"], message: Any) -> boo
         rt.logger.info(f"FUNPAY STATUS LIVE: заказ #{order_id} не найден в БД AutoSMM (status={funpay_status})")
         return True
 
-    stored_chat_id = _safe_int(order_data.get("chat_id"))
-    msg_chat_id = _safe_int(getattr(message, "chat_id", None))
+    stored_chat_id = _normalize_chat_id(order_data.get("chat_id"))
+    msg_chat_id = _normalize_chat_id(getattr(message, "chat_id", None))
     if stored_chat_id is not None and msg_chat_id is not None and stored_chat_id != msg_chat_id:
         rt.logger.warning(
             f"FUNPAY STATUS LIVE REJECTED: chat_id mismatch for order=#{order_id} "
@@ -423,7 +438,8 @@ def _apply_refund_gate(
             )
         except (sqlite3.Error, OSError) as ex:
             rt.logger.warning(f"REFUND GATE SAVE FAILED: order=#{order_id_funpay}, error={ex}")
-        rt.waiting_for_link.pop(order_id_funpay, None)
+        with rt.CONTEXT_LOCK:
+            rt.waiting_for_link.pop(order_id_funpay, None)
 
     if notify_chat_id is not None and c is not None:
         try:

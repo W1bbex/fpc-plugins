@@ -78,6 +78,7 @@ PANEL_BALANCE_CACHE: Dict[str, Any] = {
     "generation": 0,
     "inflight": {},
 }
+CONTEXT_LOCK = threading.RLock()
 SCREEN_REVISION_LOCK = threading.RLock()
 SCREEN_REVISION: Dict[Tuple[int, int], int] = {}
 
@@ -191,61 +192,84 @@ def get_screen_revision(chat_id: Optional[int], message_id: Optional[int]) -> in
 
 
 def prune_stale_contexts(now_ts: Optional[float] = None, max_ui_age_seconds: int = 3600) -> int:
-    """Evict expired ephemeral Telegram UI states and grace timers from memory."""
+    """Evict expired ephemeral Telegram UI states and stale runtime buyer contexts from memory."""
     now_value = float(now_ts if now_ts is not None else time.time())
     cutoff = now_value - max(60, int(max_ui_age_seconds))
+    buyer_cutoff = now_value - 7 * 86400
     removed = 0
 
-    for mapping in (
-        LOT_INPUT_STATES,
-        UI_INPUT_STATES,
-        LOT_CARD_CONTEXT,
-        SEARCH_RESULT_CONTEXT,
-        ANALYTICS_VIEW_MODES,
-    ):
-        for key in list(mapping.keys()):
-            ctx = mapping.get(key)
+    with CONTEXT_LOCK:
+        for mapping in (
+            LOT_INPUT_STATES,
+            UI_INPUT_STATES,
+            LOT_CARD_CONTEXT,
+            SEARCH_RESULT_CONTEXT,
+            ANALYTICS_VIEW_MODES,
+        ):
+            for key in list(mapping.keys()):
+                ctx = mapping.get(key)
+                if not isinstance(ctx, dict):
+                    continue
+                created_ts = ctx.get("created_ts")
+                if created_ts is None:
+                    continue
+                try:
+                    if float(created_ts) < cutoff:
+                        mapping.pop(key, None)
+                        removed += 1
+                except (TypeError, ValueError):
+                    mapping.pop(key, None)
+                    removed += 1
+
+        for key in list(waiting_for_link.keys()):
+            ctx = waiting_for_link.get(key)
             if not isinstance(ctx, dict):
                 continue
-            created_ts = ctx.get("created_ts")
+            created_ts = ctx.get("created_ts") or ctx.get("updated_ts")
             if created_ts is None:
                 continue
             try:
-                if float(created_ts) < cutoff:
-                    mapping.pop(key, None)
+                if float(created_ts) < buyer_cutoff:
+                    waiting_for_link.pop(key, None)
                     removed += 1
             except (TypeError, ValueError):
-                mapping.pop(key, None)
+                waiting_for_link.pop(key, None)
                 removed += 1
 
-    for key in list(DELETE_CONFIRM_GRACE_UNTIL.keys()):
-        try:
-            if float(DELETE_CONFIRM_GRACE_UNTIL.get(key) or 0.0) < now_value:
+        while len(BUYER_ORDER_SELECTION) > 5000:
+            oldest_key = next(iter(BUYER_ORDER_SELECTION))
+            BUYER_ORDER_SELECTION.pop(oldest_key, None)
+            removed += 1
+
+        for key in list(DELETE_CONFIRM_GRACE_UNTIL.keys()):
+            try:
+                if float(DELETE_CONFIRM_GRACE_UNTIL.get(key) or 0.0) < now_value:
+                    DELETE_CONFIRM_GRACE_UNTIL.pop(key, None)
+                    removed += 1
+            except (TypeError, ValueError):
                 DELETE_CONFIRM_GRACE_UNTIL.pop(key, None)
                 removed += 1
-        except (TypeError, ValueError):
-            DELETE_CONFIRM_GRACE_UNTIL.pop(key, None)
-            removed += 1
 
     return removed
 
 
 def clear_memory_contexts() -> None:
     """Reset in-memory buyer and Telegram UI wizard states."""
-    for container in (
-        waiting_for_link,
-        BUYER_ORDER_SELECTION,
-        LOT_PAGE_CONTEXT,
-        WEBSITE_PAGE_CONTEXT,
-        LOT_INPUT_STATES,
-        LOT_CARD_CONTEXT,
-        UI_INPUT_STATES,
-        SEARCH_RESULT_CONTEXT,
-        ANALYTICS_VIEW_MODES,
-        DELETE_CONFIRM_GRACE_UNTIL,
-        CALLBACK_TOKENS,
-    ):
-        container.clear()
+    with CONTEXT_LOCK:
+        for container in (
+            waiting_for_link,
+            BUYER_ORDER_SELECTION,
+            LOT_PAGE_CONTEXT,
+            WEBSITE_PAGE_CONTEXT,
+            LOT_INPUT_STATES,
+            LOT_CARD_CONTEXT,
+            UI_INPUT_STATES,
+            SEARCH_RESULT_CONTEXT,
+            ANALYTICS_VIEW_MODES,
+            DELETE_CONFIRM_GRACE_UNTIL,
+            CALLBACK_TOKENS,
+        ):
+            container.clear()
     with SCREEN_REVISION_LOCK:
         SCREEN_REVISION.clear()
 

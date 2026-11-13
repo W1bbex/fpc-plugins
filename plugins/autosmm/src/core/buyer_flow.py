@@ -229,7 +229,8 @@ def _transition_waiting_state(
     select_order: bool = True,
 ) -> None:
     """Update waiting context, persist buyer flow state, and update active selection."""
-    rt.waiting_for_link[order_id] = ctx
+    with rt.CONTEXT_LOCK:
+        rt.waiting_for_link[order_id] = ctx
     _save_waiting_context(ctx, state=state, saved_link_marker=saved_link_marker)
     if select_order:
         _set_selected_order_for_buyer(buyer_id, chat_id, order_id)
@@ -239,11 +240,13 @@ def _transition_waiting_state(
 
 def _set_selected_order_for_buyer(buyer_id: Any, chat_id: Any, order_id: Any) -> None:
     if order_id not in (None, ""):
-        rt.BUYER_ORDER_SELECTION[_buyer_selection_key(buyer_id, chat_id)] = str(order_id)
+        with rt.CONTEXT_LOCK:
+            rt.BUYER_ORDER_SELECTION[_buyer_selection_key(buyer_id, chat_id)] = str(order_id)
 
 
 def _clear_selected_order_for_buyer(buyer_id: Any, chat_id: Any) -> None:
-    rt.BUYER_ORDER_SELECTION.pop(_buyer_selection_key(buyer_id, chat_id), None)
+    with rt.CONTEXT_LOCK:
+        rt.BUYER_ORDER_SELECTION.pop(_buyer_selection_key(buyer_id, chat_id), None)
 
 
 def _get_buyer_orders(buyer_id: Any, chat_id: Any) -> List[Dict]:
@@ -336,9 +339,10 @@ def _handle_buyer_link_command(c: "Cardinal", msg_text: str, buyer_id: Any, chat
     if _has_panel_order(order_record) or state in (BUYER_STATE_PANEL_CREATED, BUYER_STATE_COMPLETED, BUYER_STATE_FAILED):
         _send_buyer_message(c, chat_id, BUYER_PANEL_CREATED_BLOCK_TEXT)
         return True
-    ctx = rt.waiting_for_link.get(order_id) or _build_waiting_context_from_order(order_record) or {}
-    ctx.update({"order_id_funpay": order_id, "buyer_id": buyer_id, "chat_id": chat_id})
-    if state == BUYER_STATE_WAITING_LINK:
+    with rt.CONTEXT_LOCK:
+        ctx = rt.waiting_for_link.get(order_id)
+    if ctx is None:
+        ctx = _build_waiting_context_from_order(order_record) or {}
         _transition_waiting_state(ctx, order_id, buyer_id, chat_id, BUYER_STATE_LINK_PAUSED, saved_link_marker=None, select_order=False)
         _send_buyer_message(c, chat_id, f"⏸ Ожидание ссылки приостановлено.\n\n🧾 Заказ: #{order_id}\n\nКогда будете готовы отправить ссылку:\n!ссылка {order_id}")
         return True
@@ -384,7 +388,8 @@ def _can_buyer_refund_pre_panel(c: "Cardinal", order_record: Dict, buyer_id: Any
         fields: Dict[str, Any] = {"funpay_status": funpay_status, "funpay_status_checked_at": rt.now_str()}
         if funpay_status in ("refunded", "partially_refunded"):
             fields.update({"buyer_flow_state": BUYER_STATE_REFUNDED, "saved_link": None, "updated_at": rt.now_str()})
-            rt.waiting_for_link.pop(order_id, None)
+            with rt.CONTEXT_LOCK:
+                rt.waiting_for_link.pop(order_id, None)
         update_order_fields(order_id, **fields)
         latest = get_order_data(order_id) or latest
 
@@ -416,7 +421,10 @@ def _handle_buyer_cancel_command(c: "Cardinal", msg_text: str, buyer_id: Any, ch
     if _has_panel_order(order_record) or state in (BUYER_STATE_PANEL_CREATED, BUYER_STATE_COMPLETED, BUYER_STATE_FAILED):
         _send_buyer_message(c, chat_id, "Заказ уже передан в работу.\nАвтоматическая отмена недоступна.")
         return True
-    ctx = rt.waiting_for_link.get(order_id) or _build_waiting_context_from_order(order_record) or {}
+    with rt.CONTEXT_LOCK:
+        ctx = rt.waiting_for_link.get(order_id)
+    if not ctx:
+        ctx = _build_waiting_context_from_order(order_record) or {}
     ctx.update({"order_id_funpay": order_id, "buyer_id": buyer_id, "chat_id": chat_id})
 
     if allow_buyer_cancel:
@@ -464,7 +472,8 @@ def _handle_buyer_cancel_command(c: "Cardinal", msg_text: str, buyer_id: Any, ch
                 title="⚠️ AutoSMM: ошибка записи БД после возврата",
             )
 
-        rt.waiting_for_link.pop(order_id, None)
+        with rt.CONTEXT_LOCK:
+            rt.waiting_for_link.pop(order_id, None)
         _clear_selected_order_for_buyer(buyer_id, chat_id)
         _send_buyer_message(c, chat_id, "Ввод ссылки отменён.\n\nЗаказ FunPay отменён.")
         return True
@@ -479,7 +488,8 @@ def _get_waiting_candidates_for_message(buyer_id: Any, chat_id: int) -> List[Dic
 
 
 def _choose_waiting_candidate(buyer_id: Any, chat_id: int, candidates: List[Dict]) -> Optional[Dict]:
-    selected = rt.BUYER_ORDER_SELECTION.get(_buyer_selection_key(buyer_id, chat_id))
+    with rt.CONTEXT_LOCK:
+        selected = rt.BUYER_ORDER_SELECTION.get(_buyer_selection_key(buyer_id, chat_id))
     if selected:
         for order_record in candidates:
             if str(order_record.get("order_id")) == str(selected):
@@ -537,13 +547,17 @@ def _handle_waiting_link_message(c: "Cardinal", order_record: Dict, msg_text: st
     if not ok:
         _send_buyer_message(c, chat_id, reason)
         return True
-    ctx = rt.waiting_for_link.get(order_id) or _build_waiting_context_from_order(order_record) or {}
+    with rt.CONTEXT_LOCK:
+        ctx = rt.waiting_for_link.get(order_id)
+    if not ctx:
+        ctx = _build_waiting_context_from_order(order_record) or {}
     ctx.update({"buyer_id": buyer_id, "chat_id": chat_id, "order_id_funpay": order_id, "link": link_})
     if load_config().get("confirm_link", True):
         _transition_waiting_state(ctx, order_id, buyer_id, chat_id, BUYER_STATE_WAITING_CONFIRM, saved_link_marker=link_)
         _send_link_confirmation_prompt(c, chat_id, order_id, link_)
         return True
-    rt.waiting_for_link[order_id] = ctx
+    with rt.CONTEXT_LOCK:
+        rt.waiting_for_link[order_id] = ctx
     _save_waiting_context(ctx, state=BUYER_STATE_WAITING_LINK, saved_link_marker=link_)
     process_link_without_confirmation(c, ctx)
     _clear_selected_order_for_buyer(buyer_id, chat_id)
@@ -566,7 +580,10 @@ def _handle_waiting_confirm_message(c: "Cardinal", order_record: Dict, msg_text:
     if _has_panel_order(order_record):
         _send_buyer_message(c, chat_id, BUYER_PANEL_CREATED_BLOCK_TEXT)
         return True
-    ctx = rt.waiting_for_link.get(order_id) or _build_waiting_context_from_order(order_record) or {}
+    with rt.CONTEXT_LOCK:
+        ctx = rt.waiting_for_link.get(order_id)
+    if not ctx:
+        ctx = _build_waiting_context_from_order(order_record) or {}
     ctx.update({"buyer_id": buyer_id, "chat_id": chat_id, "order_id_funpay": order_id, "link": order_record.get("saved_link") or ctx.get("link") or order_record.get("customer_url") or ""})
 
     if lowered in BUYER_CONFIRM_YES_WORDS:
@@ -629,7 +646,8 @@ def _handle_buyer_flow_message(c: "Cardinal", msg_text: str, buyer_id: Any, chat
 
 def _recover_buyer_flow_runtime(c: Optional["Cardinal"] = None) -> None:
     """Restore in-memory waiting contexts on startup without losing pre-panel orders."""
-    rt.waiting_for_link.clear()
+    with rt.CONTEXT_LOCK:
+        rt.waiting_for_link.clear()
     recovered = 0
     try:
         all_orders = load_orders_data()
@@ -662,7 +680,8 @@ def _recover_buyer_flow_runtime(c: Optional["Cardinal"] = None) -> None:
             continue
         ctx = _build_waiting_context_from_order(order_record)
         if ctx:
-            rt.waiting_for_link[order_id] = ctx
+            with rt.CONTEXT_LOCK:
+                rt.waiting_for_link[order_id] = ctx
             recovered += 1
     if recovered:
         rt.logger.info(f"BUYER FLOW RECOVERY: restored {recovered} active waiting orders")

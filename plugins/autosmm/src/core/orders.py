@@ -139,7 +139,7 @@ def _apply_status_result(
 
         if mapped_status == "completed":
             progress_fields["buyer_flow_state"] = BUYER_STATE_COMPLETED
-        elif mapped_status in ("fail", "canceled", "unknown"):
+        elif mapped_status in ("fail", "canceled", "partial", "unknown"):
             progress_fields["buyer_flow_state"] = BUYER_STATE_FAILED
         else:
             progress_fields["buyer_flow_state"] = BUYER_STATE_PANEL_CREATED
@@ -173,6 +173,8 @@ def _apply_status_result(
 
     if mapped_status == "completed":
         _send_completion_notification_if_needed(c, order_record)
+    elif mapped_status == "partial":
+        _send_manual_check_alert_once(order_record, "заказ выполнен частично (partial)")
     elif mapped_status == "unknown":
         _send_manual_check_alert_once(order_record, "не удалось подтвердить состояние заказа")
 
@@ -273,6 +275,31 @@ def _save_batch_failure_for_chunk(chunk: List[Dict], error_code: Any, detail: An
     rt.logger.warning(f"BATCH STATUS SOFT FAIL: error={batch_error}, detail={detail}")
 
 
+_NON_FALLBACK_BATCH_ERRORS = frozenset({
+    "invalid_api_key",
+    "invalid_key",
+    "missing_api_key",
+    "user_inactive",
+    "service_inactive",
+})
+
+
+def _fallback_chunk_to_single_status(c: "Cardinal", chunk: List[Dict], error_code: Any, detail: Any) -> None:
+    _save_batch_failure_for_chunk(chunk, error_code, detail)
+    normalized_error = str(error_code or "").strip().lower()
+    if normalized_error in _NON_FALLBACK_BATCH_ERRORS:
+        return
+    for order_record in chunk:
+        if not rt.RUNNING:
+            break
+        try:
+            _sync_single_order_status(c, order_record, background_sync=True)
+        except Exception as ex:
+            rt.logger.warning(
+                f"SINGLE STATUS FALLBACK FAILED: order=#{order_record.get('order_id')}, error={ex}"
+            )
+
+
 def _check_pending_orders_batch(c: "Cardinal") -> None:
     try:
         all_orders = load_orders_data()
@@ -308,11 +335,16 @@ def _check_pending_orders_batch(c: "Cardinal") -> None:
                     rt.logger.warning(f"BATCH STATUS RETRY: service=#{service_number}, orders={order_ids}, error={error_code}, detail={detail}")
                     retry_result = _fetch_batch_order_status(service_number, order_ids)
                     if not retry_result.get("ok"):
-                        _save_batch_failure_for_chunk(chunk, retry_result.get("error", error_code), retry_result.get("detail", detail))
+                        _fallback_chunk_to_single_status(
+                            c,
+                            chunk,
+                            retry_result.get("error", error_code),
+                            retry_result.get("detail", detail),
+                        )
                         continue
                     result = retry_result
                 else:
-                    _save_batch_failure_for_chunk(chunk, error_code, detail)
+                    _fallback_chunk_to_single_status(c, chunk, error_code, detail)
                     continue
 
             entries = result.get("entries", {}) or {}
@@ -399,12 +431,27 @@ def _normalize_order_ref_for_lookup(raw_ref: Any) -> str:
     return str(raw_ref or "").strip().lstrip("#").upper()
 
 
-def _find_order_by_any_order_ref(raw_ref: Any) -> Optional[Dict]:
+def _find_order_by_any_order_ref(
+    raw_ref: Any,
+    *,
+    buyer_id: Any = None,
+    buyer_chat_id: Any = None,
+    access_checker: Optional[Any] = None,
+) -> Optional[Dict]:
     """Find a unique order matching either FunPay ID or panel ID without guessing on collisions."""
     ref = _normalize_order_ref_for_lookup(raw_ref)
     if not ref:
         return None
     all_orders = [order for order in load_orders_data() if isinstance(order, dict)]
+
+    def _caller_can_access(order_record: Dict) -> bool:
+        if buyer_id in (None, "") and buyer_chat_id in (None, ""):
+            return True
+        if callable(access_checker):
+            return bool(access_checker(order_record, buyer_id, buyer_chat_id))
+        buyer_match = buyer_id not in (None, "") and str(order_record.get("buyer_id")) == str(buyer_id)
+        chat_match = buyer_chat_id not in (None, "") and str(order_record.get("chat_id")) == str(buyer_chat_id)
+        return bool(buyer_match or chat_match)
 
     def _collect_matches(fields: Tuple[str, ...], normalize_value: bool) -> List[Dict]:
         result: List[Dict] = []
@@ -413,7 +460,8 @@ def _find_order_by_any_order_ref(raw_ref: Any) -> Optional[Dict]:
                 raw_val = order_record.get(field_name)
                 value = _normalize_order_ref_for_lookup(raw_val) if normalize_value else str(raw_val or "").strip()
                 if value and value == ref:
-                    result.append(order_record)
+                    if _caller_can_access(order_record):
+                        result.append(order_record)
                     break
         return result
 

@@ -12,7 +12,7 @@ import shutil
 import sqlite3
 import threading
 import time
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 import uuid
 
 from .. import runtime as rt
@@ -251,6 +251,15 @@ def save_config(cfg: Dict[str, Any]) -> None:
             _write_json_atomic(rt.CONFIG_BAK_PATH, cfg)
         except (OSError, ValueError, TypeError) as bak_err:
             logger.warning(f"Не удалось создать backup конфига: {bak_err}")
+
+
+def update_config(mutator: Callable[[Dict[str, Any]], Any]) -> Dict[str, Any]:
+    """Read-modify-write auto_lots.json atomically under CONFIG_LOCK."""
+    with CONFIG_LOCK:
+        cfg = load_config()
+        mutator(cfg)
+        save_config(cfg)
+        return cfg
 
 
 def reindex_lots(cfg: Dict[str, Any]) -> None:
@@ -601,9 +610,10 @@ def rename_panel_service(
                     logger.exception(f"Не удалось откатить конфигурацию после сбоя миграции БД: {rb_exc}")
                 return False, f"❌ Не удалось обновить заказы при смене номера панели: {exc}"
 
-            for ctx in list(rt.waiting_for_link.values()):
-                if isinstance(ctx, dict) and safe_int(ctx.get("service_number")) == old_service_idx:
-                    ctx["service_number"] = new_service_idx
+            with rt.CONTEXT_LOCK:
+                for ctx in list(rt.waiting_for_link.values()):
+                    if isinstance(ctx, dict) and safe_int(ctx.get("service_number")) == old_service_idx:
+                        ctx["service_number"] = new_service_idx
         else:
             save_config(cfg)
 

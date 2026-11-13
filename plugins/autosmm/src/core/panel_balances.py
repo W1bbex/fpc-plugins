@@ -278,7 +278,7 @@ def get_cached_service_balance(
 
     return {
         "ok": False,
-        "status_emoji": "⏳" if is_refreshing else "⏳",
+        "status_emoji": "⏳",
         "balance_text": "обновляется..." if is_refreshing else "не проверялся",
         "balance_value": None,
         "currency": None,
@@ -459,7 +459,8 @@ def schedule_panel_balances_refresh(
         callbacks: List[Callable[[bool, str], None]] = []
         if on_complete is not None:
             callbacks.append(on_complete)
-        inflight[inflight_key] = {"started_at": time.time(), "callbacks": callbacks}
+        inflight_entry = {"started_at": time.time(), "callbacks": callbacks}
+        inflight[inflight_key] = inflight_entry
 
     def _worker() -> None:
         updated = False
@@ -477,7 +478,11 @@ def schedule_panel_balances_refresh(
             rt.logger.warning(f"{rt.LOGGER_PREFIX} Фоновое обновление балансов завершилось ошибкой: {ex}")
         finally:
             with rt.PANEL_BALANCE_CACHE_LOCK:
-                entry = _cache_inflight_dict_locked().pop(inflight_key, None)
+                inflight_map = _cache_inflight_dict_locked()
+                if inflight_map.get(inflight_key) is inflight_entry:
+                    entry = inflight_map.pop(inflight_key, None)
+                else:
+                    entry = inflight_entry
                 pending_callbacks = list((entry or {}).get("callbacks") or [])
 
         for callback in pending_callbacks:

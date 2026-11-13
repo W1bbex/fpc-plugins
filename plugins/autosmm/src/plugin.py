@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 import threading
 from typing import TYPE_CHECKING, Any, Callable, List, Tuple
@@ -289,7 +290,8 @@ def _register_telegram_callbacks(c_: Cardinal) -> None:
                     rt.bot.answer_callback_query(call.id)
                 except Exception as ans_exc:
                     logger.debug(f"answer_callback_query failed: {ans_exc}")
-                _show_telemetry_gate(call.message.chat.id, message_id=call.message.message_id)
+                if msg_chat_id is not None and msg_id is not None:
+                    _show_telemetry_gate(msg_chat_id, message_id=msg_id)
                 return None
             return _fn(call)
 
@@ -309,18 +311,31 @@ def _register_telegram_callbacks(c_: Cardinal) -> None:
     c_.telegram.file_handler(STATE_RESTORE_BACKUP, handle_backup_restore_upload)
 
     for route_name, handler in _EXACT_CALLBACK_ROUTES:
-        _add_cb(handler, func=lambda call, target=route_name: call.data == target)
+        _add_cb(
+            handler,
+            func=lambda call, target=route_name: isinstance(getattr(call, "data", None), str) and call.data == target,
+        )
 
     for prefix, handler in _PREFIX_CALLBACK_ROUTES:
-        _add_cb(handler, func=lambda call, p=prefix: call.data.startswith(p))
+        _add_cb(
+            handler,
+            func=lambda call, p=prefix: isinstance(getattr(call, "data", None), str) and call.data.startswith(p),
+        )
 
     _add_cb(
         edit_lot_callback,
-        func=lambda call: call.data.startswith("edit_lot_") and not call.data.startswith("edit_lot_search_"),
+        func=lambda call: (
+            isinstance(getattr(call, "data", None), str)
+            and call.data.startswith("edit_lot_")
+            and not call.data.startswith("edit_lot_search_")
+        ),
     )
     _add_cb(
         page_navigation,
-        func=lambda call: call.data.startswith("prev_page_") or call.data.startswith("next_page_"),
+        func=lambda call: (
+            isinstance(getattr(call, "data", None), str)
+            and (call.data.startswith("prev_page_") or call.data.startswith("next_page_"))
+        ),
     )
 
     c_.telegram.msg_handler(auto_smm_settings, commands=["autosmm"])
@@ -333,7 +348,12 @@ def init_commands(c_: Cardinal) -> None:
     _bootstrap_runtime()
     logger.debug("AutoSMM init_commands() started")
     rt.cardinal_instance = c_
-    rt.bot = c_.telegram.bot
+    tg = getattr(c_, "telegram", None)
+    bot = getattr(tg, "bot", None)
+    if c_ is None or tg is None or bot is None:
+        logger.warning("Skipping AutoSMM Telegram registration: Telegram bot is disabled or unavailable")
+        return
+    rt.bot = bot
 
     with CONFIG_LOCK:
         cfg = load_config()
@@ -356,16 +376,34 @@ def start_runtime(c_: Cardinal) -> None:
     """Recover buyer-flow runtime state and start background workers once Cardinal account init completes."""
     logger.debug("AutoSMM start_runtime() started")
     rt.cardinal_instance = c_
-    rt.bot = c_.telegram.bot
+    tg = getattr(c_, "telegram", None)
+    bot = getattr(tg, "bot", None)
+    if c_ is None or tg is None or bot is None:
+        logger.warning("Skipping AutoSMM start_runtime: Telegram bot is disabled or unavailable")
+        return
+    rt.bot = bot
     rt.RUNNING = True
     _recover_buyer_flow_runtime(c_)
     _start_background_threads(c_)
 
 
 def stop_runtime(*_args: Any, **_kwargs: Any) -> None:
-    """Signal AutoSMM background workers to stop when the plugin is unloaded or deleted."""
+    """Signal AutoSMM background workers to stop and close plugin file log handlers."""
     rt.RUNNING = False
     logger.debug("AutoSMM stop_runtime() signaled background workers to stop")
+    target_log = os.path.abspath(rt.LOG_PATH) if getattr(rt, "LOG_PATH", None) else ""
+    for handler in list(rt.logger.handlers):
+        if isinstance(handler, logging.FileHandler):
+            if not target_log or os.path.abspath(getattr(handler, "baseFilename", "")) == target_log:
+                try:
+                    handler.flush()
+                    handler.close()
+                except Exception:
+                    pass
+                try:
+                    rt.logger.removeHandler(handler)
+                except ValueError:
+                    pass
 
 
 BIND_TO_PRE_INIT = [init_commands]

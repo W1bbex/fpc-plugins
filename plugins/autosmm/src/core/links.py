@@ -99,6 +99,19 @@ def normalize_incoming_text(text: Any) -> str:
     return value.strip()
 
 
+def _is_domain_like_bare_token(token: Any) -> bool:
+    cand = str(token or "").strip().lower().strip(".")
+    if not cand or "@" in cand or "://" in cand or "/" in cand:
+        return False
+    if cand.startswith("www.") and "." in cand[4:]:
+        return True
+    if "." not in cand:
+        return False
+    if _is_plausible_allowed_domain(cand):
+        return True
+    return bool(re.fullmatch(r"[a-z0-9_.-]+\.[a-z]{2,24}", cand))
+
+
 def _links_extract_buyer_target(text_value: Any, *, allowed_domains) -> Optional[str]:
     text = normalize_incoming_text(text_value)
     if not text:
@@ -127,7 +140,7 @@ def _links_extract_buyer_target(text_value: Any, *, allowed_domains) -> Optional
         token = words[0].strip().strip('"\'')
         lowered = token.lower()
         if lowered not in BUYER_CONFIRM_YES_WORDS and lowered not in BUYER_CONFIRM_NO_WORDS and (lowered not in {'!смм', '!ссылка', '!отмена', '!команды', '!помощь', 'чек', 'рефилл', 'статус', 'ок', 'да', 'нет'}):
-            if re.fullmatch('[A-Za-z0-9_.-]{3,64}', token) and (not token.isdigit()):
+            if re.fullmatch('[A-Za-z0-9_.-]{3,64}', token) and (not token.isdigit()) and (not _is_domain_like_bare_token(token)):
                 return token
     return None
 
@@ -172,6 +185,9 @@ def _links_looks_like_link_without_https(text_value: Any, *, allowed_domains) ->
         return True
     if re.search('(?i)\\b[a-z0-9-]+(?:\\.[a-z0-9-]+)+/\\S*', text):
         return True
+    words = text.split()
+    if len(words) == 1 and _is_domain_like_bare_token(words[0].strip().strip('"\'')):
+        return True
     return False
 
 
@@ -187,6 +203,8 @@ def _links_is_valid_buyer_target(target: str, *, allowed_domains) -> Tuple[bool,
             return (False, '❌ Некорректный формат юзернейма. Разрешены латинские буквы, цифры и символы _ . -')
         return (True, '✅ Юзернейм корректен.')
     if re.fullmatch('[A-Za-z0-9_.-]{3,64}', target):
+        if _is_domain_like_bare_token(target):
+            return (False, INVALID_LINK_SCHEME_TEXT)
         return (True, '✅ Юзернейм корректен.')
     return (False, '❌ Ссылка или юзернейм не приняты. Отправьте ссылку (https://...) или юзернейм (@channel).')
 
