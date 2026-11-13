@@ -1,37 +1,68 @@
-import ast
 from pathlib import Path
-import types
+import sys
+from types import SimpleNamespace
 import unittest
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from src import runtime as rt
+from src.tg import files, settings
 
 
-SETTINGS_SOURCE = Path(__file__).resolve().parent.parent / "src" / "tg" / "settings.py"
-FILES_SOURCE = Path(__file__).resolve().parent.parent / "src" / "tg" / "files.py"
-
-
-class OldFileCleanupTests(unittest.TestCase):
+class CleanupMenuBehaviorTests(unittest.TestCase):
     def test_settings_opens_without_scanning_plugin_files(self):
-        tree = ast.parse(SETTINGS_SOURCE.read_text(encoding="utf-8"))
-        function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "auto_smm_settings")
-        function.returns = None
-        for arg in function.args.args:
-            arg.annotation = None
         events = []
-        namespace = {
-            "_telemetry_gate_allows_menu": lambda: True,
-            "_open_main_settings_menu": lambda chat_id: events.append(("menu", chat_id)),
-            "_maybe_send_telemetry_ping": lambda *args, **kwargs: events.append(("telemetry",)),
-            "rt": types.SimpleNamespace(cardinal_instance=object()),
-        }
-        exec(compile(ast.Module(body=[function], type_ignores=[]), str(SETTINGS_SOURCE), "exec"), namespace)
-        namespace["auto_smm_settings"](types.SimpleNamespace(chat=types.SimpleNamespace(id=42)))
+        message = SimpleNamespace(chat=SimpleNamespace(id=42))
+        with (
+            mock.patch.object(settings, "_telemetry_gate_allows_menu", return_value=True),
+            mock.patch.object(
+                settings,
+                "_open_main_settings_menu",
+                side_effect=lambda chat_id: events.append(("menu", chat_id)),
+            ),
+            mock.patch.object(
+                settings,
+                "_maybe_send_telemetry_ping",
+                side_effect=lambda *args, **kwargs: events.append(("telemetry",)),
+            ),
+            mock.patch.object(rt, "cardinal_instance", object()),
+        ):
+            settings.auto_smm_settings(message)
         self.assertEqual(events, [("menu", 42), ("telemetry",)])
 
     def test_cleanup_menu_retains_data_cleanup_only(self):
-        tree = ast.parse(FILES_SOURCE.read_text(encoding="utf-8"))
-        function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "autosmm_cleanup_menu")
-        strings = [node.value for node in ast.walk(function) if isinstance(node, ast.Constant) and isinstance(node.value, str)]
-        self.assertIn("full_autosmm_delete_prompt", strings)
-        self.assertFalse(any("cleanup_old_files" in value for value in strings))
+        edited = []
+        fake_bot = SimpleNamespace(
+            edit_message_text=lambda text, chat_id, message_id, **kwargs: edited.append(
+                (text, chat_id, message_id, kwargs)
+            ),
+            answer_callback_query=lambda *args, **kwargs: None,
+        )
+        call = SimpleNamespace(
+            id="cb-1",
+            from_user=SimpleNamespace(id=100),
+            message=SimpleNamespace(chat=SimpleNamespace(id=200), message_id=300),
+        )
+        with (
+            mock.patch.object(rt, "bot", fake_bot),
+            mock.patch.object(files, "_is_authorized_tg_user", return_value=True),
+            mock.patch.object(files, "_safe_answer_callback"),
+        ):
+            files.autosmm_cleanup_menu(call)
+
+        self.assertEqual(len(edited), 1)
+        text, chat_id, msg_id, kwargs = edited[0]
+        self.assertEqual((chat_id, msg_id), (200, 300))
+        markup = kwargs.get("reply_markup")
+        callback_values = [
+            btn.callback_data
+            for row in (getattr(markup, "keyboard", None) or [])
+            for btn in row
+            if getattr(btn, "callback_data", None)
+        ]
+        self.assertIn("full_autosmm_delete_prompt", callback_values)
+        self.assertFalse(any("cleanup_old_files" in cb for cb in callback_values))
+        self.assertNotIn("cleanup_old_files", text)
 
 
 if __name__ == "__main__":

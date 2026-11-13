@@ -532,7 +532,6 @@ class FunPayBatchAndNewOrderTests(unittest.TestCase):
                     cardinal,
                     "FPNOTIF1",
                     777888,
-                    "https://t.me/channel",
                     "https://panel.example/api/v2",
                     "key",
                     50.0,

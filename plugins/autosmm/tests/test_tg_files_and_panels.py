@@ -562,21 +562,21 @@ class TgUiHardeningTests(unittest.TestCase):
                     lambda msg: invoked.append(msg.from_user.id),
                     expected_user_id=1001,
                 )
-            self.assertEqual(len(registered), 1)
-            wrong_user_msg = SimpleNamespace(
-                chat=SimpleNamespace(id=-100),
-                from_user=SimpleNamespace(id=2002),
-                text="hijack",
-            )
-            right_user_msg = SimpleNamespace(
-                chat=SimpleNamespace(id=-100),
-                from_user=SimpleNamespace(id=1001),
-                text="ok",
-            )
-            registered[0](wrong_user_msg)
-            self.assertEqual(invoked, [])
-            registered[-1](right_user_msg)
-            self.assertEqual(invoked, [1001])
+                self.assertEqual(len(registered), 1)
+                wrong_user_msg = SimpleNamespace(
+                    chat=SimpleNamespace(id=-100),
+                    from_user=SimpleNamespace(id=2002),
+                    text="hijack",
+                )
+                right_user_msg = SimpleNamespace(
+                    chat=SimpleNamespace(id=-100),
+                    from_user=SimpleNamespace(id=1001),
+                    text="ok",
+                )
+                registered[0](wrong_user_msg)
+                self.assertEqual(invoked, [])
+                registered[-1](right_user_msg)
+                self.assertEqual(invoked, [1001])
         finally:
             rt.bot = orig_bot
 
