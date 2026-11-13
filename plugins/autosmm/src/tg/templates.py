@@ -118,12 +118,12 @@ def edit_messages_menu(call: types.CallbackQuery) -> None:
 Полный список переменных:
 https://teletype.in/@w1bbex/AutoSMM"""
     kb = _inline_kb(
-        ("💸 После оплаты", "edit_msg_payment"),
-        ("✅ Подтверждение ссылки", "edit_msg_link_confirm"),
-        ("🚀 После запуска заказа", "edit_msg_confirmation"),
-        ("🎉 После завершения", "edit_msg_completion"),
-        ("🔄 Сбросить тексты", "reset_message_texts_prompt"),
-        ("◀️ Назад", "misc_settings"),
+        ("💸 После оплаты", "asmm:edit_msg_payment"),
+        ("✅ Подтверждение ссылки", "asmm:edit_msg_link_confirm"),
+        ("🚀 После запуска заказа", "asmm:edit_msg_confirmation"),
+        ("🎉 После завершения", "asmm:edit_msg_completion"),
+        ("🔄 Сбросить тексты", "asmm:reset_message_texts_prompt"),
+        ("◀️ Назад", "asmm:misc_settings"),
     )
     _edit_html_screen(call, text_, kb)
 
@@ -186,9 +186,9 @@ def _show_template_editor_screen(chat_id: int, message_id: Optional[int], templa
     if template_key not in TEMPLATE_EDITOR_DEFS:
         return
     kb = _inline_kb(
-        ("✏️ Изменить текст", f"template_edit_{template_key}"),
-        ("🔄 Сбросить этот текст", f"template_reset_prompt_{template_key}"),
-        ("◀️ Назад", "edit_messages"),
+        ("✏️ Изменить текст", f"asmm:template_edit_{template_key}"),
+        ("🔄 Сбросить этот текст", f"asmm:template_reset_prompt_{template_key}"),
+        ("◀️ Назад", "asmm:edit_messages"),
     )
     text_ = _render_template_view_text(template_key)
     if message_id is None:
@@ -207,7 +207,7 @@ def _extract_template_meta(call: types.CallbackQuery, prefix: str) -> Tuple[str,
 
 def template_view_callback(call: types.CallbackQuery) -> None:
     _safe_answer_callback(call)
-    template_key, meta = _extract_template_meta(call, "template_view_")
+    template_key, meta = _extract_template_meta(call, "asmm:template_view_")
     if not meta:
         return
     _show_template_editor_screen(call.message.chat.id, call.message.message_id, template_key)
@@ -215,7 +215,7 @@ def template_view_callback(call: types.CallbackQuery) -> None:
 
 def template_edit_callback(call: types.CallbackQuery) -> None:
     _safe_answer_callback(call)
-    template_key, meta = _extract_template_meta(call, "template_edit_")
+    template_key, meta = _extract_template_meta(call, "asmm:template_edit_")
     if not meta:
         return
     _start_ui_input_flow(
@@ -223,18 +223,18 @@ def template_edit_callback(call: types.CallbackQuery) -> None:
         f"Отправьте новый текст для:\n{meta.get('title')}\n\nТекущий текст можно скопировать с прошлого экрана.",
         process_template_text_change,
         template_key,
-        back_target=f"template_view_{template_key}",
+        back_target=f"asmm:template_view_{template_key}",
     )
 
 
 def template_reset_prompt_callback(call: types.CallbackQuery) -> None:
     _safe_answer_callback(call)
-    template_key, meta = _extract_template_meta(call, "template_reset_prompt_")
+    template_key, meta = _extract_template_meta(call, "asmm:template_reset_prompt_")
     if not meta:
         return
     kb = _inline_kb(
-        ("✅ Сбросить этот текст", f"template_reset_confirm_{template_key}"),
-        ("◀️ Назад", f"template_view_{template_key}"),
+        ("✅ Сбросить этот текст", f"asmm:template_reset_confirm_{template_key}"),
+        ("◀️ Назад", f"asmm:template_view_{template_key}"),
     )
     _safe_edit_message_text(
         f"Сбросить стандартный текст?\n\n{meta.get('title')}",
@@ -245,7 +245,7 @@ def template_reset_prompt_callback(call: types.CallbackQuery) -> None:
 
 
 def template_reset_confirm_callback(call: types.CallbackQuery) -> None:
-    template_key, meta = _extract_template_meta(call, "template_reset_confirm_")
+    template_key, meta = _extract_template_meta(call, "asmm:template_reset_confirm_")
     if not meta:
         return
     with CONFIG_LOCK:
@@ -263,7 +263,7 @@ def process_template_text_change(message: types.Message, template_key: str) -> N
         return
     if template_key not in TEMPLATE_EDITOR_DEFS:
         _clear_ui_input_state(message.chat.id)
-        rt.bot.send_message(message.chat.id, "❌ Неизвестный текст сообщения.", reply_markup=_inline_kb(("◀️ Назад", "edit_messages")))
+        rt.bot.send_message(message.chat.id, "❌ Неизвестный текст сообщения.", reply_markup=_inline_kb(("◀️ Назад", "asmm:edit_messages")))
         return
     with CONFIG_LOCK:
         cfg = load_config()
@@ -296,7 +296,7 @@ def edit_msg_completion(call: types.CallbackQuery) -> None:
 
 def reset_message_texts_prompt(call: types.CallbackQuery) -> None:
     _safe_answer_callback(call)
-    kb = _inline_kb(("✅ Сбросить тексты", "reset_message_texts_confirm"), ("◀️ Назад", "edit_messages"))
+    kb = _inline_kb(("✅ Сбросить тексты", "asmm:reset_message_texts_confirm"), ("◀️ Назад", "asmm:edit_messages"))
     _safe_edit_message_text("Сбросить стандартные тексты AutoSMM?", call.message.chat.id, call.message.message_id, reply_markup=kb)
 
 
@@ -313,12 +313,12 @@ def reset_message_texts_confirm(call: types.CallbackQuery) -> None:
 
 
 def _nav_template_view(call: types.CallbackQuery, target: str) -> None:
-    template_key = str(target or "").split("template_view_", 1)[1] if "template_view_" in str(target or "") else ""
+    template_key = str(target or "").split("asmm:template_view_", 1)[1] if "asmm:template_view_" in str(target or "") else ""
     if template_key in TEMPLATE_EDITOR_DEFS:
         _show_template_editor_screen(call.message.chat.id, call.message.message_id, template_key)
     else:
         edit_messages_menu(call)
 
 
-register_navigation_target("edit_messages", edit_messages_menu)
-register_navigation_prefix("template_view_", _nav_template_view)
+register_navigation_target("asmm:edit_messages", edit_messages_menu)
+register_navigation_prefix("asmm:template_view_", _nav_template_view)

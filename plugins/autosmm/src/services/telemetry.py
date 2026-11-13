@@ -256,7 +256,7 @@ def _build_telemetry_guest_warning_markup() -> Any:
         return None
     kb = InlineKeyboardMarkup(row_width=1)
     kb.add(
-        InlineKeyboardButton("✅ Согласиться и продолжить", callback_data="autosmm_telemetry_accept"),
+        InlineKeyboardButton("✅ Согласиться и продолжить", callback_data="asmm:telemetry_accept"),
         InlineKeyboardButton("🛡 Насколько это безопасно?", url=TELEMETRY_SECURITY_URL),
     )
     return kb

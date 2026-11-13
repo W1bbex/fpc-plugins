@@ -180,7 +180,7 @@ def _set_lot_input_state(
         "mode": mode,
         "lot_key": lot_key,
         "from": "lot_card",
-        "back_target": card_ctx.get("back_callback") or "lot_settings",
+        "back_target": card_ctx.get("back_callback") or "asmm:lot_settings",
         "back_label": card_ctx.get("back_label") or "◀️ Назад",
         "page": _get_lot_page_context(chat_id),
         "prompt_text": prompt_text,
@@ -203,7 +203,7 @@ def _set_ui_input_state(
     prompt_text: str,
     next_handler: Any,
     *handler_args: Any,
-    back_target: str = "return_to_settings",
+    back_target: str = "asmm:return_to_settings",
     cancel_target: Optional[str] = None,
     initiator_user_id: Optional[int] = None,
 ) -> None:
@@ -239,17 +239,17 @@ def _clear_autosmm_memory_contexts() -> None:
 
 def _build_ui_input_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     state = _get_ui_input_state(chat_id) or {}
-    back_target = state.get("back_target", "return_to_settings")
+    back_target = state.get("back_target", "asmm:return_to_settings")
     cancel_target = state.get("cancel_target")
 
     kb_ = InlineKeyboardMarkup(row_width=2)
     if cancel_target and cancel_target != back_target:
         kb_.row(
-            InlineKeyboardButton("◀️ Назад", callback_data="ui_input_back"),
-            InlineKeyboardButton("✖️ Отмена", callback_data="ui_input_cancel"),
+            InlineKeyboardButton("◀️ Назад", callback_data="asmm:ui_input_back"),
+            InlineKeyboardButton("✖️ Отмена", callback_data="asmm:ui_input_cancel"),
         )
     else:
-        kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="ui_input_back"))
+        kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="asmm:ui_input_back"))
     return kb_
 
 
@@ -269,7 +269,7 @@ def register_navigation_prefix(prefix: str, handler: Callable[[types.CallbackQue
 
 
 def _dispatch_navigation_callback(call: types.CallbackQuery, target: str) -> None:
-    target = str(target or "return_to_settings")
+    target = str(target or "asmm:return_to_settings")
     handler = _NAVIGATION_TARGETS.get(target)
     if handler is not None:
         handler(call)
@@ -278,7 +278,7 @@ def _dispatch_navigation_callback(call: types.CallbackQuery, target: str) -> Non
         if target.startswith(prefix):
             prefix_handler(call, target)
             return
-    fallback = _NAVIGATION_TARGETS.get("return_to_settings")
+    fallback = _NAVIGATION_TARGETS.get("asmm:return_to_settings")
     if fallback is not None:
         fallback(call)
 
@@ -287,14 +287,14 @@ def ui_input_back_callback(call: types.CallbackQuery) -> None:
     state = _get_ui_input_state(call.message.chat.id)
     _clear_step_handler(call.message.chat.id)
     _clear_ui_input_state(call.message.chat.id)
-    _dispatch_navigation_callback(call, state.get("back_target") if state else "return_to_settings")
+    _dispatch_navigation_callback(call, state.get("back_target") if state else "asmm:return_to_settings")
 
 
 def ui_input_cancel_callback(call: types.CallbackQuery) -> None:
     state = _get_ui_input_state(call.message.chat.id)
     _clear_step_handler(call.message.chat.id)
     _clear_ui_input_state(call.message.chat.id)
-    fallback_target = state.get("back_target") if state else "return_to_settings"
+    fallback_target = state.get("back_target") if state else "asmm:return_to_settings"
     target = state.get("cancel_target") if state and state.get("cancel_target") else fallback_target
     _dispatch_navigation_callback(call, target)
 
@@ -372,7 +372,7 @@ def _start_ui_input_flow(
     prompt_text: str,
     next_handler: Any,
     *handler_args: Any,
-    back_target: str = "return_to_settings",
+    back_target: str = "asmm:return_to_settings",
     cancel_target: Optional[str] = None,
 ) -> None:
     chat_id = call.message.chat.id

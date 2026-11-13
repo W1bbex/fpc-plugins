@@ -188,7 +188,7 @@ class BuildTests(unittest.TestCase):
                 )
 
                 self.assertEqual(mod.NAME, "AutoSMM")
-                self.assertEqual(mod.VERSION, "1.0.1")
+                self.assertEqual(mod.VERSION, "1.0")
                 self.assertEqual(str(uuid.UUID(mod.UUID)), mod.UUID)
                 self.assertIs(mod.SETTINGS_PAGE, False)
                 self.assertEqual(mod.BIND_TO_DELETE, [mod.stop_runtime])
@@ -299,7 +299,7 @@ class BuildTests(unittest.TestCase):
                     top_level[key] = ast.literal_eval(node.value)
 
         self.assertEqual(top_level.get("NAME"), "AutoSMM")
-        self.assertEqual(top_level.get("VERSION"), "1.0.1")
+        self.assertEqual(top_level.get("VERSION"), "1.0")
         self.assertEqual(top_level.get("CREDITS"), "@w1bbex")
         self.assertEqual(top_level.get("UUID"), "a6ccb3f1-3e7b-4984-9e4c-01d3ea7e0ad8")
         self.assertIs(top_level.get("SETTINGS_PAGE"), False)

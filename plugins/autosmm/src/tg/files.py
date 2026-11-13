@@ -45,11 +45,11 @@ def _render_files_menu(call: types.CallbackQuery) -> None:
     )
     kb_ = InlineKeyboardMarkup(row_width=1)
     kb_.add(
-        InlineKeyboardButton("📤 Экспорт бэкапа", callback_data="full_backup_prompt"),
-        InlineKeyboardButton("📥 Загрузка бэкапа", callback_data="restore_backup_prompt"),
-        InlineKeyboardButton("📝 Логи", callback_data="export_errors"),
-        InlineKeyboardButton("🧹 Очистка AutoSMM", callback_data="autosmm_cleanup_menu"),
-        InlineKeyboardButton("◀️ Назад", callback_data="return_to_settings"),
+        InlineKeyboardButton("📤 Экспорт бэкапа", callback_data="asmm:full_backup_prompt"),
+        InlineKeyboardButton("📥 Загрузка бэкапа", callback_data="asmm:restore_backup_prompt"),
+        InlineKeyboardButton("📝 Логи", callback_data="asmm:export_errors"),
+        InlineKeyboardButton("🧹 Очистка AutoSMM", callback_data="asmm:cleanup_menu"),
+        InlineKeyboardButton("◀️ Назад", callback_data="asmm:return_to_settings"),
     )
     _safe_edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb_)
 
@@ -94,7 +94,7 @@ def auto_smm_delete(message: types.Message) -> None:
     filename = os.path.basename(backup_path)
     txt = f"✅ Данные AutoSMM очищены.\n\nПеред очисткой создан аварийный бэкап:\n<code>{h(filename)}</code>\n\nРекомендуется перезапустить Cardinal."
     kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("◀️ В меню", callback_data="return_to_settings"))
+    kb.add(InlineKeyboardButton("◀️ В меню", callback_data="asmm:return_to_settings"))
     rt.bot.send_message(message.chat.id, txt, reply_markup=kb, parse_mode="HTML")
 
 
@@ -102,8 +102,8 @@ def full_backup_prompt(call: types.CallbackQuery) -> None:
     _safe_answer_callback(call)
     kb_ = InlineKeyboardMarkup(row_width=1)
     kb_.add(
-        InlineKeyboardButton("📤 Создать бэкап", callback_data="full_backup_confirm"),
-        InlineKeyboardButton("◀️ Назад", callback_data="files_menu"),
+        InlineKeyboardButton("📤 Создать бэкап", callback_data="asmm:full_backup_confirm"),
+        InlineKeyboardButton("◀️ Назад", callback_data="asmm:files_menu"),
     )
     txt_ = (
         "⚠️ <b>Экспорт бэкапа AutoSMM</b>\n\n"
@@ -140,7 +140,7 @@ def restore_backup_prompt(call: types.CallbackQuery) -> None:
         STATE_RESTORE_BACKUP,
     )
     kb_ = InlineKeyboardMarkup(row_width=1)
-    kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="files_menu"))
+    kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="asmm:files_menu"))
     txt_ = (
         "📥 <b>Загрузка бэкапа AutoSMM</b>\n\n"
         "Отправьте JSON-файл бэкапа AutoSMM.\n\n"
@@ -160,8 +160,8 @@ def autosmm_cleanup_menu(call: types.CallbackQuery) -> None:
     )
     kb_ = InlineKeyboardMarkup(row_width=1)
     kb_.add(
-        InlineKeyboardButton("🧹 Очистить данные AutoSMM", callback_data="full_autosmm_delete_prompt"),
-        InlineKeyboardButton("◀️ Назад", callback_data="files_menu"),
+        InlineKeyboardButton("🧹 Очистить данные AutoSMM", callback_data="asmm:full_delete_prompt"),
+        InlineKeyboardButton("◀️ Назад", callback_data="asmm:files_menu"),
     )
     _safe_edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb_)
 
@@ -170,8 +170,8 @@ def full_autosmm_delete_prompt(call: types.CallbackQuery) -> None:
     _safe_answer_callback(call)
     kb_ = InlineKeyboardMarkup(row_width=1)
     kb_.add(
-        InlineKeyboardButton("✅ Да, очистить", callback_data="full_autosmm_delete_confirm"),
-        InlineKeyboardButton("◀️ Назад", callback_data="autosmm_cleanup_menu"),
+        InlineKeyboardButton("✅ Да, очистить", callback_data="asmm:full_delete_confirm"),
+        InlineKeyboardButton("◀️ Назад", callback_data="asmm:cleanup_menu"),
     )
     txt_ = (
         "⚠️ <b>Очистить данные AutoSMM?</b>\n\n"
@@ -253,7 +253,7 @@ def export_errors(call: types.CallbackQuery) -> None:
 
 def _files_back_kb() -> InlineKeyboardMarkup:
     kb_ = InlineKeyboardMarkup()
-    kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="files_menu"))
+    kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="asmm:files_menu"))
     return kb_
 
 
@@ -326,4 +326,4 @@ def handle_backup_restore_upload(message: types.Message) -> None:
         rt.logger.error(f"Неизвестная ошибка при восстановлении бэкапа: {e}")
 
 
-register_navigation_target("files_menu", files_menu)
+register_navigation_target("asmm:files_menu", files_menu)

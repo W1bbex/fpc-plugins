@@ -60,7 +60,7 @@ class CleanupMenuBehaviorTests(unittest.TestCase):
             for btn in row
             if getattr(btn, "callback_data", None)
         ]
-        self.assertIn("full_autosmm_delete_prompt", callback_values)
+        self.assertIn("asmm:full_delete_prompt", callback_values)
         self.assertFalse(any("cleanup_old_files" in cb for cb in callback_values))
         self.assertNotIn("cleanup_old_files", text)
 

@@ -84,9 +84,9 @@ def _build_telemetry_consent_text(c: Optional[Cardinal] = None) -> str:
 def _build_telemetry_consent_keyboard() -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=1)
     kb.add(
-        InlineKeyboardButton("✅ Согласиться и продолжить", callback_data="autosmm_telemetry_accept"),
+        InlineKeyboardButton("✅ Согласиться и продолжить", callback_data="asmm:telemetry_accept"),
         InlineKeyboardButton("🛡 Насколько это безопасно?", url=TELEMETRY_SECURITY_URL),
-        InlineKeyboardButton(f"⛔ Не использовать v{rt.VERSION}", callback_data="autosmm_telemetry_refuse"),
+        InlineKeyboardButton(f"⛔ Не использовать v{rt.VERSION}", callback_data="asmm:telemetry_refuse"),
     )
     return kb
 
@@ -118,9 +118,9 @@ AutoSMM v{h(rt.VERSION)} использует минимальную техни�
 def _build_telemetry_refuse_keyboard() -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=1)
     if not _telemetry_guest_used():
-        kb.add(InlineKeyboardButton("🧪 Попробовать 7 дней без телеметрии", callback_data="autosmm_telemetry_guest_7d"))
+        kb.add(InlineKeyboardButton("🧪 Попробовать 7 дней без телеметрии", callback_data="asmm:telemetry_guest_7d"))
     kb.add(
-        InlineKeyboardButton("✅ Согласиться и продолжить", callback_data="autosmm_telemetry_accept"),
+        InlineKeyboardButton("✅ Согласиться и продолжить", callback_data="asmm:telemetry_accept"),
         InlineKeyboardButton("🛡 Насколько это безопасно?", url=TELEMETRY_SECURITY_URL),
         InlineKeyboardButton("📦 AutoSMM v0.0.8 без телеметрии", url=AUTOSMM_V008_NO_TELEMETRY_URL),
     )
@@ -144,7 +144,7 @@ def telemetry_accept_callback(call: types.CallbackQuery) -> None:
     """Persist telemetry consent, open settings, and immediately emit an initial ping."""
     _safe_answer_callback(call)
     _set_telemetry_consent(True)
-    _dispatch_navigation_callback(call, "return_to_settings")
+    _dispatch_navigation_callback(call, "asmm:return_to_settings")
     _maybe_send_telemetry_ping(rt.cardinal_instance, force=True)
 
 
@@ -159,7 +159,7 @@ def telemetry_guest_7d_callback(call: types.CallbackQuery) -> None:
     """Activate the one-time 7-day guest pass when eligible."""
     _safe_answer_callback(call)
     if _telemetry_consent_accepted():
-        _dispatch_navigation_callback(call, "return_to_settings")
+        _dispatch_navigation_callback(call, "asmm:return_to_settings")
         return
     chat_id = getattr(getattr(call, "message", None), "chat", None)
     guest_chat_id = getattr(chat_id, "id", None) if chat_id is not None else None
@@ -171,4 +171,4 @@ def telemetry_guest_7d_callback(call: types.CallbackQuery) -> None:
 AutoSMM v{h(rt.VERSION)} доступен на <b>7 дней без телеметрии</b>.
 
 Мы заранее напомним за <b>48ч</b> и за <b>12ч</b> до окончания. Через 7 дней плагин снова попросит выбрать: принять телеметрию или остаться на AutoSMM v0.0.8."""
-    _edit_html_screen(call, text_value, _inline_kb(("🚀 Открыть AutoSMM", "return_to_settings")), clean=True, disable_preview=True)
+    _edit_html_screen(call, text_value, _inline_kb(("🚀 Открыть AutoSMM", "asmm:return_to_settings")), clean=True, disable_preview=True)

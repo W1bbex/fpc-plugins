@@ -108,16 +108,16 @@ def build_main_menu_text_and_kb(cfg: Dict[str, Any]) -> Tuple[str, InlineKeyboar
 
     kb = InlineKeyboardMarkup(row_width=2)
     kb.row(
-        InlineKeyboardButton("🛍️ Каталог лотов", callback_data="lot_settings"),
-        InlineKeyboardButton("➕ Создать новый лот", callback_data="add_new_lot"),
+        InlineKeyboardButton("🛍️ Каталог лотов", callback_data="asmm:lot_settings"),
+        InlineKeyboardButton("➕ Создать новый лот", callback_data="asmm:add_new_lot"),
     )
-    kb.add(InlineKeyboardButton("🔌 Интеграция API", callback_data="api_settings"))
-    kb.add(InlineKeyboardButton("📊 Аналитика", callback_data="show_orders"))
+    kb.add(InlineKeyboardButton("🔌 Интеграция API", callback_data="asmm:api_settings"))
+    kb.add(InlineKeyboardButton("📊 Аналитика", callback_data="asmm:show_orders"))
     kb.row(
-        InlineKeyboardButton("📁 Бэкап / файлы", callback_data="files_menu"),
-        InlineKeyboardButton("⚙️ Настройки", callback_data="misc_settings"),
+        InlineKeyboardButton("📁 Бэкап / файлы", callback_data="asmm:files_menu"),
+        InlineKeyboardButton("⚙️ Настройки", callback_data="asmm:misc_settings"),
     )
-    kb.add(InlineKeyboardButton("📚 Полезные ресурсы", callback_data="links_menu"))
+    kb.add(InlineKeyboardButton("📚 Полезные ресурсы", callback_data="asmm:links_menu"))
     return txt_, kb
 
 
@@ -137,12 +137,12 @@ def misc_settings(call: types.CallbackQuery) -> None:
     fallback_enabled = bool(cfg.get("fallback_enabled", False))
     txt_ = "⚙️ <b>Настройки AutoSMM</b>\n\nВыберите раздел настроек:"
     kb_ = _inline_kb(
-        ("👤 Покупательский сценарий", "buyer_flow_settings"),
-        ("💬 Тексты сообщений", "edit_messages"),
-        ("🔔 Уведомления продавцу", "seller_notifications_settings"),
-        ("🌐 Разрешённые сайты", "manage_websites"),
-        (f"🔁 Резервная панель: {'✅' if fallback_enabled else '❌'}", "toggle_fallback"),
-        ("◀️ Назад", "return_to_settings"),
+        ("👤 Покупательский сценарий", "asmm:buyer_flow_settings"),
+        ("💬 Тексты сообщений", "asmm:edit_messages"),
+        ("🔔 Уведомления продавцу", "asmm:seller_notifications_settings"),
+        ("🌐 Разрешённые сайты", "asmm:manage_websites"),
+        (f"🔁 Резервная панель: {'✅' if fallback_enabled else '❌'}", "asmm:toggle_fallback"),
+        ("◀️ Назад", "asmm:return_to_settings"),
     )
     _edit_html_screen(call, txt_, kb_)
 
@@ -162,10 +162,10 @@ def buyer_flow_settings(call: types.CallbackQuery) -> None:
 
 Здесь настраивается поведение покупателя после оплаты."""
     kb_ = _inline_kb(
-        (f"✅ Подтверждение ссылки: {'✅' if confirm_link else '❌'}", "toggle_confirm_link"),
-        (f"↩️ Автовозвраты: {'✅' if auto_refunds else '❌'}", "toggle_auto_refunds"),
-        (f"⚠️ Отмена до запуска: {'✅' if allow_cancel else '❌'}", "toggle_buyer_cancel_before_panel"),
-        ("◀️ Назад", "misc_settings"),
+        (f"✅ Подтверждение ссылки: {'✅' if confirm_link else '❌'}", "asmm:toggle_confirm_link"),
+        (f"↩️ Автовозвраты: {'✅' if auto_refunds else '❌'}", "asmm:toggle_auto_refunds"),
+        (f"⚠️ Отмена до запуска: {'✅' if allow_cancel else '❌'}", "asmm:toggle_buyer_cancel_before_panel"),
+        ("◀️ Назад", "asmm:misc_settings"),
     )
     _edit_html_screen(call, txt_, kb_)
 
@@ -181,11 +181,11 @@ def seller_notifications_settings(call: types.CallbackQuery) -> None:
 
 AutoSMM может отправлять продавцу уведомления о новых заказах, ошибках панели и ручной проверке."""
     kb_ = _inline_kb(
-        ("📌 Использовать этот чат", "use_current_chat_for_notifications"),
-        ("📩 Указать другой чат", "set_notification_chat_id"),
-        ("🧪 Отправить тестовое уведомление", "send_test_notification"),
-        ("🔕 Отключить уведомления", "disable_notifications"),
-        ("◀️ Назад", "misc_settings"),
+        ("📌 Использовать этот чат", "asmm:use_current_chat_for_notifications"),
+        ("📩 Указать другой чат", "asmm:set_notification_chat_id"),
+        ("🧪 Отправить тестовое уведомление", "asmm:send_test_notification"),
+        ("🔕 Отключить уведомления", "asmm:disable_notifications"),
+        ("◀️ Назад", "asmm:misc_settings"),
     )
     _edit_html_screen(call, txt_, kb_)
 
@@ -262,7 +262,7 @@ def _toggle_danger_setting(
         buyer_flow_settings(call)
         return
     _safe_answer_callback(call)
-    _edit_html_screen(call, prompt_text, _inline_kb((confirm_label, confirm_cb), ("◀️ Назад", "buyer_flow_settings")))
+    _edit_html_screen(call, prompt_text, _inline_kb((confirm_label, confirm_cb), ("◀️ Назад", "asmm:buyer_flow_settings")))
 
 
 def toggle_buyer_cancel_before_panel(call: types.CallbackQuery) -> None:
@@ -271,7 +271,7 @@ def toggle_buyer_cancel_before_panel(call: types.CallbackQuery) -> None:
         "allow_buyer_cancel_before_panel_order",
         "Отключено",
         "✅ Включить",
-        "enable_buyer_cancel_before_panel",
+        "asmm:enable_buyer_cancel_before_panel",
         """⚠️ <b>Опасная настройка</b>
 
 Если включить эту опцию, покупатель сможет отменить заказ командой !отмена, пока выполнение ещё не запущено.
@@ -294,7 +294,7 @@ def toggle_auto_refunds(call: types.CallbackQuery) -> None:
         "auto_refunds",
         "Автовозвраты выключены",
         "✅ Включить автовозвраты",
-        "enable_auto_refunds",
+        "asmm:enable_auto_refunds",
         """⚠️ <b>Автовозвраты</b>
 
 Если включить эту настройку, AutoSMM сможет автоматически вернуть деньги покупателю, если заказ не удалось безопасно запустить.
@@ -332,7 +332,7 @@ def links_menu(call: types.CallbackQuery) -> None:
         InlineKeyboardButton("💻 GitHub", url="https://github.com/W1bbex"),
         InlineKeyboardButton("❓ FAQ", url="https://teletype.in/@w1bbex/FAQ-AutoSMM"),
     )
-    kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="return_to_settings"))
+    kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="asmm:return_to_settings"))
     _safe_edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb_)
 
 
@@ -364,18 +364,18 @@ def manage_websites(call: types.CallbackQuery) -> None:
         "Здесь настраиваются сайты, ссылки с которых покупатели могут отправлять после оплаты."
     )
     kb_ = _inline_kb(
-        ("📋 Показать список", "show_allowed_websites_list"),
-        ("➕ Добавить сайт", "add_website"),
-        ("🗑 Удалить сайт", "show_allowed_websites_list"),
-        ("🔄 Сбросить список", "reset_valid_links_prompt"),
-        ("◀️ Назад", "misc_settings"),
+        ("📋 Показать список", "asmm:show_allowed_websites_list"),
+        ("➕ Добавить сайт", "asmm:add_website"),
+        ("🗑 Удалить сайт", "asmm:show_allowed_websites_list"),
+        ("🔄 Сбросить список", "asmm:reset_valid_links_prompt"),
+        ("◀️ Назад", "asmm:misc_settings"),
     )
     _edit_html_screen(call, txt_, kb_)
 
 
 def reset_valid_links_prompt(call: types.CallbackQuery) -> None:
     _safe_answer_callback(call)
-    kb_ = _inline_kb(("✅ Сбросить", "reset_valid_links_confirm"), ("◀️ Назад", "manage_websites"))
+    kb_ = _inline_kb(("✅ Сбросить", "asmm:reset_valid_links_confirm"), ("◀️ Назад", "asmm:manage_websites"))
     txt_ = """Список разрешённых сайтов будет заменён на стандартный набор AutoSMM.
 Ваши добавленные вручную домены будут удалены.
 
@@ -418,7 +418,7 @@ def show_allowed_websites_list(
         buttons = [
             InlineKeyboardButton(
                 f"🗑 {site}",
-                callback_data=_encode_callback_value("delete_website_", site),
+                callback_data=_encode_callback_value("asmm:delete_website_", site),
             )
             for site in chunk
         ]
@@ -426,9 +426,9 @@ def show_allowed_websites_list(
             kb_.row(*buttons[idx : idx + 2])
         nav_buttons = []
         if current_page > 0:
-            nav_buttons.append(InlineKeyboardButton("⬅️", callback_data=f"sites_page_{current_page - 1}"))
+            nav_buttons.append(InlineKeyboardButton("⬅️", callback_data=f"asmm:sites_page_{current_page - 1}"))
         if end < len(valid_links):
-            nav_buttons.append(InlineKeyboardButton("➡️", callback_data=f"sites_page_{current_page + 1}"))
+            nav_buttons.append(InlineKeyboardButton("➡️", callback_data=f"asmm:sites_page_{current_page + 1}"))
         if nav_buttons:
             kb_.row(*nav_buttons)
         page_suffix = f" (стр. {current_page + 1}/{total_pages})" if total_pages > 1 else ""
@@ -437,9 +437,9 @@ def show_allowed_websites_list(
         text_ = "🌐 <b>Разрешённые сайты</b>\n\nСписок разрешённых сайтов пуст."
 
     kb_.add(
-        InlineKeyboardButton("➕ Добавить сайт", callback_data="add_website"),
-        InlineKeyboardButton("🔄 Сбросить список", callback_data="reset_valid_links_prompt"),
-        InlineKeyboardButton("◀️ Назад", callback_data="manage_websites"),
+        InlineKeyboardButton("➕ Добавить сайт", callback_data="asmm:add_website"),
+        InlineKeyboardButton("🔄 Сбросить список", callback_data="asmm:reset_valid_links_prompt"),
+        InlineKeyboardButton("◀️ Назад", callback_data="asmm:manage_websites"),
     )
     _edit_html_screen(call, text_, kb_)
 
@@ -466,7 +466,7 @@ def add_website_prompt(call: types.CallbackQuery) -> None:
         call,
         "Введите ссылку для добавления (например, example.com):",
         process_add_website,
-        back_target="manage_websites",
+        back_target="asmm:manage_websites",
     )
 
 
@@ -481,7 +481,7 @@ def process_add_website(message: types.Message) -> None:
         return
     add_website(message, new_site)
     _clear_ui_input_state(message.chat.id)
-    rt.bot.send_message(message.chat.id, "Возврат к списку сайтов.", reply_markup=_inline_kb(("◀️ Назад", "manage_websites")))
+    rt.bot.send_message(message.chat.id, "Возврат к списку сайтов.", reply_markup=_inline_kb(("◀️ Назад", "asmm:manage_websites")))
 
 
 def _delete_allowed_website_and_refresh(call: types.CallbackQuery, domain: str) -> None:
@@ -497,7 +497,8 @@ def _delete_allowed_website_and_refresh(call: types.CallbackQuery, domain: str) 
 
 
 def remove_website_prompt(call: types.CallbackQuery) -> None:
-    raw_arg = call.data.split("_", 2)[2]
+    data = str(getattr(call, "data", "") or "")
+    raw_arg = data.split("asmm:delete_website_", 1)[1] if "asmm:delete_website_" in data else ""
     site_to_remove = _normalize_allowed_domain(_decode_callback_value(raw_arg))
     if not site_to_remove:
         _safe_answer_callback(call)
@@ -509,8 +510,8 @@ def remove_website_prompt(call: types.CallbackQuery) -> None:
     _safe_answer_callback(call)
     back_page = max(0, int(rt.WEBSITE_PAGE_CONTEXT.get(call.message.chat.id, 0) or 0))
     kb_ = _inline_kb(
-        ("✅ Удалить", _encode_callback_value("confirm_delete_website_", site_to_remove)),
-        ("◀️ Назад", f"sites_page_{back_page}"),
+        ("✅ Удалить", _encode_callback_value("asmm:confirm_delete_website_", site_to_remove)),
+        ("◀️ Назад", f"asmm:sites_page_{back_page}"),
     )
     txt_ = f"""⚠️ <b>Удалить сайт из разрешённых?</b>
 
@@ -524,7 +525,8 @@ def remove_website_prompt(call: types.CallbackQuery) -> None:
 
 
 def confirm_delete_website_callback(call: types.CallbackQuery) -> None:
-    raw_arg = call.data.split("confirm_delete_website_", 1)[1]
+    data = str(getattr(call, "data", "") or "")
+    raw_arg = data.split("asmm:confirm_delete_website_", 1)[1] if "asmm:confirm_delete_website_" in data else ""
     domain = _decode_callback_value(raw_arg)
     _set_delete_confirm_grace(call.message.chat.id, 30)
     _delete_allowed_website_and_refresh(call, domain)
@@ -548,7 +550,7 @@ def set_notification_chat_id(call: types.CallbackQuery) -> None:
         call,
         "Отправьте ID Telegram-чата для уведомлений.\n\nМожно нажать «Использовать этот чат» в предыдущем меню.",
         process_notification_chat_id,
-        back_target="seller_notifications_settings",
+        back_target="asmm:seller_notifications_settings",
     )
 
 
@@ -579,7 +581,7 @@ def process_notification_chat_id(message: types.Message) -> None:
         rt.bot.send_message(
             message.chat.id,
             f"✅ Чат уведомлений установлен: {new_chat_id}",
-            reply_markup=_inline_kb(("◀️ Назад", "seller_notifications_settings")),
+            reply_markup=_inline_kb(("◀️ Назад", "asmm:seller_notifications_settings")),
         )
     except ValueError:
         _repeat_ui_input_flow(message.chat.id, "❌ Ошибка: отправьте ID чата числом.")
@@ -594,13 +596,13 @@ def links_menu_callback(call: types.CallbackQuery) -> None:
 
 
 for _nav_key, _nav_handler in (
-    ("return_to_settings", return_to_settings),
-    ("manage_websites", manage_websites),
-    ("show_allowed_websites_list", show_allowed_websites_list),
-    ("misc_settings", misc_settings),
-    ("links_menu", links_menu),
-    ("seller_notifications_settings", seller_notifications_settings),
-    ("buyer_flow_settings", buyer_flow_settings),
+    ("asmm:return_to_settings", return_to_settings),
+    ("asmm:manage_websites", manage_websites),
+    ("asmm:show_allowed_websites_list", show_allowed_websites_list),
+    ("asmm:misc_settings", misc_settings),
+    ("asmm:links_menu", links_menu),
+    ("asmm:seller_notifications_settings", seller_notifications_settings),
+    ("asmm:buyer_flow_settings", buyer_flow_settings),
 ):
     register_navigation_target(_nav_key, _nav_handler)
-register_navigation_prefix("sites_page_", _nav_sites_page)
+register_navigation_prefix("asmm:sites_page_", _nav_sites_page)

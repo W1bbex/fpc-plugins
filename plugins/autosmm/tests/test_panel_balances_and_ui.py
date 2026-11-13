@@ -263,7 +263,7 @@ class PaginationAndUiFixesTests(unittest.TestCase):
             with mock.patch.object(tg_settings, "load_valid_links", return_value=list(domains)):
                 call_list = SimpleNamespace(
                     id="cb1",
-                    data="show_allowed_websites_list",
+                    data="asmm:show_allowed_websites_list",
                     message=SimpleNamespace(chat=SimpleNamespace(id=300), message_id=50),
                 )
                 tg_settings.show_allowed_websites_list(call_list)
@@ -272,13 +272,13 @@ class PaginationAndUiFixesTests(unittest.TestCase):
                 kb0 = kwargs0["reply_markup"]
                 callbacks0 = [btn.callback_data for row in kb0.keyboard for btn in row]
                 self.assertIn("стр. 1/3", text0)
-                self.assertIn("sites_page_1", callbacks0)
-                self.assertNotIn("sites_page_-1", callbacks0)
+                self.assertIn("asmm:sites_page_1", callbacks0)
+                self.assertNotIn("asmm:sites_page_-1", callbacks0)
                 self.assertLessEqual(len(callbacks0), 30)
 
                 call_page1 = SimpleNamespace(
                     id="cb2",
-                    data="sites_page_1",
+                    data="asmm:sites_page_1",
                     message=SimpleNamespace(chat=SimpleNamespace(id=300), message_id=50),
                 )
                 tg_settings.allowed_websites_page_callback(call_page1)
@@ -287,19 +287,19 @@ class PaginationAndUiFixesTests(unittest.TestCase):
                 kb1 = kwargs1["reply_markup"]
                 callbacks1 = [btn.callback_data for row in kb1.keyboard for btn in row]
                 self.assertIn("стр. 2/3", text1)
-                self.assertIn("sites_page_0", callbacks1)
-                self.assertIn("sites_page_2", callbacks1)
+                self.assertIn("asmm:sites_page_0", callbacks1)
+                self.assertIn("asmm:sites_page_2", callbacks1)
 
                 call_del = SimpleNamespace(
                     id="cb3",
-                    data="delete_website_site25.example",
+                    data="asmm:delete_website_site25.example",
                     message=SimpleNamespace(chat=SimpleNamespace(id=300), message_id=50),
                 )
                 with mock.patch.object(tg_settings, "_is_delete_confirm_grace_active", return_value=False):
                     tg_settings.remove_website_prompt(call_del)
                 kb_del = calls["edits"][-1][3]["reply_markup"]
                 del_callbacks = [btn.callback_data for row in kb_del.keyboard for btn in row]
-                self.assertIn("sites_page_1", del_callbacks)
+                self.assertIn("asmm:sites_page_1", del_callbacks)
         finally:
             rt.bot = orig_bot
 
@@ -319,12 +319,12 @@ class PaginationAndUiFixesTests(unittest.TestCase):
                 self.assertIsInstance(ctx["created_ts"], float)
                 kb0 = calls["edits"][-1][3]["reply_markup"]
                 cbs0 = [btn.callback_data for row in kb0.keyboard for btn in row]
-                self.assertIn("search_page_1", cbs0)
+                self.assertIn("asmm:search_page_1", cbs0)
                 self.assertLessEqual(len(cbs0), 15)
 
                 call_page1 = SimpleNamespace(
                     id="cbs1",
-                    data="search_page_1",
+                    data="asmm:search_page_1",
                     message=SimpleNamespace(chat=SimpleNamespace(id=400), message_id=77),
                 )
                 tg_lots.search_page_navigation(call_page1)
@@ -355,18 +355,18 @@ class PaginationAndUiFixesTests(unittest.TestCase):
             rt.bot = fake_bot
             call = SimpleNamespace(
                 id="cbt",
-                data="template_edit_after_payment",
+                data="asmm:template_edit_after_payment",
                 from_user=SimpleNamespace(id=42),
                 message=SimpleNamespace(chat=SimpleNamespace(id=555), message_id=66),
             )
             with mock.patch.object(tg_templates, "load_config", return_value={"messages": {"after_payment": "hi"}}):
                 tg_templates.template_edit_callback(call)
             state = tg_common._get_ui_input_state(555)
-            self.assertEqual(state["back_target"], "template_view_after_payment")
+            self.assertEqual(state["back_target"], "asmm:template_view_after_payment")
 
             back_call = SimpleNamespace(
                 id="cbb",
-                data="ui_input_back",
+                data="asmm:ui_input_back",
                 from_user=SimpleNamespace(id=42),
                 message=SimpleNamespace(chat=SimpleNamespace(id=555), message_id=66),
             )

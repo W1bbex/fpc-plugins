@@ -199,13 +199,13 @@ class TgFilesAndPanelsTests(unittest.TestCase):
             rt.PANEL_BALANCE_CACHE.update(orig_cache)
 
     def test_settings_registers_navigation_targets(self):
-        self.assertIn("return_to_settings", common._NAVIGATION_TARGETS)
-        self.assertIn("misc_settings", common._NAVIGATION_TARGETS)
-        self.assertIn("edit_messages", common._NAVIGATION_TARGETS)
-        self.assertIn("manage_websites", common._NAVIGATION_TARGETS)
-        self.assertIn("links_menu", common._NAVIGATION_TARGETS)
-        self.assertIn("seller_notifications_settings", common._NAVIGATION_TARGETS)
-        self.assertIn("files_menu", common._NAVIGATION_TARGETS)
+        self.assertIn("asmm:return_to_settings", common._NAVIGATION_TARGETS)
+        self.assertIn("asmm:misc_settings", common._NAVIGATION_TARGETS)
+        self.assertIn("asmm:edit_messages", common._NAVIGATION_TARGETS)
+        self.assertIn("asmm:manage_websites", common._NAVIGATION_TARGETS)
+        self.assertIn("asmm:links_menu", common._NAVIGATION_TARGETS)
+        self.assertIn("asmm:seller_notifications_settings", common._NAVIGATION_TARGETS)
+        self.assertIn("asmm:files_menu", common._NAVIGATION_TARGETS)
 
     def test_settings_builds_analytics_keyboard_and_parses_legacy_callbacks(self):
         self.assertEqual(tg_analytics.parse_period_from_callback(tg_analytics.CB_STATS_7D), "7d")
@@ -215,8 +215,8 @@ class TgFilesAndPanelsTests(unittest.TestCase):
         kb = tg_analytics.build_analytics_keyboard("7d", "more")
         self.assertIsNotNone(kb)
         callbacks = [btn.callback_data for row in kb.keyboard for btn in row]
-        self.assertIn("analytics_less_week", callbacks)
-        self.assertIn("return_to_settings", callbacks)
+        self.assertIn("asmm:analytics_less_week", callbacks)
+        self.assertIn("asmm:return_to_settings", callbacks)
 
     def test_start_runtime_starts_only_order_checker_thread(self):
         orig_modules = dict(sys.modules)
@@ -361,7 +361,7 @@ class TgFilesAndPanelsTests(unittest.TestCase):
         fake_bot, calls = _make_fake_bot()
         call = types.SimpleNamespace(
             id="cb_rm_site",
-            data="remove_website_sub.example.com",
+            data="asmm:delete_website_sub.example.com",
             message=types.SimpleNamespace(
                 chat=types.SimpleNamespace(id=555),
                 message_id=88,
@@ -483,7 +483,7 @@ class TgFilesAndPanelsTests(unittest.TestCase):
                 self.assertIn(f"AutoSMM v{rt.VERSION}", refuse_text)
                 self.assertNotIn("0.0.9", refuse_text)
 
-                tg_telemetry.telemetry_guest_7d_callback(_make_call(chat_id=7123, data="autosmm_telemetry_guest_7d"))
+                tg_telemetry.telemetry_guest_7d_callback(_make_call(chat_id=7123, data="asmm:telemetry_guest_7d"))
                 self.assertEqual(len(calls["edits"]), 1)
                 edit_text = calls["edits"][0][2]
                 self.assertIn("7 дней без телеметрии", edit_text)
@@ -529,7 +529,7 @@ class TgUiHardeningTests(unittest.TestCase):
             call = SimpleNamespace(
                 message=SimpleNamespace(chat=SimpleNamespace(id=10), message_id=20),
                 from_user=SimpleNamespace(id=42),
-                data="autosmm_stats_7d",
+                data="asmm:stats_7d",
             )
             with (
                 mock.patch.object(tg_analytics, "_safe_answer_callback"),
@@ -702,13 +702,13 @@ class TgUiHardeningTests(unittest.TestCase):
             rt.bot = fake_bot
             rt.LOT_CARD_CONTEXT[10] = {
                 "lot_key": "lot_1",
-                "back_callback": "search_results_back",
+                "back_callback": "asmm:search_results_back",
                 "back_label": "◀️ Назад",
             }
             call_fmt = SimpleNamespace(
                 message=SimpleNamespace(chat=SimpleNamespace(id=10), message_id=20),
                 from_user=SimpleNamespace(id=42),
-                data="cycle_link_fmt_lot_1",
+                data="asmm:cycle_link_fmt_lot_1",
             )
             rendered_back = []
             with (
@@ -722,12 +722,12 @@ class TgUiHardeningTests(unittest.TestCase):
                 ),
             ):
                 tg_lots.cycle_link_fmt_callback(call_fmt)
-            self.assertEqual(rendered_back, ["search_results_back"])
+            self.assertEqual(rendered_back, ["asmm:search_results_back"])
 
             call_sites = SimpleNamespace(
                 message=SimpleNamespace(chat=SimpleNamespace(id=10), message_id=20),
                 from_user=SimpleNamespace(id=42),
-                data="allowed_websites_list",
+                data="asmm:show_allowed_websites_list",
             )
             with (
                 mock.patch.object(tg_settings, "_safe_answer_callback"),
@@ -741,7 +741,7 @@ class TgUiHardeningTests(unittest.TestCase):
                 for btn in row:
                     cb = getattr(btn, "callback_data", "") or ""
                     self.assertLessEqual(len(cb.encode("utf-8")), 64)
-                    if cb.startswith("delete_website_"):
+                    if cb.startswith("asmm:delete_website_"):
                         delete_cb = cb
             self.assertIsNotNone(delete_cb)
 
@@ -760,7 +760,7 @@ class TgUiHardeningTests(unittest.TestCase):
                 for btn in row:
                     cb = getattr(btn, "callback_data", "") or ""
                     self.assertLessEqual(len(cb.encode("utf-8")), 64)
-                    if cb.startswith("confirm_delete_website_"):
+                    if cb.startswith("asmm:confirm_delete_website_"):
                         confirm_cb = cb
             self.assertIsNotNone(confirm_cb)
 

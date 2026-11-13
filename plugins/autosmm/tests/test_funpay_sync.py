@@ -565,7 +565,7 @@ class TelegramFileUploadStateTests(unittest.TestCase):
         call = SimpleNamespace(
             message=SimpleNamespace(chat=SimpleNamespace(id=100), message_id=200),
             from_user=SimpleNamespace(id=42),
-            data="restore_backup_prompt",
+            data="asmm:restore_backup_prompt",
         )
         msg_list_payload = SimpleNamespace(
             chat=SimpleNamespace(id=100),

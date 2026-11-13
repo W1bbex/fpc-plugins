@@ -460,6 +460,39 @@ class AutoSmmRegressionsTests(unittest.TestCase):
             if orig_events is not None:
                 sys.modules["src.core.funpay_events"] = orig_events
 
+    def test_callback_routes_and_navigation_use_clean_asmm_namespace(self):
+        from src.tg import common as tg_common
+
+        stubs = _build_fake_funpay_modules() if "FunPayAPI" not in sys.modules else {}
+        orig_plugin = sys.modules.pop("src.plugin", None)
+        orig_events = sys.modules.pop("src.core.funpay_events", None)
+        try:
+            with mock.patch.dict(sys.modules, stubs):
+                plugin_mod = importlib.import_module("src.plugin")
+                all_routes = [r for r, _ in plugin_mod._EXACT_CALLBACK_ROUTES] + [
+                    r for r, _ in plugin_mod._PREFIX_CALLBACK_ROUTES
+                ]
+                for route in all_routes:
+                    self.assertTrue(route.startswith("asmm:"), route)
+                    self.assertNotIn("autosmm", route)
+                    self.assertLessEqual(len(route.encode("utf-8")), 64, route)
+                for route in plugin_mod._TELEMETRY_ALLOWED_CALLBACKS:
+                    self.assertTrue(route.startswith("asmm:"), route)
+                    self.assertNotIn("autosmm", route)
+                for target in tg_common._NAVIGATION_TARGETS:
+                    self.assertTrue(target.startswith("asmm:"), target)
+                    self.assertNotIn("autosmm", target)
+                for prefix, _handler in tg_common._NAVIGATION_PREFIXES:
+                    self.assertTrue(prefix.startswith("asmm:"), prefix)
+                    self.assertNotIn("autosmm", prefix)
+        finally:
+            sys.modules.pop("src.plugin", None)
+            sys.modules.pop("src.core.funpay_events", None)
+            if orig_plugin is not None:
+                sys.modules["src.plugin"] = orig_plugin
+            if orig_events is not None:
+                sys.modules["src.core.funpay_events"] = orig_events
+
 
 if __name__ == "__main__":
     unittest.main()

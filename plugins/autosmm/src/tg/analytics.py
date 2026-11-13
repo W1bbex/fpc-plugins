@@ -17,10 +17,10 @@ _ANALYTICS_PERIOD_MAP = {
 }
 _ANALYTICS_VALID_UI_PERIODS = ("day", "week", "month", "all")
 
-CB_STATS_24H = "autosmm_stats_24h"
-CB_STATS_7D = "autosmm_stats_7d"
-CB_STATS_30D = "autosmm_stats_30d"
-CB_STATS_ALL = "autosmm_stats_all"
+CB_STATS_24H = "asmm:stats_24h"
+CB_STATS_7D = "asmm:stats_7d"
+CB_STATS_30D = "asmm:stats_30d"
+CB_STATS_ALL = "asmm:stats_all"
 
 
 def build_analytics_keyboard(period: str = "24h", mode: str = "main") -> InlineKeyboardMarkup:
@@ -37,27 +37,27 @@ def build_analytics_keyboard(period: str = "24h", mode: str = "main") -> InlineK
 
     is_more = str(mode or "").strip().lower() == "more"
     toggle_callback = (
-        f"analytics_less_{period_callback_suffix}"
+        f"asmm:analytics_less_{period_callback_suffix}"
         if is_more
-        else f"analytics_more_{period_callback_suffix}"
+        else f"asmm:analytics_more_{period_callback_suffix}"
     )
     toggle_text = "◀️ Основное" if is_more else "Еще"
 
     kb = InlineKeyboardMarkup(row_width=2)
     kb.row(
-        InlineKeyboardButton("🕒 24ч", callback_data="analytics_period_day"),
-        InlineKeyboardButton("📅 7д", callback_data="analytics_period_week"),
+        InlineKeyboardButton("🕒 24ч", callback_data="asmm:analytics_period_day"),
+        InlineKeyboardButton("📅 7д", callback_data="asmm:analytics_period_week"),
     )
     kb.row(
-        InlineKeyboardButton("🗓 30д", callback_data="analytics_period_month"),
-        InlineKeyboardButton("♾ Всё", callback_data="analytics_period_all"),
+        InlineKeyboardButton("🗓 30д", callback_data="asmm:analytics_period_month"),
+        InlineKeyboardButton("♾ Всё", callback_data="asmm:analytics_period_all"),
     )
     kb.row(
         InlineKeyboardButton(toggle_text, callback_data=toggle_callback),
-        InlineKeyboardButton("🔄 Обновить", callback_data=f"analytics_period_{period_callback_suffix}"),
+        InlineKeyboardButton("🔄 Обновить", callback_data=f"asmm:analytics_period_{period_callback_suffix}"),
     )
     kb.row(
-        InlineKeyboardButton("◀️ Назад", callback_data="return_to_settings"),
+        InlineKeyboardButton("◀️ Назад", callback_data="asmm:return_to_settings"),
     )
     return kb
 
@@ -120,14 +120,14 @@ def show_orders(call: types.CallbackQuery) -> None:
 
 def analytics_period(call: types.CallbackQuery) -> None:
     """Switch the displayed analytics period from callback data."""
-    _render_analytics(call, period=_parse_analytics_period(call, "analytics_period_"))
+    _render_analytics(call, period=_parse_analytics_period(call, "asmm:analytics_period_"))
 
 
 def analytics_more(call: types.CallbackQuery) -> None:
     """Expand analytics screen details."""
-    _render_analytics(call, period=_parse_analytics_period(call, "analytics_more_"), mode="more")
+    _render_analytics(call, period=_parse_analytics_period(call, "asmm:analytics_more_"), mode="more")
 
 
 def analytics_less(call: types.CallbackQuery) -> None:
     """Collapse analytics screen to the primary summary."""
-    _render_analytics(call, period=_parse_analytics_period(call, "analytics_less_"), mode="main")
+    _render_analytics(call, period=_parse_analytics_period(call, "asmm:analytics_less_"), mode="main")

@@ -156,20 +156,20 @@ def render_api_menu(cfg: Dict, *, use_cache_only: bool = True) -> Tuple[str, Inl
 
     kb = InlineKeyboardMarkup(row_width=1)
     for srv_num, _, _, display_name in service_rows:
-        kb.add(InlineKeyboardButton(f"📡 {display_name}", callback_data=f"api_service_{srv_num}"))
+        kb.add(InlineKeyboardButton(f"📡 {display_name}", callback_data=f"asmm:api_service_{srv_num}"))
     kb.row(
-        InlineKeyboardButton("➕ Добавить сервис", callback_data="add_service"),
-        InlineKeyboardButton("➖ Удалить сервис", callback_data="delete_service"),
+        InlineKeyboardButton("➕ Добавить сервис", callback_data="asmm:add_service"),
+        InlineKeyboardButton("➖ Удалить сервис", callback_data="asmm:delete_service"),
     )
     if service_rows:
-        kb.add(InlineKeyboardButton("🔄 Обновить балансы", callback_data="refresh_api_balances"))
-    kb.add(InlineKeyboardButton("◀️ Назад", callback_data="return_to_settings"))
+        kb.add(InlineKeyboardButton("🔄 Обновить балансы", callback_data="asmm:refresh_api_balances"))
+    kb.add(InlineKeyboardButton("◀️ Назад", callback_data="asmm:return_to_settings"))
     return "\n".join(lines).strip(), kb
 
 
 def _build_api_service_card_not_found() -> Tuple[str, InlineKeyboardMarkup]:
     kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(InlineKeyboardButton("◀️ Назад", callback_data="api_settings"))
+    kb.add(InlineKeyboardButton("◀️ Назад", callback_data="asmm:api_settings"))
     return "❌ Сервис не найден.", kb
 
 
@@ -206,12 +206,12 @@ def render_api_service_card(
 
     kb = InlineKeyboardMarkup(row_width=1)
     kb.add(
-        InlineKeyboardButton("Изменить ссылку", callback_data=f"edit_apiurl_{service_idx}"),
-        InlineKeyboardButton("Изменить ключ", callback_data=f"edit_apikey_{service_idx}"),
-        InlineKeyboardButton("Изменить название сервиса", callback_data=f"edit_apiname_{service_idx}"),
-        InlineKeyboardButton("Изменить номер сервиса", callback_data=f"edit_apinum_{service_idx}"),
-        InlineKeyboardButton("🔄 Обновить баланс", callback_data=f"check_balance_{service_idx}"),
-        InlineKeyboardButton("◀️ Назад", callback_data="api_settings"),
+        InlineKeyboardButton("Изменить ссылку", callback_data=f"asmm:edit_apiurl_{service_idx}"),
+        InlineKeyboardButton("Изменить ключ", callback_data=f"asmm:edit_apikey_{service_idx}"),
+        InlineKeyboardButton("Изменить название сервиса", callback_data=f"asmm:edit_apiname_{service_idx}"),
+        InlineKeyboardButton("Изменить номер сервиса", callback_data=f"asmm:edit_apinum_{service_idx}"),
+        InlineKeyboardButton("🔄 Обновить баланс", callback_data=f"asmm:check_balance_{service_idx}"),
+        InlineKeyboardButton("◀️ Назад", callback_data="asmm:api_settings"),
     )
     return "\n".join(lines).strip(), kb
 
@@ -304,7 +304,7 @@ def api_settings_menu(call: types.CallbackQuery) -> None:
 
 
 def _panels_back_kb() -> InlineKeyboardMarkup:
-    return _inline_kb(("◀️ Назад", "api_settings"))
+    return _inline_kb(("◀️ Назад", "asmm:api_settings"))
 
 
 def _parse_service_idx(call: types.CallbackQuery) -> Optional[int]:
@@ -514,7 +514,7 @@ def edit_apiurl(call: types.CallbackQuery) -> None:
         f"Введите ссылку или домен для сервиса #{idx_}:\n\nТекущий URL: {h(current_url)}",
         process_apiurl_change,
         idx_,
-        back_target=f"api_service_{idx_}",
+        back_target=f"asmm:api_service_{idx_}",
     )
 
 
@@ -523,7 +523,7 @@ def edit_apikey(call: types.CallbackQuery) -> None:
     if idx_ is None:
         return
     _safe_answer_callback(call)
-    _start_ui_input_flow(call, f"Введите новый ключ для сервиса #{idx_}:", process_apikey_change, idx_, back_target=f"api_service_{idx_}")
+    _start_ui_input_flow(call, f"Введите новый ключ для сервиса #{idx_}:", process_apikey_change, idx_, back_target=f"asmm:api_service_{idx_}")
 
 
 def edit_apiname(call: types.CallbackQuery) -> None:
@@ -538,7 +538,7 @@ def edit_apiname(call: types.CallbackQuery) -> None:
         f"Введите новое название сервиса #{idx_}:\n\nТекущее название: {h(current_name)}",
         process_apiname_change,
         idx_,
-        back_target=f"api_service_{idx_}",
+        back_target=f"asmm:api_service_{idx_}",
     )
 
 
@@ -547,7 +547,7 @@ def edit_apinum(call: types.CallbackQuery) -> None:
     if idx_ is None:
         return
     _safe_answer_callback(call)
-    _start_ui_input_flow(call, f"Введите новый номер для сервиса #{idx_}:", process_apinum_change, idx_, back_target=f"api_service_{idx_}")
+    _start_ui_input_flow(call, f"Введите новый номер для сервиса #{idx_}:", process_apinum_change, idx_, back_target=f"asmm:api_service_{idx_}")
 
 
 def check_balance(call: types.CallbackQuery) -> None:
@@ -559,12 +559,12 @@ def check_balance(call: types.CallbackQuery) -> None:
 
 def add_service(call: types.CallbackQuery) -> None:
     _safe_answer_callback(call)
-    _start_ui_input_flow(call, "Введите номер нового сервиса (число):", process_add_service, back_target="api_settings")
+    _start_ui_input_flow(call, "Введите номер нового сервиса (число):", process_add_service, back_target="asmm:api_settings")
 
 
 def delete_service(call: types.CallbackQuery) -> None:
     _safe_answer_callback(call)
-    _start_ui_input_flow(call, "Введите номер панели для удаления:", process_delete_service, back_target="api_settings")
+    _start_ui_input_flow(call, "Введите номер панели для удаления:", process_delete_service, back_target="asmm:api_settings")
 
 
 def process_add_service(message: types.Message) -> None:
@@ -631,5 +631,5 @@ def _nav_api_service(call: types.CallbackQuery, target: str) -> None:
     _open_api_service_card(call.message.chat.id, service_idx, message_id=call.message.message_id)
 
 
-register_navigation_target("api_settings", api_settings_menu)
-register_navigation_prefix("api_service_", _nav_api_service)
+register_navigation_target("asmm:api_settings", api_settings_menu)
+register_navigation_prefix("asmm:api_service_", _nav_api_service)

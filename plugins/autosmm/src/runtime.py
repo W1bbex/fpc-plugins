@@ -12,8 +12,8 @@ import time
 from typing import Any, Dict, Optional, Tuple
 
 NAME = "AutoSMM"
-VERSION = "1.0.1"
-DESCRIPTION = "AutoSMM v1.0.1: PerfectPanel/Peakerr API support, atomic config storage, usernames support (@channel), flexible API keys."
+VERSION = "1.0"
+DESCRIPTION = "AutoSMM v1.0: PerfectPanel/Peakerr API support, atomic config storage, usernames support (@channel), flexible API keys."
 CREDITS = "@w1bbex"
 UUID = "a6ccb3f1-3e7b-4984-9e4c-01d3ea7e0ad8"
 SETTINGS_PAGE = False
