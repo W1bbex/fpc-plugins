@@ -760,9 +760,6 @@ def _recover_buyer_flow_runtime(c: Optional["Cardinal"] = None) -> None:
         # Evaluate only locally persisted refund state during startup; schedule remote FunPay verification async.
         if _apply_refund_gate(None, order_record, notify_chat_id=None, force_check=False):
             continue
-        if _has_panel_order(order_record):
-            update_order_fields(order_id, buyer_flow_state=BUYER_STATE_PANEL_CREATED, panel_order_id=_get_panel_order_id(order_record), updated_at=rt.now_str())
-            continue
         ctx = _build_waiting_context_from_order(order_record)
         if ctx:
             with rt.CONTEXT_LOCK:

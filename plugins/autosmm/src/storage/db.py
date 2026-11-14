@@ -153,9 +153,12 @@ def _stat_signature(path: str) -> Optional[Tuple[int, int, int]]:
         st = os.stat(path)
     except OSError:
         return None
-    if not st.st_ino:
-        return None
-    return (int(st.st_dev), int(st.st_ino), int(getattr(st, "st_ctime_ns", 0)))
+    ino = int(getattr(st, "st_ino", 0) or 0)
+    ctime = int(getattr(st, "st_ctime_ns", 0) or int(getattr(st, "st_ctime", 0)))
+    if ino:
+        return (int(st.st_dev), ino, ctime)
+    mtime = int(getattr(st, "st_mtime_ns", 0) or int(getattr(st, "st_mtime", 0)))
+    return (int(st.st_size), mtime, ctime)
 
 
 def _mark_db_initialized(target: str) -> None:

@@ -1,13 +1,17 @@
 import importlib
+import os
 import re
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
+
+import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src import models, runtime as rt
@@ -19,9 +23,10 @@ from src.core import (
     links,
     orders,
     panel_balances,
+    panel_errors,
     panel_submission,
 )
-from src.services import notifications
+from src.services import analytics, currency, notifications
 from src.storage import db, db_orders, storage
 from src.tg import files, panels, templates
 
@@ -1014,6 +1019,114 @@ class AutoSmmRegressionsTests(unittest.TestCase):
                 updated = db_orders.get_order("ORD-PAUSED-1")
                 self.assertEqual(updated["buyer_flow_state"], buyer_flow.BUYER_STATE_WAITING_CONFIRM)
                 self.assertEqual(updated["saved_link"], "https://t.me/test_channel")
+
+    def test_funpay_events_resolves_buyer_chat_before_order_lock(self):
+        fake_mods = _build_fake_funpay_modules()
+        with mock.patch.dict(sys.modules, fake_mods):
+            orig_events_mod = sys.modules.get("src.core.funpay_events")
+            sys.modules.pop("src.core.funpay_events", None)
+            try:
+                mod = importlib.import_module("src.core.funpay_events")
+                call_order = []
+                lock_held_during_resolve = []
+
+                class MockOrderLock:
+                    def __enter__(self):
+                        call_order.append("lock_enter")
+                        return self
+                    def __exit__(self, *args):
+                        call_order.append("lock_exit")
+
+                def mock_resolve_target(c, order):
+                    call_order.append("resolve_target")
+                    lock_held_during_resolve.append("lock_enter" in call_order and "lock_exit" not in call_order)
+                    return (123, 456, "buyer42")
+
+                fake_cardinal = SimpleNamespace(account=None, send_message=mock.MagicMock())
+                fake_order = SimpleNamespace(id="FP-ORD-1", description="AutoSMM Lot", price=100.0, amount=1, raw_chat_id=None)
+                fake_event = SimpleNamespace(order=fake_order)
+
+                with (
+                    mock.patch.object(mod, "resolve_lot_by_description", return_value={"ok": True, "lot_number": 1, "service_number": 1, "service_id": 10, "multiplier": 1, "min_count": 10}),
+                    mock.patch.object(mod, "load_config", return_value={}),
+                    mock.patch.object(mod, "_resolve_buyer_chat_target", side_effect=mock_resolve_target),
+                    mock.patch.object(rt, "get_order_lock", return_value=MockOrderLock()),
+                    mock.patch.object(mod, "_persist_and_notify_matched_order"),
+                ):
+                    mod._handle_new_order_event(fake_cardinal, fake_event)
+
+                self.assertEqual(call_order, ["resolve_target", "lock_enter", "lock_exit"])
+                self.assertEqual(lock_held_during_resolve, [False])
+            finally:
+                sys.modules.pop("src.core.funpay_events", None)
+                if orig_events_mod is not None:
+                    sys.modules["src.core.funpay_events"] = orig_events_mod
+
+    def test_currency_negative_cache_skips_failed_providers_for_60s(self):
+        call_count = [0]
+        def failing_getter(*args, **kwargs):
+            call_count[0] += 1
+            raise requests.RequestException("provider unreachable")
+
+        currency.reset_memory_cache()
+        t0 = 1000.0
+        res1 = currency.refresh_fx_rates(now_ts=t0, http_get=failing_getter)
+        self.assertIsNone(res1)
+        first_calls = call_count[0]
+        self.assertGreater(first_calls, 0)
+
+        # Call within negative cache window (30s later)
+        res2 = currency.refresh_fx_rates(now_ts=t0 + 30.0, http_get=failing_getter)
+        self.assertIsNone(res2)
+        self.assertEqual(call_count[0], first_calls)  # Skipped!
+
+        # After reset, attempts resume
+        currency.reset_memory_cache()
+        res3 = currency.refresh_fx_rates(now_ts=t0 + 35.0, http_get=failing_getter)
+        self.assertIsNone(res3)
+        self.assertGreater(call_count[0], first_calls)
+
+    def test_normalize_runtime_status_maps_refunded_to_canceled(self):
+        self.assertEqual(panel_errors._normalize_runtime_status("Refunded"), "canceled")
+        self.assertEqual(panel_errors._normalize_runtime_status("partially refunded"), "partial")
+        self.assertEqual(panel_errors._normalize_runtime_status("order refunded"), "canceled")
+
+    def test_db_stat_signature_supports_zero_inode_filesystems(self):
+        with tempfile.NamedTemporaryFile() as tmp:
+            sig = db._stat_signature(tmp.name)
+            self.assertIsNotNone(sig)
+            self.assertIsInstance(sig, tuple)
+            self.assertEqual(len(sig), 3)
+
+            # Simulate filesystem with st_ino = 0
+            fake_stat = os.stat_result((33188, 0, 2, 1, 1000, 1000, 42, 100, 200, 300))
+            with mock.patch("os.stat", return_value=fake_stat):
+                sig_no_ino = db._stat_signature("dummy_path")
+                self.assertIsNotNone(sig_no_ino)
+                self.assertEqual(len(sig_no_ino), 3)
+
+    def test_render_api_menu_caps_visible_services_at_25(self):
+        services = {
+            str(i): {"name": f"Panel_{i}", "api_url": f"https://panel{i}.com/api"}
+            for i in range(1, 35)
+        }
+        cfg = {"services": services}
+        menu_text, kb = panels.render_api_menu(cfg, use_cache_only=True)
+        self.assertIn("...и ещё 9 сервисов", menu_text)
+        self.assertLess(len(menu_text), 4096)
+        service_buttons = [b for row in kb.keyboard for b in row if b.callback_data.startswith("asmm:api_service_")]
+        self.assertEqual(len(service_buttons), 25)
+
+    def test_analytics_statistics_total_excludes_refunded_orders(self):
+        now = time.time()
+        orders_list = [
+            {"order_id": "ORD-1", "created_at": now - 100, "summa": 100.0, "chistota": 40.0, "status": "completed"},
+            {"order_id": "ORD-2", "created_at": now - 200, "summa": 50.0, "chistota": 20.0, "status": "canceled", "is_refunded": True},
+        ]
+        stats = analytics._analytics_get_statistics(load_merged=lambda: orders_list)
+        self.assertEqual(stats["day_orders"], 2)
+        self.assertEqual(stats["day_total"], 100.0)  # Excludes refunded 50.0
+        self.assertEqual(stats["day_chistota"], 40.0)
 
 
 if __name__ == "__main__":

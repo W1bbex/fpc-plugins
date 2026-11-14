@@ -47,6 +47,8 @@ _CURRENCY_ALIASES = {
 
 _MEMORY_LOCK = threading.RLock()
 _REFRESH_LOCK = threading.RLock()
+_FX_NEGATIVE_CACHE_TTL_SECONDS = 60.0
+_LAST_REFRESH_FAILED_AT = 0.0
 _MEMORY_CACHE: Dict[str, Any] = {
     "fetched_at": 0.0,
     "source": "",
@@ -202,9 +204,12 @@ def refresh_fx_rates(
     http_get: Optional[Callable[..., Any]] = None,
 ) -> Optional[Dict[str, float]]:
     """Fetch fresh RUB exchange rates across configured providers and cache them."""
+    global _LAST_REFRESH_FAILED_AT
     getter = http_get or requests.get
     ts = float(now_ts if now_ts is not None else time.time())
     with _REFRESH_LOCK:
+        if (ts - _LAST_REFRESH_FAILED_AT) < _FX_NEGATIVE_CACHE_TTL_SECONDS:
+            return None
         for source_name, fetcher in _FX_PROVIDERS:
             try:
                 rates = fetcher(getter)
@@ -218,13 +223,18 @@ def refresh_fx_rates(
                     _MEMORY_CACHE["source"] = source_name
                     _MEMORY_CACHE["rates"] = dict(rates)
                 _save_persisted_fx_cache(ts, source_name, rates)
+                _LAST_REFRESH_FAILED_AT = 0.0
                 logger.debug(f"FX курсы обновлены из {source_name}: валют={len(rates)}")
                 return rates
+        _LAST_REFRESH_FAILED_AT = ts
     return None
 
 
 def reset_memory_cache() -> None:
     """Clear only the in-memory FX cache (useful for isolated tests)."""
+    global _LAST_REFRESH_FAILED_AT
+    with _REFRESH_LOCK:
+        _LAST_REFRESH_FAILED_AT = 0.0
     with _MEMORY_LOCK:
         _MEMORY_CACHE["fetched_at"] = 0.0
         _MEMORY_CACHE["source"] = ""

@@ -157,8 +157,6 @@ def _links_is_valid_link(link: str, *, allowed_domains) -> Tuple[bool, str]:
         parsed = urlparse(raw_link)
     except ValueError:
         return (False, '❌ Не удалось прочитать ссылку.')
-    if '\\' in (parsed.netloc or ''):
-        return (False, '❌ Некорректный формат ссылки.')
     hostname = (parsed.hostname or '').strip().lower().strip('.')
     if hostname.startswith('www.'):
         hostname = hostname[4:]

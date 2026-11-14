@@ -127,17 +127,22 @@ def render_api_menu(cfg: Dict, *, use_cache_only: bool = True) -> Tuple[str, Inl
 
     total_balance_text = core_panel_balances.compute_total_balance_text(services, cached_by_key)
     lines = ["🔌 Интеграция API", "", f"Общий баланс: {h(total_balance_text)}", "", "Подключённые сервисы:", ""]
-    if service_rows:
-        for idx, (_, _, payload, display_name) in enumerate(service_rows):
+    max_visible = 25
+    visible_rows = service_rows[:max_visible]
+    if visible_rows:
+        for idx, (_, _, payload, display_name) in enumerate(visible_rows):
             lines.append(f"📡 {h(display_name)}")
             lines.append(f"Состояние подключения: {payload.get('status_emoji', '❌')}")
-            if idx != len(service_rows) - 1:
+            if idx != len(visible_rows) - 1:
                 lines.append("")
+        if len(service_rows) > max_visible:
+            lines.append("")
+            lines.append(f"<i>...и ещё {len(service_rows) - max_visible} сервисов</i>")
     else:
         lines.append("Сервисов пока нет.")
 
     kb = InlineKeyboardMarkup(row_width=1)
-    for srv_num, _, _, display_name in service_rows:
+    for srv_num, _, _, display_name in visible_rows:
         kb.add(InlineKeyboardButton(f"📡 {display_name}", callback_data=f"asmm:api_service_{srv_num}"))
     kb.row(
         InlineKeyboardButton("➕ Добавить сервис", callback_data="asmm:add_service"),

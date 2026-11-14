@@ -457,8 +457,8 @@ def _handle_new_order_event(c: Cardinal, e: NewOrderEvent) -> None:
                 str(order_desc or "")[:300],
             )
             return
+        buyer_chat_id, buyer_id, buyer_username = _resolve_buyer_chat_target(c, order_)
         with rt.get_order_lock(order_id):
-            buyer_chat_id, buyer_id, buyer_username = _resolve_buyer_chat_target(c, order_)
             _handle_unmatched_order(
                 c,
                 order_id,
@@ -473,8 +473,8 @@ def _handle_new_order_event(c: Cardinal, e: NewOrderEvent) -> None:
         return
 
     cfg = load_config()
+    buyer_chat_id, buyer_id, buyer_username = _resolve_buyer_chat_target(c, order_)
     with rt.get_order_lock(order_id):
-        buyer_chat_id, buyer_id, buyer_username = _resolve_buyer_chat_target(c, order_)
         _persist_and_notify_matched_order(
             c,
             cfg,

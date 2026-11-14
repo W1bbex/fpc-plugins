@@ -221,9 +221,9 @@ def _analytics_get_statistics(*, load_merged: Callable[[], List[Dict]]) -> Dict:
 
     def calc(p: str) -> Dict:
         _, lst = _filter_by_period(items, p)
-        total = sum(safe_float(o.get("summa"), 0.0) for o in lst)
+        total = sum(safe_float(o.get("summa"), 0.0) for o in lst if not is_order_refundedish(o))
         ch = sum(safe_float(o.get("chistota"), 0.0) for o in lst if not is_order_refundedish(o))
-        return {"orders": len(lst), "total": total, "chistota": round(ch, 2)}
+        return {"orders": len(lst), "total": round(total, 2), "chistota": round(ch, 2)}
 
     day = calc("24h")
     week = calc("7d")

@@ -398,7 +398,7 @@ def _normalize_runtime_status(status_value: Any) -> str:
         return "partial"
     if "completed" in haystack:
         return "completed"
-    if "canceled" in haystack or "cancelled" in haystack:
+    if "canceled" in haystack or "cancelled" in haystack or "refunded" in haystack:
         return "canceled"
     if "failed" in haystack or haystack == "fail" or " error" in f" {haystack}" or haystack.startswith("error"):
         return "fail"

@@ -167,18 +167,18 @@ def _apply_status_result(
         order_record.update(latest)
         order_record.update(fields)
 
-        if fx_info is not None:
-            try:
-                analytics.update_order_charge_and_net(
-                    order_id_funpay,
-                    fx_info["spent"],
-                    currency=fx_info["currency"],
-                    net_profit=fx_info["net_profit"],
-                    spent_rub=fx_info["spent_rub"],
-                    fx_rate_to_rub=fx_info["fx_rate_to_rub"],
-                )
-            except (sqlite3.Error, OSError, ValueError, TypeError) as ex:
-                rt.logger.error(f"Не удалось обновить затраты/профит для заказа #{order_id_funpay}: {ex}")
+    if fx_info is not None:
+        try:
+            analytics.update_order_charge_and_net(
+                order_id_funpay,
+                fx_info["spent"],
+                currency=fx_info["currency"],
+                net_profit=fx_info["net_profit"],
+                spent_rub=fx_info["spent_rub"],
+                fx_rate_to_rub=fx_info["fx_rate_to_rub"],
+            )
+        except (sqlite3.Error, OSError, ValueError, TypeError) as ex:
+            rt.logger.error(f"Не удалось обновить затраты/профит для заказа #{order_id_funpay}: {ex}")
 
     if mapped_status == "completed":
         _send_completion_notification_if_needed(c, order_record)
