@@ -191,7 +191,7 @@ class BuildTests(unittest.TestCase):
                 self.assertEqual(mod.VERSION, "1.0")
                 self.assertEqual(str(uuid.UUID(mod.UUID)), mod.UUID)
                 self.assertIs(mod.SETTINGS_PAGE, False)
-                self.assertEqual(mod.BIND_TO_DELETE, [mod.stop_runtime])
+                self.assertIs(mod.BIND_TO_DELETE, mod.stop_runtime)
                 self.assertGreaterEqual(len(mod.BIND_TO_PRE_INIT), 1)
                 self.assertGreaterEqual(len(mod.BIND_TO_POST_INIT), 1)
                 self.assertGreaterEqual(len(mod.BIND_TO_NEW_MESSAGE), 1)
@@ -261,7 +261,7 @@ class BuildTests(unittest.TestCase):
                 self.assertGreaterEqual(len(spawned), 1)
                 rt_reloaded = sys.modules["_autosmm_src.runtime"]
                 self.assertTrue(rt_reloaded.RUNNING)
-                mod_reloaded.BIND_TO_DELETE[0](fake_cardinal)
+                mod_reloaded.BIND_TO_DELETE(fake_cardinal)
                 self.assertFalse(rt_reloaded.RUNNING)
 
     def test_bundle_resolves_cardinal_root_under_plugins_w1bbex_dir(self):

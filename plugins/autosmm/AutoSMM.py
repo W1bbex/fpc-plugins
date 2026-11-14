@@ -812,7 +812,7 @@ _BUNDLE_SOURCES: dict[str, str] = {
         'BIND_TO_NEW_MESSAGE = [auto_smm_handler]\n'
         'BIND_TO_NEW_ORDER = [auto_smm_handler]\n'
         'BIND_TO_ORDER_STATUS_CHANGED = [auto_smm_handler]\n'
-        'BIND_TO_DELETE = [stop_runtime]\n'
+        'BIND_TO_DELETE = stop_runtime\n'
     ),
     'runtime': (
         '"""Shared paths and mutable runtime state for the AutoSMM plugin."""\n'

@@ -411,4 +411,4 @@ BIND_TO_POST_INIT = [start_runtime]
 BIND_TO_NEW_MESSAGE = [auto_smm_handler]
 BIND_TO_NEW_ORDER = [auto_smm_handler]
 BIND_TO_ORDER_STATUS_CHANGED = [auto_smm_handler]
-BIND_TO_DELETE = [stop_runtime]
+BIND_TO_DELETE = stop_runtime
