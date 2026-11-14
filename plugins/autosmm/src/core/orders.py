@@ -36,12 +36,12 @@ from .engine import (
     BUYER_STATE_PANEL_CREATED,
 )
 from .funpay_sync import FUNPAY_STATUS_SYNC_INTERVAL_SECONDS, _run_funpay_status_sync
+from ..models import safe_int as _safe_int
 from .panel_api import (
-    _build_status_result_from_entry,
     _fetch_batch_order_status,
     _fetch_single_order_status,
-    _safe_int,
 )
+from .panel_errors import _build_status_result_from_entry
 
 STATUS_BATCH_SIZE = 50
 STATUS_BATCH_INTERVAL_SECONDS = 300

@@ -29,9 +29,9 @@ from .engine import (
     BUYER_STATE_FAILED,
     BUYER_STATE_REFUNDED,
 )
-from .panel_api import (
+from .panel_api import _panel_api_json
+from .panel_errors import (
     _normalize_api_key,
-    _panel_api_json,
     _sanitize_secret_text,
 )
 

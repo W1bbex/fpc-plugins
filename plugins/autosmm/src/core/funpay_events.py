@@ -60,12 +60,14 @@ from .funpay_sync import (
 )
 from .links import normalize_incoming_text
 from .orders import _apply_status_result, _find_order_by_any_order_ref
+from ..models import safe_int as _safe_int
 from .panel_api import (
     _extract_service_credentials,
     _fetch_single_order_status,
-    _normalize_api_key,
     _panel_api_json,
-    _safe_int,
+)
+from .panel_errors import (
+    _normalize_api_key,
     _sanitize_secret_text,
     _validate_api_key_for_action,
 )

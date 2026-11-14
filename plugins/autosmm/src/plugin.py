@@ -47,7 +47,7 @@ from .tg.files import (
     handle_backup_restore_upload,
     restore_backup_prompt,
 )
-from .tg.lots import (
+from .tg.lot_editor import (
     add_new_lot,
     change_fallback_id_prompt,
     change_fallback_snum_prompt,
@@ -55,12 +55,14 @@ from .tg.lots import (
     change_name,
     change_quantity,
     change_snum,
-    confirm_delete_one_lot_callback,
     cycle_link_fmt_callback,
+    lot_input_back_callback,
+)
+from .tg.lots import (
+    confirm_delete_one_lot_callback,
     delete_one_lot_callback,
     edit_lot_callback,
     edit_lot_from_search,
-    lot_input_back_callback,
     lot_settings,
     page_navigation,
     return_to_lots,

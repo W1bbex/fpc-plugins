@@ -9,7 +9,7 @@ import time
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from .. import runtime as rt
-from ..core.panel_api import _normalize_runtime_status
+from ..core.panel_errors import _normalize_runtime_status
 from ..models import (
     get_effective_funpay_status,
     is_order_refundedish,

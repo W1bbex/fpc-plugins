@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from src.core import panel_api
+from src.core import panel_api, panel_errors
 
 
 class PanelApiTests(unittest.TestCase):
@@ -27,9 +27,9 @@ class PanelApiTests(unittest.TestCase):
 
     def test_batch_result_preserves_order_identifiers(self):
         payload = {"123": {"status": "Completed"}, "456": {"status": "Pending"}}
-        result = panel_api._extract_batch_status_entries(payload, [123, 456])
+        result = panel_errors._extract_batch_status_entries(payload, [123, 456])
         self.assertEqual(result, payload)
-        self.assertEqual(panel_api._build_status_result_from_entry(result["123"])["status"], "completed")
+        self.assertEqual(panel_errors._build_status_result_from_entry(result["123"])["status"], "completed")
 
     def test_add_uses_get_when_post_method_is_rejected(self):
         rejected = SimpleNamespace(status_code=405, text="", json=lambda: {})
@@ -55,7 +55,7 @@ class PanelApiHardeningTests(unittest.TestCase):
 
         cfg = {"services": {"1": {"api_url": "https://panel.example/api/v2", "api_key": "TOPSECRET_KEY_1"}}}
         raw_html = "<html><body>502 Bad Gateway: invalid url / service not found</body></html>"
-        classified = panel_api._classify_panel_payload_result(
+        classified = panel_errors._classify_panel_payload_result(
             action="status",
             payload=None,
             raw_text=raw_html,
@@ -105,7 +105,7 @@ class PanelApiHardeningTests(unittest.TestCase):
                 res = panel_api._panel_single_status(1, 123, config=cfg)
         combined = repr(res) + "\n" + "\n".join(captured.output)
         self.assertNotIn(secret, combined)
-        sanitized = panel_api._sanitize_secret_text(
+        sanitized = panel_errors._sanitize_secret_text(
             f"key={secret}&action=cancel",
             secret,
         )

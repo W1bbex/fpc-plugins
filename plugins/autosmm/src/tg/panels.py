@@ -10,12 +10,12 @@ from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from .. import runtime as rt
 from ..core import panel_balances as core_panel_balances
-from ..core.panel_api import (
+from ..core.panel_api import _panel_api_json
+from ..core.panel_errors import (
     MAX_API_KEY_LENGTH,
     MIN_API_KEY_LENGTH,
     _is_placeholder_api_key,
     _normalize_api_key,
-    _panel_api_json,
 )
 from ..models import safe_int
 from ..storage.storage import CONFIG_LOCK, load_config, rename_panel_service, save_config, sort_service_items

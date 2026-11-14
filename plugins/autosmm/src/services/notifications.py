@@ -19,9 +19,9 @@ if TYPE_CHECKING:
 
 from .. import runtime as rt
 from ..core.buyer_messages import _render_template
-from ..core.panel_api import (
+from ..core.panel_api import _panel_api_json
+from ..core.panel_errors import (
     _build_transport_error_balance_note,
-    _panel_api_json,
     _sanitize_secret_text,
     _validate_api_key_for_action,
 )

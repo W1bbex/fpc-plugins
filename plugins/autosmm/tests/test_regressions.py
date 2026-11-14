@@ -495,12 +495,12 @@ class AutoSmmRegressionsTests(unittest.TestCase):
 
     def test_panel_api_status_rate_limit_secret_sanitization_and_balance_note(self):
         import logging
-        from src.core import panel_api
+        from src.core import panel_api, panel_errors
 
-        self.assertEqual(panel_api._normalize_runtime_status("Partially Completed"), "partial")
-        self.assertEqual(panel_api._normalize_runtime_status("Completed"), "completed")
+        self.assertEqual(panel_errors._normalize_runtime_status("Partially Completed"), "partial")
+        self.assertEqual(panel_errors._normalize_runtime_status("Completed"), "completed")
 
-        err_status = panel_api._classify_panel_api_result(
+        err_status = panel_errors._classify_panel_api_result(
             action="status",
             payload={"error": "Unexpected panel error"},
             raw_text='{"error":"Unexpected panel error"}',
@@ -508,7 +508,7 @@ class AutoSmmRegressionsTests(unittest.TestCase):
         self.assertEqual(err_status["error"], "unknown")
         self.assertEqual(err_status["error_class"], "UNKNOWN_ERROR")
 
-        rate_429 = panel_api._classify_panel_api_result(
+        rate_429 = panel_errors._classify_panel_api_result(
             action="status",
             response=SimpleNamespace(status_code=429),
             payload={"error": "Too many requests"},
@@ -517,7 +517,7 @@ class AutoSmmRegressionsTests(unittest.TestCase):
         self.assertEqual(rate_429["error"], "rate_limited")
         self.assertEqual(rate_429["error_class"], "TRANSPORT_ERROR")
 
-        rate_txt = panel_api._classify_panel_api_result(
+        rate_txt = panel_errors._classify_panel_api_result(
             action="add",
             response=SimpleNamespace(status_code=200),
             payload={"error": "Rate limit exceeded"},
@@ -555,7 +555,7 @@ class AutoSmmRegressionsTests(unittest.TestCase):
         joined_logs = "\n".join(records)
         self.assertNotIn(secret, joined_logs)
 
-        _note, risk_status = panel_api._build_transport_error_balance_note(
+        _note, risk_status = panel_errors._build_transport_error_balance_note(
             {"ok": True, "balance": float("nan"), "currency": "RUB"},
             {"ok": True, "balance": 10.0, "currency": "RUB"},
         )

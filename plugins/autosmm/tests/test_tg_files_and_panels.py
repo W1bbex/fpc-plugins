@@ -621,7 +621,7 @@ class TgUiHardeningTests(unittest.TestCase):
         from types import SimpleNamespace
         from unittest import mock
         from src import runtime as rt
-        from src.tg import lots as tg_lots
+        from src.tg import lot_editor as tg_lot_editor
         from src.tg import panels as tg_panels
         from src.tg import settings as tg_settings
         from src.tg import templates as tg_templates
@@ -645,9 +645,9 @@ class TgUiHardeningTests(unittest.TestCase):
                 text=None,
                 message_id=9,
             )
-            with mock.patch.object(tg_lots, "load_config", return_value={"lot_mapping": {}, "services": {}}):
-                tg_lots.process_new_lot_id_step(media_msg)
-                self.assertIsNone(tg_lots._parse_int_or_repeat(media_msg, "err", min_value=1))
+            with mock.patch.object(tg_lot_editor, "load_config", return_value={"lot_mapping": {}, "services": {}}):
+                tg_lot_editor.process_new_lot_id_step(media_msg)
+                self.assertIsNone(tg_lot_editor._parse_int_or_repeat(media_msg, "err", min_value=1))
                 zero_msg = SimpleNamespace(
                     chat=SimpleNamespace(id=555),
                     from_user=SimpleNamespace(id=42),
@@ -660,8 +660,8 @@ class TgUiHardeningTests(unittest.TestCase):
                     text="-5",
                     message_id=11,
                 )
-                self.assertIsNone(tg_lots._parse_int_or_repeat(zero_msg, "err", min_value=1))
-                self.assertIsNone(tg_lots._parse_int_or_repeat(neg_msg, "err", min_value=1))
+                self.assertIsNone(tg_lot_editor._parse_int_or_repeat(zero_msg, "err", min_value=1))
+                self.assertIsNone(tg_lot_editor._parse_int_or_repeat(neg_msg, "err", min_value=1))
 
             with mock.patch.object(tg_panels, "load_config", return_value={"services": {"1": {}}}):
                 tg_panels.process_apiurl_change(media_msg, 1)
@@ -679,7 +679,7 @@ class TgUiHardeningTests(unittest.TestCase):
         from types import SimpleNamespace
         from unittest import mock
         from src import runtime as rt
-        from src.tg import lots as tg_lots
+        from src.tg import lot_editor as tg_lot_editor
 
         cfg = {
             "lot_mapping": {
@@ -703,12 +703,12 @@ class TgUiHardeningTests(unittest.TestCase):
             rt.bot = SimpleNamespace(send_message=lambda *a, **kw: None)
             msg = SimpleNamespace(chat=SimpleNamespace(id=10), from_user=SimpleNamespace(id=42), text="99")
             with (
-                mock.patch.object(tg_lots, "load_config", return_value=cfg),
-                mock.patch.object(tg_lots, "save_config"),
-                mock.patch.object(tg_lots, "reindex_lots", side_effect=_reindex),
-                mock.patch.object(tg_lots, "_show_lot_card", side_effect=lambda cid, lk, **kw: opened.append(lk)),
+                mock.patch.object(tg_lot_editor, "load_config", return_value=cfg),
+                mock.patch.object(tg_lot_editor, "save_config"),
+                mock.patch.object(tg_lot_editor, "reindex_lots", side_effect=_reindex),
+                mock.patch.object(tg_lot_editor, "_show_lot_card", side_effect=lambda cid, lk, **kw: opened.append(lk)),
             ):
-                tg_lots._apply_lot_field_update(msg, "lot_3", "id_yslygi", 99, "ok")
+                tg_lot_editor._apply_lot_field_update(msg, "lot_3", "id_yslygi", 99, "ok")
             self.assertEqual(opened, ["lot_2"])
         finally:
             rt.bot = orig_bot
@@ -717,7 +717,7 @@ class TgUiHardeningTests(unittest.TestCase):
         from types import SimpleNamespace
         from unittest import mock
         from src import runtime as rt
-        from src.tg import lots as tg_lots
+        from src.tg import lot_editor as tg_lot_editor
         from src.tg import settings as tg_settings
 
         long_domain = ("very-long-subdomain-part-" * 3) + "example.com"
@@ -749,16 +749,16 @@ class TgUiHardeningTests(unittest.TestCase):
             )
             rendered_back = []
             with (
-                mock.patch.object(tg_lots, "_safe_answer_callback"),
-                mock.patch.object(tg_lots, "load_config", return_value=cfg),
-                mock.patch.object(tg_lots, "save_config"),
+                mock.patch.object(tg_lot_editor, "_safe_answer_callback"),
+                mock.patch.object(tg_lot_editor, "load_config", return_value=cfg),
+                mock.patch.object(tg_lot_editor, "save_config"),
                 mock.patch.object(
-                    tg_lots,
+                    tg_lot_editor,
                     "_show_lot_card",
                     side_effect=lambda c, lk, mid=None, **kw: rendered_back.append(kw.get("back_callback")),
                 ),
             ):
-                tg_lots.cycle_link_fmt_callback(call_fmt)
+                tg_lot_editor.cycle_link_fmt_callback(call_fmt)
             self.assertEqual(rendered_back, ["asmm:search_results_back"])
 
             call_sites = SimpleNamespace(
@@ -925,6 +925,7 @@ class TgUiHardeningTests(unittest.TestCase):
             analytics as tg_analytics,
             common as tg_common,
             files as tg_files,
+            lot_editor as tg_lot_editor,
             lots as tg_lots,
             panels as tg_panels,
             settings as tg_settings,
@@ -991,12 +992,12 @@ class TgUiHardeningTests(unittest.TestCase):
                         telegram=SimpleNamespace(authorized_users={42: {}}, set_state=lambda *a, **k: None, clear_state=lambda *a, **k: None),
                     )
                     bad_id_msg = SimpleNamespace(chat=SimpleNamespace(id=10), from_user=SimpleNamespace(id=42), text="0")
-                    with mock.patch.object(tg_lots, "_repeat_ui_input_flow") as repeat_mock:
-                        tg_lots.process_new_lot_id_step(bad_id_msg)
+                    with mock.patch.object(tg_lot_editor, "_repeat_ui_input_flow") as repeat_mock:
+                        tg_lot_editor.process_new_lot_id_step(bad_id_msg)
                         repeat_mock.assert_called_once()
 
                     ok_id_msg = SimpleNamespace(chat=SimpleNamespace(id=10), from_user=SimpleNamespace(id=42), text="12345")
-                    tg_lots.process_new_lot_id_step(ok_id_msg)
+                    tg_lot_editor.process_new_lot_id_step(ok_id_msg)
                     saved_lots = storage.load_config()["lot_mapping"]
                     self.assertIn("lot_1", saved_lots)
                     self.assertIn("&lt;Promo&gt; &amp; Boost", sent_messages[-1][1])
@@ -1019,9 +1020,9 @@ class TgUiHardeningTests(unittest.TestCase):
                     )
                     fmt_lock_free = []
                     with mock.patch.object(
-                        tg_lots, "_show_lot_card", side_effect=lambda *a, **kw: fmt_lock_free.append(_is_lock_free(tg_lots.CONFIG_LOCK))
+                        tg_lot_editor, "_show_lot_card", side_effect=lambda *a, **kw: fmt_lock_free.append(_is_lock_free(tg_lot_editor.CONFIG_LOCK))
                     ):
-                        tg_lots.cycle_link_fmt_callback(
+                        tg_lot_editor.cycle_link_fmt_callback(
                             SimpleNamespace(
                                 id="cbfmt",
                                 data="asmm:cycle_link_fmt_lot_1",
