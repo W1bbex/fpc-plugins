@@ -762,3 +762,53 @@ class StorageResilienceTests(unittest.TestCase):
             rt.config.update(orig_cfg)
             rt.lot_mapping.clear()
             rt.lot_mapping.update(orig_lots)
+
+    def test_wal_read_only_queries_do_not_acquire_db_lock_or_run_ddl(self):
+        import sqlite3
+        import tempfile
+        import threading
+        from pathlib import Path
+        from unittest import mock
+        from src import runtime as rt
+        from src.storage import db, db_orders, db_state
+
+        orig_db = rt.DB_PATH
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                rt.DB_PATH = str(Path(tmp) / "autosmm.db")
+                db.init_db(rt.DB_PATH)
+                db_orders.upsert_order(101, "FP-RO-1", 555, "pending", 90.0, "https://t.me/a", 100, 1)
+                db_state.save_state({"custom_flag": "ok"})
+
+                lock = db.get_db_lock(rt.DB_PATH)
+                read_results = {}
+                read_errors = []
+
+                def reader():
+                    try:
+                        with mock.patch.object(db, "init_db", side_effect=AssertionError("unexpected DDL on cached read")):
+                            read_results["order"] = db_orders.get_order("FP-RO-1")
+                            read_results["orders"] = db_orders.list_orders()
+                            read_results["state"] = db_state.load_state()
+                    except Exception as exc:
+                        read_errors.append(exc)
+
+                with lock:
+                    t = threading.Thread(target=reader)
+                    t.start()
+                    t.join(timeout=2.0)
+                    self.assertFalse(t.is_alive())
+
+                self.assertEqual(read_errors, [])
+                self.assertEqual(read_results["order"]["panel_order_id"], 555)
+                self.assertEqual(len(read_results["orders"]), 1)
+                self.assertEqual(read_results["state"]["custom_flag"], "ok")
+
+                with db._connect(rt.DB_PATH, read_only=True) as ro_conn:
+                    with self.assertRaises(sqlite3.OperationalError):
+                        ro_conn.execute("DELETE FROM orders WHERE order_id = ?", ("FP-RO-1",))
+
+                db.invalidate_schema_cache(rt.DB_PATH)
+                self.assertFalse(db._is_db_schema_cached(rt.DB_PATH))
+        finally:
+            rt.DB_PATH = orig_db

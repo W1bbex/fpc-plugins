@@ -21,11 +21,13 @@ from .common import (
     _clear_step_handler,
     _clear_ui_input_state,
     _edit_html_screen,
+    _extract_call_ids,
     _inline_kb,
     _repeat_ui_input_flow,
     _safe_answer_callback,
     _safe_edit_message_text,
     _start_ui_input_flow,
+    h,
     register_navigation_prefix,
     register_navigation_target,
 )
@@ -220,7 +222,7 @@ def template_edit_callback(call: types.CallbackQuery) -> None:
         return
     _start_ui_input_flow(
         call,
-        f"Отправьте новый текст для:\n{meta.get('title')}\n\nТекущий текст можно скопировать с прошлого экрана.",
+        f"Отправьте новый текст для:\n{h(meta.get('title'))}\n\nТекущий текст можно скопировать с прошлого экрана.",
         process_template_text_change,
         template_key,
         back_target=f"asmm:template_view_{template_key}",
@@ -313,9 +315,13 @@ def reset_message_texts_confirm(call: types.CallbackQuery) -> None:
 
 
 def _nav_template_view(call: types.CallbackQuery, target: str) -> None:
+    _safe_answer_callback(call)
+    chat_id, message_id, _ = _extract_call_ids(call)
+    if chat_id is None:
+        return
     template_key = str(target or "").split("asmm:template_view_", 1)[1] if "asmm:template_view_" in str(target or "") else ""
     if template_key in TEMPLATE_EDITOR_DEFS:
-        _show_template_editor_screen(call.message.chat.id, call.message.message_id, template_key)
+        _show_template_editor_screen(chat_id, message_id, template_key)
     else:
         edit_messages_menu(call)
 

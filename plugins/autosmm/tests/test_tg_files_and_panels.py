@@ -269,6 +269,7 @@ class TgFilesAndPanelsTests(unittest.TestCase):
 
         try:
             from src import plugin
+            from src.core import funpay_events
 
             fake_cardinal = types.SimpleNamespace(
                 telegram=types.SimpleNamespace(bot=types.SimpleNamespace())
@@ -277,12 +278,13 @@ class TgFilesAndPanelsTests(unittest.TestCase):
 
             def _fake_thread(*args, **kwargs):
                 spawned_targets.append(kwargs.get("target"))
-                return types.SimpleNamespace(start=lambda: None, is_alive=lambda: True)
+                return types.SimpleNamespace(start=lambda: None, is_alive=lambda: True, join=lambda timeout=None: None)
 
             with tempfile.TemporaryDirectory() as tmp:
                 db_path = Path(tmp) / "autosmm.db"
                 db.init_db(str(db_path))
                 orig_db = rt.DB_PATH
+                orig_log = rt.LOG_PATH
                 orig_running = rt.RUNNING
                 orig_thread = rt.ORDER_CHECK_THREAD
                 try:
@@ -294,11 +296,44 @@ class TgFilesAndPanelsTests(unittest.TestCase):
                         mock.patch.object(rt, "bot", fake_cardinal.telegram.bot),
                     ):
                         plugin.start_runtime(fake_cardinal)
-                    self.assertEqual(spawned_targets, [plugin.start_order_checking])
+                    self.assertIs(spawned_targets[0], plugin.start_order_checking)
+                    self.assertEqual(
+                        [getattr(target, "__name__", None) for target in spawned_targets],
+                        ["start_order_checking"] + ["_shard_worker_loop"] * funpay_events._EVENT_WORKER_COUNT,
+                    )
                     self.assertFalse(hasattr(plugin, "start_auto_lots_sender"))
                     self.assertFalse(hasattr(rt, "AUTO_LOTS_SEND_THREAD"))
+
+                    # Track shutdown ordering: background thread joins before rt.LOG_PATH FileHandler closes.
+                    join_events = []
+                    bg_started = __import__("threading").Event()
+                    rt.LOG_PATH = str(Path(tmp) / "autosmm_stop_test.log")
+                    fh = logging.FileHandler(rt.LOG_PATH, encoding="utf-8")
+                    rt.logger.addHandler(fh)
+
+                    def bg_worker():
+                        bg_started.set()
+                        rt.STOP_EVENT.wait(timeout=3.0)
+                        join_events.append(("bg_done", not fh.stream.closed))
+
+                    bg_thread = __import__("threading").Thread(target=bg_worker)
+                    bg_thread.start()
+                    rt.register_background_thread(bg_thread)
+                    self.assertTrue(bg_started.wait(timeout=1.0))
+
+                    plugin.stop_runtime()
+                    self.assertTrue(rt.STOP_EVENT.is_set())
+                    self.assertFalse(bg_thread.is_alive())
+                    self.assertEqual(join_events, [("bg_done", True)])
+                    self.assertIsNone(fh.stream)
                 finally:
+                    try:
+                        plugin.stop_runtime()
+                    except Exception:
+                        pass
+                    rt.STOP_EVENT.clear()
                     rt.DB_PATH = orig_db
+                    rt.LOG_PATH = orig_log
                     rt.RUNNING = orig_running
                     rt.ORDER_CHECK_THREAD = orig_thread
         finally:
@@ -865,6 +900,262 @@ class TgUiHardeningTests(unittest.TestCase):
             self.assertEqual(len(repeated), 1)
         finally:
             rt.bot = orig_bot
+
+    def test_tg_handlers_masking_escaping_truncation_locks_and_null_message_guards(self):
+        import threading
+        from types import SimpleNamespace
+        from unittest import mock
+        from src import runtime as rt
+        from src.storage import storage
+        from src.tg import (
+            analytics as tg_analytics,
+            common as tg_common,
+            files as tg_files,
+            lots as tg_lots,
+            panels as tg_panels,
+            settings as tg_settings,
+            templates as tg_templates,
+        )
+
+        def _is_lock_free(lock_obj) -> bool:
+            res = []
+
+            def _probe():
+                acq = lock_obj.acquire(blocking=False)
+                if acq:
+                    lock_obj.release()
+                res.append(acq)
+
+            t = threading.Thread(target=_probe)
+            t.start()
+            t.join(timeout=1.0)
+            return bool(res and res[0])
+
+        orig_bot = rt.bot
+        orig_cardinal = rt.cardinal_instance
+        sent_messages = []
+        edited_messages = []
+        answered = []
+        sent_docs = []
+        cleared_steps = []
+        registered_steps = []
+        try:
+            rt.bot = SimpleNamespace(
+                send_message=lambda cid, text, **kw: sent_messages.append((cid, text, kw))
+                or SimpleNamespace(chat=SimpleNamespace(id=cid), message_id=999),
+                edit_message_text=lambda text, cid, mid, **kw: edited_messages.append((cid, mid, text, kw)),
+                answer_callback_query=lambda call_id, text=None, **kw: answered.append((call_id, text)),
+                send_document=lambda cid, f, **kw: sent_docs.append((cid, f, kw)),
+                clear_step_handler_by_chat_id=lambda cid: cleared_steps.append(cid),
+                register_next_step_handler=lambda msg, fn, *a, **kw: registered_steps.append((msg, fn)),
+            )
+
+            # 1. mask_api_key across short, medium, and normal lengths.
+            self.assertEqual(tg_panels.mask_api_key(""), "не задан")
+            self.assertEqual(tg_panels.mask_api_key("abcd"), "......")
+            self.assertEqual(tg_panels.mask_api_key("123456"), "1......6")
+            self.assertEqual(tg_panels.mask_api_key("LIVEKEY12345"), "LIV......345")
+
+            # 2. Search results HTML truncation respects Telegram 4096-char limit without cutting entities.
+            long_term = "<tag> & " + ("x" * 5000)
+            rendered_search = tg_lots._format_search_results_text(
+                long_term, has_results=True, current_page=1, total_pages=1
+            )
+            self.assertLessEqual(len(rendered_search), 4096)
+            self.assertIn("&lt;tag&gt; &amp;", rendered_search)
+            self.assertFalse(rendered_search.rstrip(".").endswith("&am"))
+
+            # 3. process_new_lot_id_step & delete_one_lot (HTML escaping + reindex + error recovery).
+            with tempfile.TemporaryDirectory() as tmp:
+                orig_cfg_path = rt.CONFIG_PATH
+                try:
+                    rt.CONFIG_PATH = str(Path(tmp) / "config.json")
+                    storage.save_config({"services": {"1": {"name": "S1"}}, "lot_mapping": {}})
+                    fake_lot = SimpleNamespace(fields={"fields[summary][ru]": "<Promo> & Boost"})
+                    rt.cardinal_instance = SimpleNamespace(
+                        account=SimpleNamespace(get_lot_fields=lambda lid: fake_lot),
+                        telegram=SimpleNamespace(authorized_users={42: {}}, set_state=lambda *a, **k: None, clear_state=lambda *a, **k: None),
+                    )
+                    bad_id_msg = SimpleNamespace(chat=SimpleNamespace(id=10), from_user=SimpleNamespace(id=42), text="0")
+                    with mock.patch.object(tg_lots, "_repeat_ui_input_flow") as repeat_mock:
+                        tg_lots.process_new_lot_id_step(bad_id_msg)
+                        repeat_mock.assert_called_once()
+
+                    ok_id_msg = SimpleNamespace(chat=SimpleNamespace(id=10), from_user=SimpleNamespace(id=42), text="12345")
+                    tg_lots.process_new_lot_id_step(ok_id_msg)
+                    saved_lots = storage.load_config()["lot_mapping"]
+                    self.assertIn("lot_1", saved_lots)
+                    self.assertIn("&lt;Promo&gt; &amp; Boost", sent_messages[-1][1])
+                    self.assertEqual(sent_messages[-1][2].get("parse_mode"), "HTML")
+
+                    # delete_one_lot removes existing lot cleanly and reports missing lot safely.
+                    del_call = SimpleNamespace(id="cb1", message=SimpleNamespace(chat=SimpleNamespace(id=10), message_id=50), from_user=SimpleNamespace(id=42))
+                    tg_lots.delete_one_lot(del_call, "lot_1")
+                    self.assertEqual(storage.load_config()["lot_mapping"], {})
+                    self.assertIn("удалён", edited_messages[-1][2])
+                    tg_lots.delete_one_lot(del_call, "<missing>")
+                    self.assertIn("&lt;missing&gt;", edited_messages[-1][2])
+
+                    # 4. cycle_link_fmt_callback & process_add_service / process_delete_service lock release before TG I/O.
+                    storage.save_config(
+                        {
+                            "services": {"1": {"name": "P1", "api_url": "https://p.example/api/v2", "api_key": "SECRET123456"}},
+                            "lot_mapping": {"lot_1": {"name": "L1", "service_id": 1, "quantity": 10, "service_number": 1}},
+                        }
+                    )
+                    fmt_lock_free = []
+                    with mock.patch.object(
+                        tg_lots, "_show_lot_card", side_effect=lambda *a, **kw: fmt_lock_free.append(_is_lock_free(tg_lots.CONFIG_LOCK))
+                    ):
+                        tg_lots.cycle_link_fmt_callback(
+                            SimpleNamespace(
+                                id="cbfmt",
+                                data="asmm:cycle_link_fmt_lot_1",
+                                message=SimpleNamespace(chat=SimpleNamespace(id=10), message_id=50),
+                                from_user=SimpleNamespace(id=42),
+                            )
+                        )
+                    self.assertEqual(fmt_lock_free, [True])
+                    self.assertEqual(storage.load_config()["lot_mapping"]["lot_1"]["link_format"], "clean_username")
+
+                    dup_lock_free = []
+                    with mock.patch.object(
+                        tg_panels, "_repeat_ui_input_flow", side_effect=lambda *a, **kw: dup_lock_free.append(_is_lock_free(tg_panels.CONFIG_LOCK))
+                    ):
+                        tg_panels.process_add_service(SimpleNamespace(chat=SimpleNamespace(id=10), from_user=SimpleNamespace(id=42), text="1"))
+                        tg_panels.process_delete_service(SimpleNamespace(chat=SimpleNamespace(id=10), from_user=SimpleNamespace(id=42), text="99"))
+                    self.assertEqual(dup_lock_free, [True, True])
+
+                    tg_panels.process_add_service(SimpleNamespace(chat=SimpleNamespace(id=10), from_user=SimpleNamespace(id=42), text="2"))
+                    self.assertIn("2", storage.load_config()["services"])
+                    tg_panels.process_delete_service(SimpleNamespace(chat=SimpleNamespace(id=10), from_user=SimpleNamespace(id=42), text="2"))
+                    self.assertNotIn("2", storage.load_config()["services"])
+
+                    # 5. add_website & _delete_allowed_website_and_refresh serialize config write under lock and do TG I/O outside lock.
+                    site_io_lock_free = []
+                    with (
+                        mock.patch.object(tg_settings, "load_valid_links", return_value=["t.me"]),
+                        mock.patch.object(tg_settings, "save_valid_links", return_value=True),
+                        mock.patch.object(
+                            rt.bot,
+                            "send_message",
+                            side_effect=lambda *a, **kw: site_io_lock_free.append(_is_lock_free(tg_settings.CONFIG_LOCK)),
+                        ),
+                    ):
+                        tg_settings.add_website(SimpleNamespace(chat=SimpleNamespace(id=10), from_user=SimpleNamespace(id=42)), "vk.com")
+                    with (
+                        mock.patch.object(tg_settings, "load_valid_links", return_value=["t.me", "vk.com"]),
+                        mock.patch.object(tg_settings, "save_valid_links", return_value=True),
+                        mock.patch.object(
+                            tg_settings,
+                            "show_allowed_websites_list",
+                            side_effect=lambda *a, **kw: site_io_lock_free.append(_is_lock_free(tg_settings.CONFIG_LOCK)),
+                        ),
+                    ):
+                        tg_settings._delete_allowed_website_and_refresh(
+                            SimpleNamespace(id="cbs", message=SimpleNamespace(chat=SimpleNamespace(id=10), message_id=50), from_user=SimpleNamespace(id=42)),
+                            "vk.com",
+                        )
+                    self.assertEqual(site_io_lock_free, [True, True])
+                finally:
+                    rt.CONFIG_PATH = orig_cfg_path
+
+            # 6. /chatid@bot step command, zero rejection, and valid chat ID persistence in process_notification_chat_id.
+            self.assertEqual(getattr(tg_settings.process_notification_chat_id, "allowed_step_commands", None), ("/chatid",))
+            tg_common._set_ui_input_state(
+                10,
+                "notif_chat_id",
+                tg_settings.process_notification_chat_id,
+                back_target="back_target",
+                initiator_user_id=42,
+            )
+            fake_msg_user = SimpleNamespace(chat=SimpleNamespace(id=10), from_user=SimpleNamespace(id=42), text="/chatid@my_test_bot")
+            with mock.patch.object(tg_settings, "_register_guarded_step_handler", wraps=tg_common._register_guarded_step_handler) as reg_wrap:
+                tg_settings.process_notification_chat_id(fake_msg_user)
+            self.assertIn("ID этого чата: 10", sent_messages[-1][1])
+            reg_wrap.assert_called_once()
+            # Underlying step helper exposes allowed_step_commands for /chatid@bot pass-through.
+            passed_msg = SimpleNamespace(chat=SimpleNamespace(id=10), from_user=SimpleNamespace(id=42), text="/chatid@my_test_bot")
+            tg_common._register_guarded_step_handler(passed_msg, tg_settings.process_notification_chat_id, expected_user_id=42)
+            sent_count_before = len(sent_messages)
+            registered_steps[-1][1](passed_msg)
+            self.assertEqual(len(sent_messages), sent_count_before + 1)
+            self.assertIn("ID этого чата: 10", sent_messages[-1][1])
+
+            with mock.patch.object(tg_settings, "_repeat_ui_input_flow") as rep_chat:
+                tg_settings.process_notification_chat_id(SimpleNamespace(chat=SimpleNamespace(id=10), from_user=SimpleNamespace(id=42), text="0"))
+                rep_chat.assert_called_once()
+            with mock.patch.object(tg_settings, "_update_config_value") as upd_chat:
+                tg_settings.process_notification_chat_id(SimpleNamespace(chat=SimpleNamespace(id=10), from_user=SimpleNamespace(id=42), text="-100123456"))
+                upd_chat.assert_called_once_with("notification_chat_id", -100123456)
+
+            # 7. full_backup_confirm error escaping + export_errors + call.message is None guards + cancel routing + /autosmm clear_state.
+            with tempfile.TemporaryDirectory() as tmp_b:
+                dummy_backup = Path(tmp_b) / "backup.json"
+                dummy_backup.write_text("{}", encoding="utf-8")
+                call_file = SimpleNamespace(id="cbf", message=SimpleNamespace(chat=SimpleNamespace(id=10), message_id=50), from_user=SimpleNamespace(id=42))
+                with (
+                    mock.patch.object(tg_files, "_create_full_backup", return_value=str(dummy_backup)),
+                    mock.patch.object(tg_files, "files_menu"),
+                ):
+                    tg_files.full_backup_confirm(call_file)
+                self.assertEqual(len(sent_docs), 1)
+
+                with (
+                    mock.patch.object(tg_files, "_create_full_backup", return_value=str(dummy_backup)),
+                    mock.patch.object(rt.bot, "send_document", side_effect=RuntimeError("<bad & xml>")),
+                    mock.patch.object(tg_files, "files_menu"),
+                ):
+                    tg_files.full_backup_confirm(call_file)
+                self.assertIn("&lt;bad &amp; xml&gt;", sent_messages[-1][1])
+                self.assertEqual(sent_messages[-1][2].get("parse_mode"), "HTML")
+
+                with (
+                    mock.patch.object(tg_files, "_create_full_backup", side_effect=OSError("disk error")),
+                    mock.patch.object(tg_files, "files_menu"),
+                ):
+                    tg_files.full_backup_confirm(call_file)
+                self.assertIn("Не удалось создать бэкап", sent_messages[-1][1])
+
+                with (
+                    mock.patch.object(tg_files, "_send_log_file_async") as log_send_mock,
+                    mock.patch.object(tg_files, "_render_files_menu") as files_render_mock,
+                ):
+                    tg_files.export_errors(call_file)
+                    log_send_mock.assert_called_once()
+                    files_render_mock.assert_called_once()
+
+            null_call = SimpleNamespace(id="cb_null", message=None, from_user=None, data="asmm:ui_input_cancel")
+            for fn in (
+                tg_common.ui_input_cancel_callback,
+                tg_common.ui_input_back_callback,
+                tg_analytics._render_analytics,
+                tg_files._render_files_menu,
+                tg_files.export_errors,
+            ):
+                fn(null_call)
+
+            nav_api_calls = []
+            nav_tpl_calls = []
+            with mock.patch.object(tg_common, "_NAVIGATION_PREFIXES", [("api_service_", lambda c, t: nav_api_calls.append(t)), ("template_view_", lambda c, t: nav_tpl_calls.append(t))]):
+                tg_common._set_ui_input_state(10, "p1", lambda m: None, back_target="api_service_1", initiator_user_id=42)
+                tg_common.ui_input_cancel_callback(SimpleNamespace(id="c1", message=SimpleNamespace(chat=SimpleNamespace(id=10), message_id=50), from_user=SimpleNamespace(id=42)))
+                tg_common._set_ui_input_state(10, "p2", lambda m: None, back_target="asmm:settings", cancel_target="template_view_payment", initiator_user_id=42)
+                tg_common.ui_input_cancel_callback(SimpleNamespace(id="c2", message=SimpleNamespace(chat=SimpleNamespace(id=10), message_id=50), from_user=SimpleNamespace(id=42)))
+            self.assertEqual(nav_api_calls, ["api_service_1"])
+            self.assertEqual(nav_tpl_calls, ["template_view_payment"])
+
+            cleared_tg_states = []
+            rt.cardinal_instance = SimpleNamespace(
+                telegram=SimpleNamespace(clear_state=lambda cid, uid, del_msg=False: cleared_tg_states.append((cid, uid)))
+            )
+            with mock.patch.object(tg_settings, "_open_main_settings_menu"):
+                tg_settings.auto_smm_settings(SimpleNamespace(chat=SimpleNamespace(id=10), from_user=SimpleNamespace(id=42)))
+            self.assertIn((10, 42), cleared_tg_states)
+        finally:
+            tg_common._clear_autosmm_memory_contexts()
+            rt.bot = orig_bot
+            rt.cardinal_instance = orig_cardinal
 
 
 if __name__ == "__main__":

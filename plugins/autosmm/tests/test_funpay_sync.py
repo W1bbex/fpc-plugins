@@ -4,6 +4,8 @@ from pathlib import Path
 import re
 import sys
 import tempfile
+import threading
+import time
 from types import ModuleType, SimpleNamespace
 import unittest
 from unittest import mock
@@ -135,6 +137,7 @@ class FunPayLiveStatusSecurityTests(unittest.TestCase):
         rt.waiting_for_link.clear()
 
     def tearDown(self):
+        funpay_events.stop_event_workers(drain=False, timeout=2.0)
         rt.RUNNING = self._orig_running
         rt.waiting_for_link.clear()
         rt.waiting_for_link.update(self._orig_waiting)
@@ -167,6 +170,7 @@ class FunPayLiveStatusSecurityTests(unittest.TestCase):
                 )
                 with mock.patch.object(funpay_sync, "_attempt_panel_cancel_after_funpay_refund") as cancel_mock:
                     funpay_events.auto_smm_handler(cardinal, forged)
+                    funpay_events.flush_event_queue(timeout=5.0)
 
                 stored = storage.get_order_data("FP123456")
                 self.assertEqual(stored["funpay_status"], "open")
@@ -224,6 +228,7 @@ class FunPayLiveStatusSecurityTests(unittest.TestCase):
                     )
                 )
                 funpay_events.auto_smm_handler(cardinal, as_buyer_refund)
+                funpay_events.flush_event_queue(timeout=5.0)
                 self.assertEqual(storage.get_order_data("FP100001")["funpay_status"], "open")
 
                 # Mismatched chat_id must be rejected even with author_id=0.
@@ -238,6 +243,7 @@ class FunPayLiveStatusSecurityTests(unittest.TestCase):
                     )
                 )
                 funpay_events.auto_smm_handler(cardinal, wrong_chat_refund)
+                funpay_events.flush_event_queue(timeout=5.0)
                 self.assertEqual(storage.get_order_data("FP100001")["funpay_status"], "open")
 
                 # Authentic full refund in matching chat.
@@ -253,6 +259,7 @@ class FunPayLiveStatusSecurityTests(unittest.TestCase):
                 )
                 with mock.patch.object(funpay_sync, "_attempt_panel_cancel_after_funpay_refund") as cancel_mock:
                     funpay_events.auto_smm_handler(cardinal, real_refund)
+                    funpay_events.flush_event_queue(timeout=5.0)
                 stored1 = storage.get_order_data("FP100001")
                 self.assertEqual(stored1["funpay_status"], "refunded")
                 self.assertEqual(stored1["buyer_flow_state"], "refunded")
@@ -271,6 +278,7 @@ class FunPayLiveStatusSecurityTests(unittest.TestCase):
                     )
                 )
                 funpay_events.auto_smm_handler(cardinal, real_confirm)
+                funpay_events.flush_event_queue(timeout=5.0)
                 self.assertEqual(storage.get_order_data("FP100002")["funpay_status"], "closed")
 
                 # Partial refund (FunPayAPI sets i_am_seller=None) must be accepted without full cancel.
@@ -286,6 +294,7 @@ class FunPayLiveStatusSecurityTests(unittest.TestCase):
                 )
                 with mock.patch.object(funpay_sync, "_attempt_panel_cancel_after_funpay_refund") as cancel_mock:
                     funpay_events.auto_smm_handler(cardinal, partial_refund)
+                    funpay_events.flush_event_queue(timeout=5.0)
                 self.assertEqual(storage.get_order_data("FP100003")["funpay_status"], "partially_refunded")
                 cancel_mock.assert_not_called()
 
@@ -309,6 +318,7 @@ class FunPayLiveStatusSecurityTests(unittest.TestCase):
                     cardinal,
                     _OrderStatusChangedEvent(SimpleNamespace(id="FOREIGN1", status=_OrderStatuses.CLOSED)),
                 )
+                funpay_events.flush_event_queue(timeout=5.0)
                 get_order_mock.assert_not_called()
 
                 # CLOSED updates directly with 0 extra HTTP requests.
@@ -316,6 +326,7 @@ class FunPayLiveStatusSecurityTests(unittest.TestCase):
                     cardinal,
                     _OrderStatusChangedEvent(SimpleNamespace(id="FP200001", status=_OrderStatuses.CLOSED)),
                 )
+                funpay_events.flush_event_queue(timeout=5.0)
                 self.assertEqual(storage.get_order_data("FP200001")["funpay_status"], "closed")
                 get_order_mock.assert_not_called()
 
@@ -325,6 +336,7 @@ class FunPayLiveStatusSecurityTests(unittest.TestCase):
                         cardinal,
                         _OrderStatusChangedEvent(SimpleNamespace(id="FP200002", status=_OrderStatuses.REFUNDED)),
                     )
+                    funpay_events.flush_event_queue(timeout=5.0)
                 get_order_mock.assert_called_once_with("FP200002")
                 self.assertEqual(storage.get_order_data("FP200002")["funpay_status"], "partially_refunded")
                 cancel_mock.assert_not_called()
@@ -338,6 +350,7 @@ class FunPayBatchAndNewOrderTests(unittest.TestCase):
         rt.waiting_for_link.clear()
 
     def tearDown(self):
+        funpay_events.stop_event_workers(drain=False, timeout=2.0)
         rt.RUNNING = self._orig_running
         rt.waiting_for_link.clear()
         rt.waiting_for_link.update(self._orig_waiting)
@@ -454,6 +467,7 @@ class FunPayBatchAndNewOrderTests(unittest.TestCase):
                     )
                 )
                 funpay_events.auto_smm_handler(cardinal, foreign_event)
+                funpay_events.flush_event_queue(timeout=5.0)
                 get_order_mock.assert_not_called()
                 get_chat_mock.assert_not_called()
                 self.assertIsNone(storage.get_order_data("FOREIGN99"))
@@ -471,6 +485,7 @@ class FunPayBatchAndNewOrderTests(unittest.TestCase):
                     )
                 )
                 funpay_events.auto_smm_handler(cardinal, matched_event)
+                funpay_events.flush_event_queue(timeout=5.0)
                 get_chat_mock.assert_called_once_with("buyer_cached")
                 get_order_mock.assert_not_called()
                 stored = storage.get_order_data("SMM1001")
@@ -493,8 +508,152 @@ class FunPayBatchAndNewOrderTests(unittest.TestCase):
                     )
                 )
                 funpay_events.auto_smm_handler(cardinal, miss_event)
+                funpay_events.flush_event_queue(timeout=5.0)
                 get_order_mock.assert_called_once_with("SMM1002")
                 self.assertEqual(storage.get_order_data("SMM1002")["chat_id"], 666)
+
+    def test_auto_smm_handler_dispatches_async_preserves_waiting_before_send_and_skips_none_chat(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "autosmm.db"
+            cfg = {
+                "lot_mapping": {
+                    "lot_1": {"name": "Telegram подписчики", "id_yslygi": 10, "real_amount": 100, "service_number": 1}
+                },
+                "messages": {"after_payment": "Отправьте ссылку"},
+            }
+            with (
+                mock.patch.object(rt, "DB_PATH", str(db_path)),
+                mock.patch.object(rt, "lot_mapping", cfg["lot_mapping"]),
+                mock.patch.object(funpay_events, "load_config", return_value=cfg),
+            ):
+                gate = threading.Event()
+                started = threading.Event()
+                waiting_at_send = []
+
+                def slow_get_chat(username):
+                    if username == "buyer_slow":
+                        started.set()
+                        gate.wait(timeout=2.0)
+                        return SimpleNamespace(id=777)
+                    return None
+
+                def fake_send_buyer(cardinal_arg, chat_id, text):
+                    waiting_at_send.append((chat_id, dict(rt.waiting_for_link)))
+                    return True
+
+                cardinal = SimpleNamespace(
+                    account=SimpleNamespace(get_order=mock.MagicMock(return_value=None), get_chat_by_name=slow_get_chat),
+                    send_message=mock.MagicMock(),
+                )
+                slow_evt = _NewOrderEvent(
+                    SimpleNamespace(
+                        id="SMMSLOW1",
+                        description="Telegram подписчики",
+                        amount=1,
+                        price=100.0,
+                        buyer_id=404,
+                        buyer_username="buyer_slow",
+                        chat_id="users-1-404",
+                    )
+                )
+                no_chat_evt = _NewOrderEvent(
+                    SimpleNamespace(
+                        id="SMMNOCHAT",
+                        description="Telegram подписчики",
+                        amount=1,
+                        price=100.0,
+                        buyer_id=405,
+                        buyer_username="buyer_nochat",
+                        chat_id=None,
+                    )
+                )
+                try:
+                    with mock.patch.object(funpay_events, "_send_buyer_message", side_effect=fake_send_buyer):
+                        t0 = time.monotonic()
+                        funpay_events.auto_smm_handler(cardinal, slow_evt)
+                        dispatch_elapsed = time.monotonic() - t0
+                        self.assertLess(dispatch_elapsed, 0.25)
+                        self.assertTrue(started.wait(timeout=1.5))
+
+                        # Separate order without resolvable chat_id must still persist and never send to chat None.
+                        funpay_events.auto_smm_handler(cardinal, no_chat_evt)
+                        gate.set()
+                        funpay_events.flush_event_queue(timeout=5.0)
+                finally:
+                    gate.set()
+
+                funpay_events._send_buyer_message(cardinal, None, "ignored")
+                cardinal.send_message.assert_not_called()
+
+                self.assertEqual(len(waiting_at_send), 1)
+                self.assertEqual(waiting_at_send[0][0], 777)
+                self.assertIn("SMMSLOW1", waiting_at_send[0][1])
+                no_chat_stored = storage.get_order_data("SMMNOCHAT")
+                self.assertIsNotNone(no_chat_stored)
+                self.assertIsNone(no_chat_stored.get("chat_id"))
+                self.assertEqual(no_chat_stored.get("buyer_flow_state"), "waiting_link")
+
+    def test_same_order_lock_serializes_concurrent_event_and_sync_mutations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "autosmm.db"
+            with mock.patch.object(rt, "DB_PATH", str(db_path)):
+                storage.save_orders_data(
+                    [{"order_id": "FPLOCK01", "chat_id": 888, "funpay_status": "open", "buyer_flow_state": "waiting_link"}]
+                )
+                active = 0
+                max_active = 0
+                count_lock = threading.Lock()
+                orig_apply = funpay_sync._apply_funpay_status_update
+
+                def observed_apply(*args, **kwargs):
+                    nonlocal active, max_active
+                    with count_lock:
+                        active += 1
+                        max_active = max(max_active, active)
+                    time.sleep(0.05)
+                    try:
+                        return orig_apply(*args, **kwargs)
+                    finally:
+                        with count_lock:
+                            active -= 1
+
+                cardinal = SimpleNamespace(account=SimpleNamespace(id=777, get_order=mock.MagicMock()))
+                errors = []
+                with mock.patch.object(funpay_sync, "_apply_funpay_status_update", side_effect=observed_apply):
+                    def run_sync(fn, arg):
+                        try:
+                            fn(cardinal, arg)
+                        except Exception as exc:
+                            errors.append(exc)
+
+                    t1 = threading.Thread(
+                        target=run_sync,
+                        args=(
+                            funpay_sync._sync_funpay_status_from_order_event,
+                            _OrderStatusChangedEvent(SimpleNamespace(id="FPLOCK01", status=_OrderStatuses.CLOSED)),
+                        ),
+                    )
+                    t2 = threading.Thread(
+                        target=run_sync,
+                        args=(
+                            funpay_sync._sync_funpay_status_from_event,
+                            SimpleNamespace(
+                                author_id=0,
+                                author="FunPay",
+                                chat_id=888,
+                                type=_MessageTypes.ORDER_CONFIRMED,
+                                i_am_seller=True,
+                                text="Покупатель подтвердил выполнение заказа #FPLOCK01.",
+                            ),
+                        ),
+                    )
+                    t1.start()
+                    t2.start()
+                    t1.join(timeout=2.0)
+                    t2.join(timeout=2.0)
+
+                self.assertEqual(errors, [])
+                self.assertEqual(max_active, 1)
 
     def test_send_order_started_notification_reuses_stored_buyer_username(self):
         with tempfile.TemporaryDirectory() as tmp:

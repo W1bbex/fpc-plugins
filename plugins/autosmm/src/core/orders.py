@@ -323,19 +323,27 @@ def _check_pending_orders_batch(c: "Cardinal") -> None:
         grouped.setdefault(int(order_record.get("service_number") or 1), []).append(order_record)
 
     for service_number, orders_group in grouped.items():
+        if rt.STOP_EVENT.is_set():
+            return
         for start_idx in range(0, len(orders_group), STATUS_BATCH_SIZE):
+            if rt.STOP_EVENT.is_set():
+                return
             chunk = orders_group[start_idx:start_idx + STATUS_BATCH_SIZE]
             order_ids = [oid for oid in (_safe_int(r.get("id_zakaz")) for r in chunk) if oid is not None]
             if not order_ids:
                 continue
 
             result = _fetch_batch_order_status(service_number, order_ids)
+            if rt.STOP_EVENT.is_set():
+                return
             if not result.get("ok"):
                 error_code = result.get("error", "unknown")
                 detail = result.get("detail", "")
                 if _is_batch_transport_error(error_code):
                     rt.logger.warning(f"BATCH STATUS RETRY: service=#{service_number}, orders={order_ids}, error={error_code}, detail={detail}")
                     retry_result = _fetch_batch_order_status(service_number, order_ids)
+                    if rt.STOP_EVENT.is_set():
+                        return
                     if not retry_result.get("ok"):
                         _fallback_chunk_to_single_status(
                             c,
@@ -351,6 +359,8 @@ def _check_pending_orders_batch(c: "Cardinal") -> None:
 
             entries = result.get("entries", {}) or {}
             for order_record in chunk:
+                if rt.STOP_EVENT.is_set():
+                    return
                 order_oid = _safe_int(order_record.get("id_zakaz"))
                 if order_oid is None:
                     continue
@@ -403,11 +413,13 @@ def start_order_checking(c: "Cardinal") -> None:
 
     last_funpay_status_sync_ts = time.time()
 
-    while rt.RUNNING:
+    while rt.RUNNING and not rt.STOP_EVENT.is_set():
         try:
             _check_pending_orders_batch(c)
         except Exception as ex:
             rt.logger.error(f"Ошибка в batch status мониторинге: {ex}")
+        if not rt.RUNNING or rt.STOP_EVENT.is_set():
+            break
 
         rt.prune_stale_contexts()
 
@@ -423,10 +435,7 @@ def start_order_checking(c: "Cardinal") -> None:
         except Exception as ex:
             rt.logger.error(f"Ошибка проверки гостевого режима телеметрии: {ex}")
 
-        for _ in range(STATUS_BATCH_INTERVAL_SECONDS):
-            if not rt.RUNNING:
-                break
-            time.sleep(1)
+        rt.wait_with_stop(STATUS_BATCH_INTERVAL_SECONDS, step=1.0)
 
 
 def _normalize_order_ref_for_lookup(raw_ref: Any) -> str:

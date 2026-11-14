@@ -26,7 +26,7 @@ def _decode_state_rows(rows: Iterable[sqlite3.Row]) -> Dict[str, Any]:
 
 def load_state(db_path: Optional[str] = None) -> Dict[str, Any]:
     """Load all persisted key-value runtime state entries."""
-    with _connect(db_path) as conn:
+    with _connect(db_path, read_only=True) as conn:
         return _decode_state_rows(conn.execute("SELECT key, value_json FROM kv_state").fetchall())
 
 
@@ -66,7 +66,7 @@ def update_state_fields(db_path: Optional[str] = None, **fields: Any) -> Dict[st
 
 def export_snapshot(db_path: Optional[str] = None) -> Dict[str, Any]:
     """Export orders and kv_state in a single read transaction for backups."""
-    with _connect(db_path) as conn:
+    with _connect(db_path, read_only=True) as conn:
         order_rows = conn.execute("SELECT * FROM orders ORDER BY created_at ASC, rowid ASC").fetchall()
         state_rows = conn.execute("SELECT key, value_json FROM kv_state").fetchall()
         return {

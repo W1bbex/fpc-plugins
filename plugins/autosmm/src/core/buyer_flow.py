@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import threading
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -65,8 +66,11 @@ from .links import (
     is_valid_buyer_target,
 )
 from .funpay_sync import (
+    FUNPAY_STATUS_BATCH_SIZE,
+    _apply_funpay_status_update,
     _apply_refund_gate,
     _fetch_funpay_status_via_cardinal,
+    _fetch_funpay_statuses_batch,
     _seconds_since_checked_at,
 )
 from .panel_submission import process_link_without_confirmation
@@ -431,79 +435,81 @@ def _handle_buyer_cancel_command(c: "Cardinal", msg_text: str, buyer_id: Any, ch
     if not order_record:
         return True
     order_id = str(order_record.get("order_id"))
-    allow_buyer_cancel = bool(load_config().get("allow_buyer_cancel_before_panel_order", False))
-    if not allow_buyer_cancel:
-        if _apply_refund_gate(c, order_record, notify_chat_id=chat_id, force_check=True):
-            return True
-    elif _is_order_refundedish(order_record):
-        if _apply_refund_gate(c, order_record, notify_chat_id=chat_id, force_check=False):
-            return True
+    with rt.get_order_lock(order_id):
+        fresh_record = get_order_data(order_id) or order_record
+        allow_buyer_cancel = bool(load_config().get("allow_buyer_cancel_before_panel_order", False))
+        if not allow_buyer_cancel:
+            if _apply_refund_gate(c, fresh_record, notify_chat_id=chat_id, force_check=True):
+                return True
+        elif _is_order_refundedish(fresh_record):
+            if _apply_refund_gate(c, fresh_record, notify_chat_id=chat_id, force_check=False):
+                return True
 
-    state = _get_buyer_flow_state(order_record)
-    if _has_panel_order(order_record) or state in (BUYER_STATE_PANEL_CREATED, BUYER_STATE_COMPLETED, BUYER_STATE_FAILED):
-        _send_buyer_message(c, chat_id, "Заказ уже передан в работу.\nАвтоматическая отмена недоступна.")
-        return True
-    with rt.CONTEXT_LOCK:
-        cached = rt.waiting_for_link.get(order_id)
-        ctx = dict(cached) if isinstance(cached, dict) else None
-    if not ctx:
-        ctx = _build_waiting_context_from_order(order_record) or {}
-    ctx.update({"order_id_funpay": order_id, "buyer_id": buyer_id, "chat_id": chat_id})
-
-    if allow_buyer_cancel:
-        can_refund, fresh_order = _can_buyer_refund_pre_panel(c, order_record, buyer_id, chat_id)
-        if not can_refund:
-            if _is_order_refundedish(fresh_order):
-                _apply_refund_gate(c, fresh_order, notify_chat_id=chat_id, force_check=False)
-            elif _is_post_panel_or_refunded(fresh_order):
-                _send_buyer_message(c, chat_id, "Заказ уже передан в работу.\nАвтоматическая отмена недоступна.")
-            else:
-                _send_buyer_message(c, chat_id, BUYER_AUTO_CANCEL_UNAVAILABLE_TEXT)
+        state = _get_buyer_flow_state(fresh_record)
+        if _has_panel_order(fresh_record) or state in (BUYER_STATE_PANEL_CREATED, BUYER_STATE_COMPLETED, BUYER_STATE_FAILED):
+            _send_buyer_message(c, chat_id, "Заказ уже передан в работу.\nАвтоматическая отмена недоступна.")
             return True
-        try:
-            c.account.refund(order_id)
-        except Exception as ex:
-            rt.logger.error(f"BUYER CANCEL REFUND FAILED: order=#{order_id}, error={ex}")
-            _transition_waiting_state(ctx, order_id, buyer_id, chat_id, BUYER_STATE_LINK_PAUSED, saved_link_marker=None, select_order=False)
-            _send_admin_order_alert(
-                order_id_funpay=order_id,
-                reason=f"покупатель запросил !отмена, но автоматический refund не сработал: {ex}",
-                bot_action="refund не выполнен, ожидание ссылки приостановлено",
-                action="проверьте заказ и при необходимости отмените вручную",
-                title="⚠️ AutoSMM: не удалось выполнить buyer cancel",
-            )
-            _send_buyer_message(c, chat_id, BUYER_AUTO_CANCEL_FAILED_TEXT)
-            return True
-
-        try:
-            update_order_fields(
-                order_id,
-                funpay_status="refunded",
-                buyer_flow_state=BUYER_STATE_REFUNDED,
-                saved_link=None,
-                refund_detected_at=rt.now_str(),
-                refund_source="buyer_cancel_command",
-                updated_at=rt.now_str(),
-            )
-        except (sqlite3.Error, OSError, ValueError, TypeError) as db_ex:
-            rt.logger.exception(f"BUYER CANCEL DB UPDATE FAILED AFTER REFUND: order=#{order_id}, error={db_ex}")
-            _send_admin_order_alert(
-                order_id_funpay=order_id,
-                reason=f"FunPay refund выполнен по команде !отмена, но не удалось обновить SQLite: {db_ex}",
-                bot_action="ожидание в памяти очищено, запись в БД требует проверки",
-                action="перезапустите синхронизацию или проверьте БД",
-                title="⚠️ AutoSMM: ошибка записи БД после возврата",
-            )
-
         with rt.CONTEXT_LOCK:
-            rt.waiting_for_link.pop(order_id, None)
-        _clear_selected_order_for_buyer(buyer_id, chat_id)
-        _send_buyer_message(c, chat_id, "Ввод ссылки отменён.\n\nЗаказ FunPay отменён.")
-        return True
+            cached = rt.waiting_for_link.get(order_id)
+            ctx = dict(cached) if isinstance(cached, dict) else None
+        if not ctx:
+            ctx = _build_waiting_context_from_order(fresh_record) or {}
+        ctx.update({"order_id_funpay": order_id, "buyer_id": buyer_id, "chat_id": chat_id})
 
-    _transition_waiting_state(ctx, order_id, buyer_id, chat_id, BUYER_STATE_LINK_PAUSED, saved_link_marker=None, select_order=False)
-    _send_buyer_message(c, chat_id, "Ввод ссылки отменён.\n\nЗаказ FunPay не отменён.\nЕсли хотите отменить заказ, напишите продавцу.\nЧтобы снова отправить ссылку, напишите: !ссылка")
-    return True
+        if allow_buyer_cancel:
+            can_refund, fresh_order = _can_buyer_refund_pre_panel(c, fresh_record, buyer_id, chat_id)
+            if not can_refund:
+                if _is_order_refundedish(fresh_order):
+                    _apply_refund_gate(c, fresh_order, notify_chat_id=chat_id, force_check=False)
+                elif _is_post_panel_or_refunded(fresh_order):
+                    _send_buyer_message(c, chat_id, "Заказ уже передан в работу.\nАвтоматическая отмена недоступна.")
+                else:
+                    _send_buyer_message(c, chat_id, BUYER_AUTO_CANCEL_UNAVAILABLE_TEXT)
+                return True
+            try:
+                c.account.refund(order_id)
+            except Exception as ex:
+                rt.logger.error(f"BUYER CANCEL REFUND FAILED: order=#{order_id}, error={ex}")
+                _transition_waiting_state(ctx, order_id, buyer_id, chat_id, BUYER_STATE_LINK_PAUSED, saved_link_marker=None, select_order=False)
+                _send_admin_order_alert(
+                    order_id_funpay=order_id,
+                    reason=f"покупатель запросил !отмена, но автоматический refund не сработал: {ex}",
+                    bot_action="refund не выполнен, ожидание ссылки приостановлено",
+                    action="проверьте заказ и при необходимости отмените вручную",
+                    title="⚠️ AutoSMM: не удалось выполнить buyer cancel",
+                )
+                _send_buyer_message(c, chat_id, BUYER_AUTO_CANCEL_FAILED_TEXT)
+                return True
+
+            try:
+                update_order_fields(
+                    order_id,
+                    funpay_status="refunded",
+                    buyer_flow_state=BUYER_STATE_REFUNDED,
+                    saved_link=None,
+                    refund_detected_at=rt.now_str(),
+                    refund_source="buyer_cancel_command",
+                    updated_at=rt.now_str(),
+                )
+            except (sqlite3.Error, OSError, ValueError, TypeError) as db_ex:
+                rt.logger.exception(f"BUYER CANCEL DB UPDATE FAILED AFTER REFUND: order=#{order_id}, error={db_ex}")
+                _send_admin_order_alert(
+                    order_id_funpay=order_id,
+                    reason=f"FunPay refund выполнен по команде !отмена, но не удалось обновить SQLite: {db_ex}",
+                    bot_action="ожидание в памяти очищено, запись в БД требует проверки",
+                    action="перезапустите синхронизацию или проверьте БД",
+                    title="⚠️ AutoSMM: ошибка записи БД после возврата",
+                )
+
+            with rt.CONTEXT_LOCK:
+                rt.waiting_for_link.pop(order_id, None)
+            _clear_selected_order_for_buyer(buyer_id, chat_id)
+            _send_buyer_message(c, chat_id, "Ввод ссылки отменён.\n\nЗаказ FunPay отменён.")
+            return True
+
+        _transition_waiting_state(ctx, order_id, buyer_id, chat_id, BUYER_STATE_LINK_PAUSED, saved_link_marker=None, select_order=False)
+        _send_buyer_message(c, chat_id, "Ввод ссылки отменён.\n\nЗаказ FunPay не отменён.\nЕсли хотите отменить заказ, напишите продавцу.\nЧтобы снова отправить ссылку, напишите: !ссылка")
+        return True
 
 
 def _get_waiting_candidates_for_message(buyer_id: Any, chat_id: int) -> List[Dict]:
@@ -561,35 +567,37 @@ def _handle_waiting_link_message(c: "Cardinal", order_record: Dict, msg_text: st
             _send_buyer_message(c, chat_id, INVALID_LINK_SCHEME_TEXT)
             return True
         return False
-    if _apply_refund_gate(c, order_record, notify_chat_id=chat_id, force_check=True):
+    with rt.get_order_lock(order_id):
+        fresh_record = get_order_data(order_id) or order_record
+        if _apply_refund_gate(c, fresh_record, notify_chat_id=chat_id, force_check=True):
+            return True
+        if _has_panel_order(fresh_record):
+            _send_buyer_message(c, chat_id, BUYER_PANEL_CREATED_BLOCK_TEXT)
+            return True
+        ok, reason = is_valid_buyer_target(link_)
+        if not ok:
+            _send_buyer_message(c, chat_id, reason)
+            return True
+        with rt.CONTEXT_LOCK:
+            cached = rt.waiting_for_link.get(order_id)
+            ctx = dict(cached) if isinstance(cached, dict) else None
+        if not ctx:
+            ctx = _build_waiting_context_from_order(fresh_record) or {}
+        ctx.update({"buyer_id": buyer_id, "chat_id": chat_id, "order_id_funpay": order_id, "link": link_})
+        if load_config().get("confirm_link", True):
+            _transition_waiting_state(ctx, order_id, buyer_id, chat_id, BUYER_STATE_WAITING_CONFIRM, saved_link_marker=link_)
+            _send_link_confirmation_prompt(c, chat_id, order_id, link_)
+            return True
+        now_ts = time.time()
+        ctx.setdefault("created_ts", now_ts)
+        ctx["updated_ts"] = now_ts
+        local_ctx = dict(ctx)
+        _save_waiting_context(local_ctx, state=BUYER_STATE_WAITING_LINK, saved_link_marker=link_)
+        with rt.CONTEXT_LOCK:
+            rt.waiting_for_link[order_id] = dict(local_ctx)
+        process_link_without_confirmation(c, dict(local_ctx))
+        _clear_selected_order_for_buyer(buyer_id, chat_id)
         return True
-    if _has_panel_order(order_record):
-        _send_buyer_message(c, chat_id, BUYER_PANEL_CREATED_BLOCK_TEXT)
-        return True
-    ok, reason = is_valid_buyer_target(link_)
-    if not ok:
-        _send_buyer_message(c, chat_id, reason)
-        return True
-    with rt.CONTEXT_LOCK:
-        cached = rt.waiting_for_link.get(order_id)
-        ctx = dict(cached) if isinstance(cached, dict) else None
-    if not ctx:
-        ctx = _build_waiting_context_from_order(order_record) or {}
-    ctx.update({"buyer_id": buyer_id, "chat_id": chat_id, "order_id_funpay": order_id, "link": link_})
-    if load_config().get("confirm_link", True):
-        _transition_waiting_state(ctx, order_id, buyer_id, chat_id, BUYER_STATE_WAITING_CONFIRM, saved_link_marker=link_)
-        _send_link_confirmation_prompt(c, chat_id, order_id, link_)
-        return True
-    now_ts = time.time()
-    ctx.setdefault("created_ts", now_ts)
-    ctx["updated_ts"] = now_ts
-    local_ctx = dict(ctx)
-    _save_waiting_context(local_ctx, state=BUYER_STATE_WAITING_LINK, saved_link_marker=link_)
-    with rt.CONTEXT_LOCK:
-        rt.waiting_for_link[order_id] = dict(local_ctx)
-    process_link_without_confirmation(c, dict(local_ctx))
-    _clear_selected_order_for_buyer(buyer_id, chat_id)
-    return True
 
 
 def _handle_waiting_confirm_message(c: "Cardinal", order_record: Dict, msg_text: str, buyer_id: Any, chat_id: int) -> bool:
@@ -603,43 +611,45 @@ def _handle_waiting_confirm_message(c: "Cardinal", order_record: Dict, msg_text:
             return True
         return _maybe_send_confirm_reminder(c, chat_id, order_record)
 
-    if _apply_refund_gate(c, order_record, notify_chat_id=chat_id, force_check=True):
-        return True
-    if _has_panel_order(order_record):
-        _send_buyer_message(c, chat_id, BUYER_PANEL_CREATED_BLOCK_TEXT)
-        return True
-    with rt.CONTEXT_LOCK:
-        cached = rt.waiting_for_link.get(order_id)
-        ctx = dict(cached) if isinstance(cached, dict) else None
-    if not ctx:
-        ctx = _build_waiting_context_from_order(order_record) or {}
-    ctx.update({"buyer_id": buyer_id, "chat_id": chat_id, "order_id_funpay": order_id, "link": order_record.get("saved_link") or ctx.get("link") or order_record.get("customer_url") or ""})
+    with rt.get_order_lock(order_id):
+        fresh_record = get_order_data(order_id) or order_record
+        if _apply_refund_gate(c, fresh_record, notify_chat_id=chat_id, force_check=True):
+            return True
+        if _has_panel_order(fresh_record):
+            _send_buyer_message(c, chat_id, BUYER_PANEL_CREATED_BLOCK_TEXT)
+            return True
+        with rt.CONTEXT_LOCK:
+            cached = rt.waiting_for_link.get(order_id)
+            ctx = dict(cached) if isinstance(cached, dict) else None
+        if not ctx:
+            ctx = _build_waiting_context_from_order(fresh_record) or {}
+        ctx.update({"buyer_id": buyer_id, "chat_id": chat_id, "order_id_funpay": order_id, "link": fresh_record.get("saved_link") or ctx.get("link") or fresh_record.get("customer_url") or ""})
 
-    if lowered in BUYER_CONFIRM_YES_WORDS:
-        if not ctx.get("link"):
+        if lowered in BUYER_CONFIRM_YES_WORDS:
+            if not ctx.get("link"):
+                _transition_waiting_state(ctx, order_id, buyer_id, chat_id, BUYER_STATE_WAITING_LINK, saved_link_marker=None)
+                _send_buyer_message(c, chat_id, f"Ссылка/юзернейм не найдены.\n\n🧾 Заказ: #{order_id}\n\nОтправьте ссылку (https://...) или юзернейм (@channel) для запуска заказа.")
+                return True
+            process_link_without_confirmation(c, ctx)
+            _clear_selected_order_for_buyer(buyer_id, chat_id)
+            return True
+
+        if lowered in BUYER_CONFIRM_NO_WORDS:
             _transition_waiting_state(ctx, order_id, buyer_id, chat_id, BUYER_STATE_WAITING_LINK, saved_link_marker=None)
-            _send_buyer_message(c, chat_id, f"Ссылка/юзернейм не найдены.\n\n🧾 Заказ: #{order_id}\n\nОтправьте ссылку (https://...) или юзернейм (@channel) для запуска заказа.")
+            _send_buyer_message(c, chat_id, f"Текущие данные сброшены.\n\n🧾 Заказ: #{order_id}\n\nОтправьте новую ссылку (https://...) или юзернейм (@channel).")
             return True
-        process_link_without_confirmation(c, ctx)
-        _clear_selected_order_for_buyer(buyer_id, chat_id)
-        return True
 
-    if lowered in BUYER_CONFIRM_NO_WORDS:
-        _transition_waiting_state(ctx, order_id, buyer_id, chat_id, BUYER_STATE_WAITING_LINK, saved_link_marker=None)
-        _send_buyer_message(c, chat_id, f"Текущие данные сброшены.\n\n🧾 Заказ: #{order_id}\n\nОтправьте новую ссылку (https://...) или юзернейм (@channel).")
-        return True
-
-    if link_:
-        ok, reason = is_valid_buyer_target(link_)
-        if not ok:
-            _send_buyer_message(c, chat_id, reason)
+        if link_:
+            ok, reason = is_valid_buyer_target(link_)
+            if not ok:
+                _send_buyer_message(c, chat_id, reason)
+                return True
+            ctx["link"] = link_
+            _transition_waiting_state(ctx, order_id, buyer_id, chat_id, BUYER_STATE_WAITING_CONFIRM, saved_link_marker=link_)
+            _send_link_confirmation_prompt(c, chat_id, order_id, link_)
             return True
-        ctx["link"] = link_
-        _transition_waiting_state(ctx, order_id, buyer_id, chat_id, BUYER_STATE_WAITING_CONFIRM, saved_link_marker=link_)
-        _send_link_confirmation_prompt(c, chat_id, order_id, link_)
-        return True
 
-    return _maybe_send_confirm_reminder(c, chat_id, order_record)
+        return _maybe_send_confirm_reminder(c, chat_id, fresh_record)
 
 
 def _handle_buyer_flow_message(c: "Cardinal", msg_text: str, buyer_id: Any, chat_id: int) -> bool:
@@ -673,11 +683,47 @@ def _handle_buyer_flow_message(c: "Cardinal", msg_text: str, buyer_id: Any, chat
     return False
 
 
+def _verify_recovered_orders_refund_async(c: "Cardinal", order_ids: List[str]) -> None:
+    if not order_ids or not rt.RUNNING or rt.STOP_EVENT.is_set():
+        return
+    try:
+        for start in range(0, len(order_ids), FUNPAY_STATUS_BATCH_SIZE):
+            if not rt.RUNNING or rt.STOP_EVENT.is_set():
+                return
+            chunk = order_ids[start : start + FUNPAY_STATUS_BATCH_SIZE]
+            batch_results = _fetch_funpay_statuses_batch(c, chunk)
+            checked_at = rt.now_str()
+            for order_id in chunk:
+                if not rt.RUNNING or rt.STOP_EVENT.is_set():
+                    return
+                res = batch_results.get(order_id) or {}
+                if not res.get("ok"):
+                    continue
+                with rt.get_order_lock(order_id):
+                    latest = get_order_data(order_id)
+                    if not latest or _has_panel_order(latest):
+                        continue
+                    if _get_buyer_flow_state(latest) not in BUYER_ACTIVE_PRE_PANEL_STATES:
+                        continue
+                    _apply_funpay_status_update(
+                        order_id,
+                        latest,
+                        str(res.get("funpay_status") or ""),
+                        checked_at=checked_at,
+                        source="startup_recovery_async",
+                        refund_source="startup_recovery_async",
+                        swallow_save_error=True,
+                    )
+    except Exception as exc:
+        rt.logger.warning(f"BUYER FLOW ASYNC REFUND CHECK FAILED: {exc}")
+
+
 def _recover_buyer_flow_runtime(c: Optional["Cardinal"] = None) -> None:
-    """Restore in-memory waiting contexts on startup without losing pre-panel orders."""
+    """Restore in-memory waiting contexts on startup without synchronous FunPay HTTP blocking."""
     with rt.CONTEXT_LOCK:
         rt.waiting_for_link.clear()
     recovered = 0
+    pending_refund_check_ids: List[str] = []
     try:
         all_orders = load_orders_data()
     except (sqlite3.Error, OSError, ValueError, TypeError) as ex:
@@ -702,7 +748,8 @@ def _recover_buyer_flow_runtime(c: Optional["Cardinal"] = None) -> None:
             continue
         if state not in BUYER_ACTIVE_PRE_PANEL_STATES:
             continue
-        if _apply_refund_gate(c, order_record, notify_chat_id=None, force_check=True):
+        # Evaluate only locally persisted refund state during startup; schedule remote FunPay verification async.
+        if _apply_refund_gate(None, order_record, notify_chat_id=None, force_check=False):
             continue
         if _has_panel_order(order_record):
             update_order_fields(order_id, buyer_flow_state=BUYER_STATE_PANEL_CREATED, panel_order_id=_get_panel_order_id(order_record), updated_at=rt.now_str())
@@ -712,5 +759,15 @@ def _recover_buyer_flow_runtime(c: Optional["Cardinal"] = None) -> None:
             with rt.CONTEXT_LOCK:
                 rt.waiting_for_link[order_id] = ctx
             recovered += 1
+            pending_refund_check_ids.append(order_id)
     if recovered:
         rt.logger.info(f"BUYER FLOW RECOVERY: restored {recovered} active waiting orders")
+    if c is not None and pending_refund_check_ids and rt.RUNNING and not rt.STOP_EVENT.is_set():
+        worker = threading.Thread(
+            target=_verify_recovered_orders_refund_async,
+            args=(c, pending_refund_check_ids),
+            name="autosmm-recovery-refund-check",
+            daemon=True,
+        )
+        rt.register_background_thread(worker)
+        worker.start()

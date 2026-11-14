@@ -10,6 +10,7 @@ from ..models import (
     extract_progress_values as _extract_progress_values,
     get_effective_funpay_status as _get_effective_funpay_status,
     is_order_refundedish as _is_order_refundedish,
+    normalize_chat_id as _normalize_chat_id,
     normalize_funpay_status as _normalize_funpay_status,
     resolve_panel_order_id as _get_panel_order_id,
     safe_int as _safe_int,
@@ -311,9 +312,13 @@ class _SafeTemplateDict(dict):
     def __missing__(self, key):
         return ""
 
-def _send_buyer_message(c: Cardinal, chat_id: int, text: str, max_lines: int = 18):
+def _send_buyer_message(c: Cardinal, chat_id: Any, text: str, max_lines: int = 18) -> None:
+    target_chat_id = _normalize_chat_id(chat_id)
+    if target_chat_id is None or c is None:
+        logger.warning(f"BUYER MESSAGE SKIPPED: invalid chat_id={chat_id!r}")
+        return
     for chunk in split_message_by_lines(text, max_lines=max_lines):
-        c.send_message(chat_id, chunk)
+        c.send_message(target_chat_id, chunk)
 
 def _render_template(template_text: str, order_record: Optional[Dict] = None, extra: Optional[Dict] = None) -> str:
     try:

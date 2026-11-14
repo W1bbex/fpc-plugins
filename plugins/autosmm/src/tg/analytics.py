@@ -83,11 +83,17 @@ def _parse_analytics_period(call: types.CallbackQuery, prefix: str) -> str:
 
 
 def _render_analytics(call: types.CallbackQuery, period: str = "day", mode: Optional[str] = None) -> None:
+    msg = getattr(call, "message", None)
+    chat_id = getattr(getattr(msg, "chat", None), "id", None)
+    message_id = getattr(msg, "message_id", None)
+    if chat_id is None:
+        _safe_answer_callback(call)
+        return
     period_norm = _ANALYTICS_PERIOD_MAP.get(str(period or "day").strip().lower(), "24h")
     if mode is None:
-        mode = analytics._get_analytics_view_mode(call.message.chat.id, call.message.message_id)
+        mode = analytics._get_analytics_view_mode(chat_id, message_id)
     else:
-        analytics._set_analytics_view_mode(call.message.chat.id, call.message.message_id, mode)
+        analytics._set_analytics_view_mode(chat_id, message_id, mode)
 
     try:
         txt = analytics.format_analytics(period=period_norm, mode=mode)
@@ -96,19 +102,23 @@ def _render_analytics(call: types.CallbackQuery, period: str = "day", mode: Opti
         txt = "❌ Ошибка формирования аналитики."
 
     kb = build_analytics_keyboard(period=period_norm, mode=mode)
-    try:
-        rt.bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb)
-    except Exception as e:
-        if _is_message_not_modified_error(e):
+    if message_id is not None:
+        try:
+            rt.bot.edit_message_text(txt, chat_id, message_id, parse_mode="HTML", reply_markup=kb)
             _safe_answer_callback(call)
             return
-        rt.logger.error(f"Ошибка при редактировании сообщения аналитики: {e}")
-        try:
-            sent = rt.bot.send_message(call.message.chat.id, txt, parse_mode="HTML", reply_markup=kb)
-            if sent is not None:
-                analytics._set_analytics_view_mode(call.message.chat.id, getattr(sent, "message_id", 0), mode)
-        except Exception as e2:
-            rt.logger.error(f"Ошибка при отправке сообщения аналитики: {e2}")
+        except Exception as e:
+            if _is_message_not_modified_error(e):
+                _safe_answer_callback(call)
+                return
+            rt.logger.error(f"Ошибка при редактировании сообщения аналитики: {e}")
+
+    try:
+        sent = rt.bot.send_message(chat_id, txt, parse_mode="HTML", reply_markup=kb)
+        if sent is not None:
+            analytics._set_analytics_view_mode(chat_id, getattr(sent, "message_id", 0), mode)
+    except Exception as e2:
+        rt.logger.error(f"Ошибка при отправке сообщения аналитики: {e2}")
 
     _safe_answer_callback(call)
 

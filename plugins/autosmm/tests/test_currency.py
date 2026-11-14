@@ -1,5 +1,6 @@
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -181,6 +182,74 @@ class CurrencyTests(unittest.TestCase):
             rates = currency._fetch_rates_cbr_xml(currency.requests.get)
         self.assertNotIn("USD", rates)
         self.assertAlmostEqual(rates["EUR"], 102.5)
+
+    def test_concurrent_rate_fetch_singleflight_and_disk_read_outside_memory_lock(self):
+        xml_payload = (
+            '<?xml version="1.0" encoding="windows-1251"?>'
+            '<ValCurs name="Foreign Currency Market">'
+            '<Valute ID="R01235"><CharCode>USD</CharCode><Nominal>1</Nominal><Value>94,5000</Value></Valute>'
+            '<Valute ID="R01239"><CharCode>EUR</CharCode><Nominal>1</Nominal><Value>101,0000</Value></Valute>'
+            "</ValCurs>"
+        ).encode("windows-1251")
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "autosmm.db")
+            fetch_calls = []
+            fetch_lock = threading.Lock()
+            barrier = threading.Barrier(4)
+            results = []
+            errors = []
+
+            def fake_get(url, *args, **kwargs):
+                if "daily_utf8" in str(url) or "XML_daily" in str(url):
+                    with fetch_lock:
+                        fetch_calls.append(url)
+                    time.sleep(0.05)
+                    return _make_response(200, content=xml_payload)
+                raise requests.ConnectionError("primary down")
+
+            def worker():
+                try:
+                    barrier.wait(timeout=2.0)
+                    results.append(currency.get_rate_to_rub("USD", http_get=fake_get, now_ts=5000.0))
+                except Exception as exc:
+                    errors.append(exc)
+
+            with mock.patch.object(rt, "DB_PATH", db_path):
+                threads = [threading.Thread(target=worker) for _ in range(4)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join(timeout=3.0)
+
+                self.assertEqual(errors, [])
+                self.assertEqual(len(results), 4)
+                for val in results:
+                    self.assertAlmostEqual(val, 94.5)
+                self.assertEqual(len(fetch_calls), 1)
+
+                currency.reset_memory_cache()
+                lock_observed_free = []
+
+                def probe_persisted_cache():
+                    probe_result = []
+
+                    def check_lock():
+                        acquired = currency._MEMORY_LOCK.acquire(blocking=False)
+                        if acquired:
+                            currency._MEMORY_LOCK.release()
+                        probe_result.append(acquired)
+
+                    probe_thread = threading.Thread(target=check_lock)
+                    probe_thread.start()
+                    probe_thread.join(timeout=1.0)
+                    lock_observed_free.extend(probe_result)
+                    return {"fetched_at": 4990.0, "source": "kv_state", "rates": {"RUB": 1.0, "USD": 94.5}}
+
+                with mock.patch.object(currency, "_load_persisted_fx_cache", side_effect=probe_persisted_cache):
+                    rates, is_fresh = currency._get_cached_rates(now_ts=5000.0, ttl_seconds=600)
+                self.assertTrue(is_fresh)
+                self.assertAlmostEqual(rates["USD"], 94.5)
+                self.assertEqual(lock_observed_free, [True])
 
 
 if __name__ == "__main__":

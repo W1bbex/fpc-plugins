@@ -9,7 +9,8 @@ import os
 from pathlib import Path
 import threading
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+import weakref
 
 NAME = "AutoSMM"
 VERSION = "1.0"
@@ -52,7 +53,81 @@ LEGACY_AUTOSMM_BACKUPS_DIR = str(LEGACY_CACHE_DIR / "autosmm_backups")
 LEGACY_LOG_PATH = str(LEGACY_LOGS_DIR / "auto_smm.log")
 
 RUNNING = False
+STOP_EVENT = threading.Event()
 ORDER_CHECK_THREAD = None
+_BACKGROUND_THREADS_LOCK = threading.Lock()
+_BACKGROUND_THREADS: List[threading.Thread] = []
+_ORDER_LOCKS_GUARD = threading.Lock()
+_ORDER_LOCKS: "weakref.WeakValueDictionary[str, _OrderLock]" = weakref.WeakValueDictionary()
+
+
+class _OrderLock:
+    """Reentrant per-order synchronization primitive compatible with WeakValueDictionary."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        return self._lock.acquire(blocking, timeout)
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def __enter__(self) -> "_OrderLock":
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self._lock.release()
+
+
+def get_order_lock(order_id: Any) -> _OrderLock:
+    """Return a reentrant lock scoped to a single normalized FunPay order ID."""
+    key = str(order_id or "").strip().lstrip("#").upper() or "__default__"
+    with _ORDER_LOCKS_GUARD:
+        lock = _ORDER_LOCKS.get(key)
+        if lock is None:
+            lock = _OrderLock()
+            _ORDER_LOCKS[key] = lock
+        return lock
+
+
+def register_background_thread(thread: Optional[threading.Thread]) -> None:
+    """Track a daemon worker thread so stop_runtime() can join it before closing logs."""
+    if thread is None:
+        return
+    with _BACKGROUND_THREADS_LOCK:
+        _BACKGROUND_THREADS[:] = [t for t in _BACKGROUND_THREADS if t.is_alive()]
+        if thread not in _BACKGROUND_THREADS:
+            _BACKGROUND_THREADS.append(thread)
+
+
+def join_background_threads(timeout: float = 5.0) -> None:
+    """Wait up to `timeout` seconds total for registered background worker threads to finish."""
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    with _BACKGROUND_THREADS_LOCK:
+        candidates = list(_BACKGROUND_THREADS)
+        _BACKGROUND_THREADS.clear()
+    current = threading.current_thread()
+    for thread in candidates:
+        if thread is current or not thread.is_alive():
+            continue
+        remaining = max(0.05, deadline - time.monotonic())
+        if deadline - time.monotonic() <= 0:
+            break
+        thread.join(timeout=remaining)
+
+
+def wait_with_stop(seconds: float, step: float = 0.25) -> bool:
+    """Sleep up to `seconds`, returning False immediately when shutdown is signaled."""
+    deadline = time.monotonic() + max(0.0, float(seconds))
+    while True:
+        if not RUNNING or STOP_EVENT.is_set():
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return RUNNING and not STOP_EVENT.is_set()
+        STOP_EVENT.wait(timeout=min(max(0.01, float(step)), remaining))
 
 bot: Any = None
 cardinal_instance: Any = None

@@ -23,6 +23,7 @@ from .common import (
     _clear_step_handler,
     _clear_ui_input_state,
     _edit_screen_if_revision_matches,
+    _extract_call_ids,
     _inline_kb,
     _repeat_ui_input_flow,
     _safe_answer_callback,
@@ -92,7 +93,9 @@ def mask_api_key(api_key: Any) -> str:
     key_value = _normalize_api_key(api_key)
     if not key_value:
         return "не задан"
-    if len(key_value) <= 2:
+    if len(key_value) <= 4:
+        return "......"
+    if len(key_value) <= 8:
         return f"{key_value[0]}......{key_value[-1]}"
     return f"{key_value[:3]}......{key_value[-3:]}"
 
@@ -332,7 +335,7 @@ def process_apiurl_change(message: types.Message, service_idx: int) -> None:
     try:
         normalized_url = normalize_api_url(str(getattr(message, "text", None) or "").strip())
     except ValueError as ex:
-        _repeat_ui_input_flow(message.chat.id, f"❌ Ошибка: {ex}.")
+        _repeat_ui_input_flow(message.chat.id, f"❌ Ошибка: {h(ex)}.")
         return
     except Exception:
         _repeat_ui_input_flow(message.chat.id, "❌ Ошибка: не удалось обработать ссылку.")
@@ -461,7 +464,7 @@ def process_apinum_change(message: types.Message, service_idx: int) -> None:
             _clear_ui_input_state(message.chat.id)
             rt.bot.send_message(message.chat.id, error_text, reply_markup=_panels_back_kb())
         else:
-            _repeat_ui_input_flow(message.chat.id, error_text)
+            _repeat_ui_input_flow(message.chat.id, h(error_text))
         return
 
     _invalidate_balance_cache()
@@ -579,21 +582,24 @@ def process_add_service(message: types.Message) -> None:
         )
         return
 
+    duplicate = False
     with CONFIG_LOCK:
         cfg = load_config()
         services = cfg.get("services", {}) or {}
         service_key = str(srv_num)
         if service_key in services:
-            _repeat_ui_input_flow(message.chat.id, f"❌ Сервис #{srv_num} уже существует.")
-            return
-
-        services[service_key] = {
-            "name": build_service_display_name(srv_num, "https://example.com/api/v2", None),
-            "api_url": "https://example.com/api/v2",
-            "api_key": "YOUR_API_KEY",
-        }
-        cfg["services"] = {k: v for k, v in _sort_service_items(services)}
-        save_config(cfg)
+            duplicate = True
+        else:
+            services[service_key] = {
+                "name": build_service_display_name(srv_num, "https://example.com/api/v2", None),
+                "api_url": "https://example.com/api/v2",
+                "api_key": "YOUR_API_KEY",
+            }
+            cfg["services"] = {k: v for k, v in _sort_service_items(services)}
+            save_config(cfg)
+    if duplicate:
+        _repeat_ui_input_flow(message.chat.id, f"❌ Сервис #{srv_num} уже существует.")
+        return
     _invalidate_balance_cache()
     _clear_ui_input_state(message.chat.id)
     _open_api_service_card(message.chat.id, srv_num)
@@ -606,29 +612,36 @@ def process_delete_service(message: types.Message) -> None:
         _repeat_ui_input_flow(message.chat.id, "❌ Ошибка: Номер сервиса должен быть числом.")
         return
 
+    missing = False
     with CONFIG_LOCK:
         cfg = load_config()
         services = cfg.get("services", {}) or {}
         service_key = str(srv_num)
         if service_key not in services:
-            _repeat_ui_input_flow(message.chat.id, f"❌ Сервис #{srv_num} не существует.")
-            return
-
-        del services[service_key]
-        cfg["services"] = {k: v for k, v in _sort_service_items(services)}
-        save_config(cfg)
+            missing = True
+        else:
+            del services[service_key]
+            cfg["services"] = {k: v for k, v in _sort_service_items(services)}
+            save_config(cfg)
+    if missing:
+        _repeat_ui_input_flow(message.chat.id, f"❌ Сервис #{srv_num} не существует.")
+        return
     _invalidate_balance_cache()
     _clear_ui_input_state(message.chat.id)
     _open_api_menu(message.chat.id)
 
 
 def _nav_api_service(call: types.CallbackQuery, target: str) -> None:
+    _safe_answer_callback(call)
+    chat_id, message_id, _ = _extract_call_ids(call)
+    if chat_id is None:
+        return
     try:
         service_idx = int(target.split("_")[-1])
     except Exception:
         api_settings_menu(call)
         return
-    _open_api_service_card(call.message.chat.id, service_idx, message_id=call.message.message_id)
+    _open_api_service_card(chat_id, service_idx, message_id=message_id)
 
 
 register_navigation_target("asmm:api_settings", api_settings_menu)

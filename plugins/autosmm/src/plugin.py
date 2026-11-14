@@ -15,7 +15,7 @@ from telebot import types
 
 from . import runtime as rt
 from .core.buyer_flow import _recover_buyer_flow_runtime
-from .core.funpay_events import auto_smm_handler
+from .core.funpay_events import auto_smm_handler, start_event_workers, stop_event_workers
 from .core.orders import start_order_checking
 from .services.telemetry import _telemetry_gate_allows_menu
 from .storage.storage import (
@@ -177,6 +177,7 @@ def _start_background_threads(c_: Cardinal) -> None:
     if not rt.ORDER_CHECK_THREAD or not rt.ORDER_CHECK_THREAD.is_alive():
         rt.ORDER_CHECK_THREAD = threading.Thread(target=start_order_checking, args=(c_,), daemon=True)
         rt.ORDER_CHECK_THREAD.start()
+    start_event_workers()
 
 
 _EXACT_CALLBACK_ROUTES: List[Tuple[str, Callable[[types.CallbackQuery], Any]]] = [
@@ -361,6 +362,7 @@ def init_commands(c_: Cardinal) -> None:
         rt.config.update(cfg)
         rt.lot_mapping.clear()
         rt.lot_mapping.update(cfg.get("lot_mapping", {}))
+    rt.STOP_EVENT.clear()
     rt.RUNNING = True
     c_.add_telegram_commands(
         UUID,
@@ -382,15 +384,33 @@ def start_runtime(c_: Cardinal) -> None:
         logger.warning("Skipping AutoSMM start_runtime: Telegram bot is disabled or unavailable")
         return
     rt.bot = bot
+    rt.STOP_EVENT.clear()
     rt.RUNNING = True
     _recover_buyer_flow_runtime(c_)
     _start_background_threads(c_)
 
 
 def stop_runtime(*_args: Any, **_kwargs: Any) -> None:
-    """Signal AutoSMM background workers to stop and close plugin file log handlers."""
+    """Signal AutoSMM background workers to stop, join active threads, and close file log handlers."""
     rt.RUNNING = False
+    rt.STOP_EVENT.set()
     logger.debug("AutoSMM stop_runtime() signaled background workers to stop")
+    try:
+        stop_event_workers(timeout=5.0)
+    except Exception as exc:
+        logger.warning(f"Error stopping AutoSMM event workers: {exc}")
+    order_thread = rt.ORDER_CHECK_THREAD
+    is_alive_fn = getattr(order_thread, "is_alive", None)
+    join_fn = getattr(order_thread, "join", None)
+    if (
+        order_thread is not None
+        and order_thread is not threading.current_thread()
+        and (not callable(is_alive_fn) or is_alive_fn())
+        and callable(join_fn)
+    ):
+        join_fn(timeout=5.0)
+    rt.ORDER_CHECK_THREAD = None
+    rt.join_background_threads(timeout=5.0)
     target_log = os.path.abspath(rt.LOG_PATH) if getattr(rt, "LOG_PATH", None) else ""
     for handler in list(rt.logger.handlers):
         if isinstance(handler, logging.FileHandler):

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import logging
+import queue
 import re
+import threading
 import time
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+import zlib
 
 if TYPE_CHECKING:
     from cardinal import Cardinal
@@ -18,7 +21,7 @@ except ImportError:
     OrderStatusChangedEvent = None
 
 from .. import runtime as rt
-from ..models import is_order_refundedish as _is_order_refundedish
+from ..models import is_order_refundedish as _is_order_refundedish, normalize_chat_id as _normalize_chat_id
 from ..runtime import now_str as _now_str
 from ..services.notifications import _send_lot_match_manual_alert
 from ..storage.storage import get_order_data, load_config, update_order_fields
@@ -292,7 +295,10 @@ def _handle_unmatched_order(
         updated_at=_now_str(),
     )
     _send_lot_match_manual_alert(order_id, order_desc, lot_result)
-    _send_buyer_message(c, buyer_chat_id, BUYER_LOT_MATCH_MANUAL_TEXT)
+    if _normalize_chat_id(buyer_chat_id) is not None:
+        _send_buyer_message(c, buyer_chat_id, BUYER_LOT_MATCH_MANUAL_TEXT)
+    else:
+        logger.warning("UNMATCHED ORDER BUYER MESSAGE SKIPPED: missing buyer_chat_id for order=#%s", order_id)
 
 
 def _persist_and_notify_matched_order(
@@ -342,6 +348,25 @@ def _persist_and_notify_matched_order(
         logger.info("DUPLICATE NEW_ORDER EVENT SKIPPED ON UPSERT: order=#%s", order_id)
         return
 
+    now_ts = time.time()
+    with rt.CONTEXT_LOCK:
+        rt.waiting_for_link[str(order_id)] = {
+            "buyer_id": buyer_id,
+            "chat_id": buyer_chat_id,
+            "buyer_username": buyer_username,
+            "service_id": service_id,
+            "real_amount": real_amount,
+            "order_id_funpay": str(order_id),
+            "price": order_price,
+            "service_number": srv_number,
+            "lot_key": matched_lot_key,
+            "lot_title": matched_lot_title,
+            "state": BUYER_STATE_WAITING_LINK,
+            "step": "await_link",
+            "created_ts": now_ts,
+            "updated_ts": now_ts,
+        }
+
     order_record = get_order_data(str(order_id)) or {}
     msg_payment = _render_template(
         cfg.get("messages", {}).get("after_payment", "❤️ Спасибо за оплату! Укажите ссылку для запуска заказа."),
@@ -364,26 +389,13 @@ def _persist_and_notify_matched_order(
             "panel_status": "",
         },
     )
-    _send_buyer_message(c, buyer_chat_id, msg_payment)
-
-    now_ts = time.time()
-    with rt.CONTEXT_LOCK:
-        rt.waiting_for_link[str(order_id)] = {
-            "buyer_id": buyer_id,
-            "chat_id": buyer_chat_id,
-            "buyer_username": buyer_username,
-            "service_id": service_id,
-            "real_amount": real_amount,
-            "order_id_funpay": str(order_id),
-            "price": order_price,
-            "service_number": srv_number,
-            "lot_key": matched_lot_key,
-            "lot_title": matched_lot_title,
-            "state": BUYER_STATE_WAITING_LINK,
-            "step": "await_link",
-            "created_ts": now_ts,
-            "updated_ts": now_ts,
-        }
+    if _normalize_chat_id(buyer_chat_id) is None:
+        logger.warning("BUYER PROMPT SKIPPED: missing buyer_chat_id for order=#%s", order_id)
+        return
+    try:
+        _send_buyer_message(c, buyer_chat_id, msg_payment)
+    except Exception as exc:
+        logger.warning("Не удалось отправить приветствие покупателю по заказу #%s: %s", order_id, exc)
 
 
 def _resolve_buyer_chat_target(c: Cardinal, order_: Any) -> tuple[Any, Any, str]:
@@ -442,37 +454,69 @@ def _handle_new_order_event(c: Cardinal, e: NewOrderEvent) -> None:
                 str(order_desc or "")[:300],
             )
             return
+        with rt.get_order_lock(order_id):
+            buyer_chat_id, buyer_id, buyer_username = _resolve_buyer_chat_target(c, order_)
+            _handle_unmatched_order(
+                c,
+                order_id,
+                order_desc,
+                order_price,
+                order_amount,
+                buyer_chat_id,
+                buyer_id,
+                buyer_username,
+                lot_result,
+            )
+        return
+
+    cfg = load_config()
+    with rt.get_order_lock(order_id):
         buyer_chat_id, buyer_id, buyer_username = _resolve_buyer_chat_target(c, order_)
-        _handle_unmatched_order(
+        _persist_and_notify_matched_order(
             c,
-            order_id,
-            order_desc,
-            order_price,
-            order_amount,
+            cfg,
+            order_,
             buyer_chat_id,
             buyer_id,
             buyer_username,
             lot_result,
         )
-        return
-
-    cfg = load_config()
-    buyer_chat_id, buyer_id, buyer_username = _resolve_buyer_chat_target(c, order_)
-    _persist_and_notify_matched_order(
-        c,
-        cfg,
-        order_,
-        buyer_chat_id,
-        buyer_id,
-        buyer_username,
-        lot_result,
-    )
 
 
-def auto_smm_handler(c: Cardinal, e: Any, *args: Any) -> None:
-    """Dispatch FunPay NewMessageEvent, NewOrderEvent, and OrderStatusChangedEvent updates."""
-    if not rt.RUNNING:
-        return
+_EVENT_WORKER_COUNT = 4
+_EVENT_SHARD_QUEUE_MAXSIZE = 512
+_STOP_SENTINEL = object()
+_EVENT_WORKERS_LOCK = threading.RLock()
+_SHARD_QUEUES: List[queue.Queue] = []
+_EVENT_WORKERS: List[threading.Thread] = []
+
+
+def _is_supported_event(e: Any) -> bool:
+    if isinstance(e, (NewMessageEvent, NewOrderEvent)):
+        return True
+    return OrderStatusChangedEvent is not None and isinstance(e, OrderStatusChangedEvent)
+
+
+def _resolve_event_shard_key(e: Any) -> str:
+    if isinstance(e, NewMessageEvent):
+        chat_id = getattr(getattr(e, "message", None), "chat_id", None)
+        if chat_id is not None:
+            return f"chat:{chat_id}"
+        return "default"
+    if isinstance(e, NewOrderEvent):
+        order_obj = getattr(e, "order", None)
+        raw_chat_id = getattr(order_obj, "chat_id", None)
+        if isinstance(raw_chat_id, int):
+            return f"chat:{raw_chat_id}"
+        order_id = str(getattr(order_obj, "id", "") or "").strip().lstrip("#")
+        return f"order:{order_id}" if order_id else "default"
+    if OrderStatusChangedEvent is not None and isinstance(e, OrderStatusChangedEvent):
+        order_id = str(getattr(getattr(e, "order", None), "id", "") or "").strip().lstrip("#")
+        return f"order:{order_id}" if order_id else "default"
+    return "default"
+
+
+def _dispatch_event_sync(c: Cardinal, e: Any) -> None:
     if isinstance(e, NewMessageEvent):
         my_id = getattr(getattr(c, "account", None), "id", None)
         _handle_new_message_event(c, e, my_id)
@@ -480,3 +524,127 @@ def auto_smm_handler(c: Cardinal, e: Any, *args: Any) -> None:
         _handle_new_order_event(c, e)
     elif OrderStatusChangedEvent is not None and isinstance(e, OrderStatusChangedEvent):
         _sync_funpay_status_from_order_event(c, e)
+
+
+def _shard_worker_loop(shard_queue: queue.Queue) -> None:
+    while True:
+        item = shard_queue.get()
+        try:
+            if item is _STOP_SENTINEL:
+                return
+            c, e = item
+            _dispatch_event_sync(c, e)
+        except Exception as exc:
+            logger.exception(f"Unhandled exception in AutoSMM event worker: {exc}")
+        finally:
+            shard_queue.task_done()
+
+
+def _ensure_event_workers_locked() -> None:
+    if len(_SHARD_QUEUES) == _EVENT_WORKER_COUNT and len(_EVENT_WORKERS) == _EVENT_WORKER_COUNT:
+        if all(worker.is_alive() for worker in _EVENT_WORKERS):
+            return
+    if not _SHARD_QUEUES or len(_SHARD_QUEUES) != _EVENT_WORKER_COUNT:
+        _SHARD_QUEUES[:] = [queue.Queue(maxsize=_EVENT_SHARD_QUEUE_MAXSIZE) for _ in range(_EVENT_WORKER_COUNT)]
+    rebuilt_workers: List[threading.Thread] = []
+    for idx in range(_EVENT_WORKER_COUNT):
+        existing = _EVENT_WORKERS[idx] if idx < len(_EVENT_WORKERS) else None
+        if existing is not None and existing.is_alive():
+            rebuilt_workers.append(existing)
+            continue
+        worker = threading.Thread(
+            target=_shard_worker_loop,
+            args=(_SHARD_QUEUES[idx],),
+            name=f"autosmm-event-worker-{idx}",
+            daemon=True,
+        )
+        worker.start()
+        rebuilt_workers.append(worker)
+    _EVENT_WORKERS[:] = rebuilt_workers
+
+
+def start_event_workers() -> None:
+    """Start or verify sharded background worker threads for FunPay event dispatch."""
+    with _EVENT_WORKERS_LOCK:
+        _ensure_event_workers_locked()
+
+
+def flush_event_queue(timeout: float = 5.0) -> bool:
+    """Wait up to `timeout` seconds for all currently queued FunPay events to complete."""
+    with _EVENT_WORKERS_LOCK:
+        queues = list(_SHARD_QUEUES)
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    for shard_queue in queues:
+        with shard_queue.all_tasks_done:
+            while shard_queue.unfinished_tasks > 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                shard_queue.all_tasks_done.wait(timeout=remaining)
+    return True
+
+
+def stop_event_workers(*, drain: bool = True, timeout: float = 5.0) -> None:
+    """Stop all sharded FunPay event workers cleanly and wait up to `timeout` seconds for exit."""
+    with _EVENT_WORKERS_LOCK:
+        queues = list(_SHARD_QUEUES)
+        workers = list(_EVENT_WORKERS)
+        _SHARD_QUEUES.clear()
+        _EVENT_WORKERS.clear()
+
+    if not drain:
+        for shard_queue in queues:
+            while True:
+                try:
+                    shard_queue.get_nowait()
+                    shard_queue.task_done()
+                except queue.Empty:
+                    break
+
+    for shard_queue in queues:
+        while True:
+            try:
+                shard_queue.put_nowait(_STOP_SENTINEL)
+                break
+            except queue.Full:
+                try:
+                    shard_queue.get_nowait()
+                    shard_queue.task_done()
+                except queue.Empty:
+                    break
+
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    current = threading.current_thread()
+    for worker in workers:
+        is_alive_fn = getattr(worker, "is_alive", None)
+        if worker is current or (callable(is_alive_fn) and not is_alive_fn()):
+            continue
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        join_fn = getattr(worker, "join", None)
+        if callable(join_fn):
+            join_fn(timeout=max(0.05, remaining))
+
+
+def auto_smm_handler(c: Cardinal, e: Any, *args: Any) -> None:
+    """Enqueue FunPay NewMessageEvent, NewOrderEvent, and OrderStatusChangedEvent without blocking Runner."""
+    del args
+    if not rt.RUNNING or not _is_supported_event(e):
+        return
+    shard_key = _resolve_event_shard_key(e)
+    with _EVENT_WORKERS_LOCK:
+        if not rt.RUNNING:
+            return
+        _ensure_event_workers_locked()
+        shard_idx = zlib.crc32(shard_key.encode("utf-8")) % len(_SHARD_QUEUES)
+        target_queue = _SHARD_QUEUES[shard_idx]
+        try:
+            target_queue.put_nowait((c, e))
+        except queue.Full:
+            logger.error(
+                "EVENT QUEUE FULL (shard=%s, size=%s): dropping %s",
+                shard_idx,
+                target_queue.qsize(),
+                type(e).__name__,
+            )

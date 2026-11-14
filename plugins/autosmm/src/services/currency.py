@@ -46,6 +46,7 @@ _CURRENCY_ALIASES = {
 }
 
 _MEMORY_LOCK = threading.RLock()
+_REFRESH_LOCK = threading.RLock()
 _MEMORY_CACHE: Dict[str, Any] = {
     "fetched_at": 0.0,
     "source": "",
@@ -171,25 +172,28 @@ def _get_cached_rates(*, now_ts: float, ttl_seconds: int) -> Tuple[Dict[str, flo
         if mem_ts > 0 and (now_ts - mem_ts) < ttl_seconds and len(mem_rates) > 1:
             return mem_rates, True
 
-        disk_entry = _load_persisted_fx_cache()
-        disk_ts = safe_float(disk_entry.get("fetched_at"), 0.0)
-        raw_disk_rates = disk_entry.get("rates") if isinstance(disk_entry.get("rates"), dict) else {}
-        disk_rates = {
-            normalize_currency_code(k): float(v)
-            for k, v in raw_disk_rates.items()
-            if (parsed := optional_float(v)) is not None and parsed > 0
-        }
-        disk_rates["RUB"] = 1.0
+    disk_entry = _load_persisted_fx_cache()
+    disk_ts = safe_float(disk_entry.get("fetched_at"), 0.0)
+    raw_disk_rates = disk_entry.get("rates") if isinstance(disk_entry.get("rates"), dict) else {}
+    disk_rates = {
+        normalize_currency_code(k): float(v)
+        for k, v in raw_disk_rates.items()
+        if (parsed := optional_float(v)) is not None and parsed > 0
+    }
+    disk_rates["RUB"] = 1.0
 
-        if disk_ts > mem_ts and len(disk_rates) > 1:
+    with _MEMORY_LOCK:
+        cur_mem_ts = safe_float(_MEMORY_CACHE.get("fetched_at"), 0.0)
+        cur_mem_rates = dict(_MEMORY_CACHE.get("rates") or {"RUB": 1.0})
+        if disk_ts > cur_mem_ts and len(disk_rates) > 1:
             _MEMORY_CACHE["fetched_at"] = disk_ts
             _MEMORY_CACHE["source"] = str(disk_entry.get("source") or "kv_state")
             _MEMORY_CACHE["rates"] = dict(disk_rates)
-            mem_ts = disk_ts
-            mem_rates = dict(disk_rates)
+            cur_mem_ts = disk_ts
+            cur_mem_rates = dict(disk_rates)
 
-        is_fresh = mem_ts > 0 and (now_ts - mem_ts) < ttl_seconds and len(mem_rates) > 1
-        return mem_rates, is_fresh
+        is_fresh = cur_mem_ts > 0 and (now_ts - cur_mem_ts) < ttl_seconds and len(cur_mem_rates) > 1
+        return cur_mem_rates, is_fresh
 
 
 def refresh_fx_rates(
@@ -200,21 +204,22 @@ def refresh_fx_rates(
     """Fetch fresh RUB exchange rates across configured providers and cache them."""
     getter = http_get or requests.get
     ts = float(now_ts if now_ts is not None else time.time())
-    for source_name, fetcher in _FX_PROVIDERS:
-        try:
-            rates = fetcher(getter)
-        except (requests.RequestException, ET.ParseError, ValueError, TypeError, KeyError) as exc:
-            logger.debug(f"FX провайдер {source_name} недоступен: {exc}")
-            continue
-        if rates and len(rates) > 1:
-            rates["RUB"] = 1.0
-            with _MEMORY_LOCK:
-                _MEMORY_CACHE["fetched_at"] = ts
-                _MEMORY_CACHE["source"] = source_name
-                _MEMORY_CACHE["rates"] = dict(rates)
-            _save_persisted_fx_cache(ts, source_name, rates)
-            logger.debug(f"FX курсы обновлены из {source_name}: валют={len(rates)}")
-            return rates
+    with _REFRESH_LOCK:
+        for source_name, fetcher in _FX_PROVIDERS:
+            try:
+                rates = fetcher(getter)
+            except (requests.RequestException, ET.ParseError, ValueError, TypeError, KeyError) as exc:
+                logger.debug(f"FX провайдер {source_name} недоступен: {exc}")
+                continue
+            if rates and len(rates) > 1:
+                rates["RUB"] = 1.0
+                with _MEMORY_LOCK:
+                    _MEMORY_CACHE["fetched_at"] = ts
+                    _MEMORY_CACHE["source"] = source_name
+                    _MEMORY_CACHE["rates"] = dict(rates)
+                _save_persisted_fx_cache(ts, source_name, rates)
+                logger.debug(f"FX курсы обновлены из {source_name}: валют={len(rates)}")
+                return rates
     return None
 
 
@@ -250,9 +255,13 @@ def get_rate_to_rub(
         return cached_rates[code]
 
     if allow_network:
-        fresh = refresh_fx_rates(now_ts=ts, http_get=http_get)
-        if fresh and code in fresh:
-            return fresh[code]
+        with _REFRESH_LOCK:
+            cached_rates, is_fresh = _get_cached_rates(now_ts=ts, ttl_seconds=ttl_seconds)
+            if is_fresh and code in cached_rates:
+                return cached_rates[code]
+            fresh = refresh_fx_rates(now_ts=ts, http_get=http_get)
+            if fresh and code in fresh:
+                return fresh[code]
 
     # Graceful offline fallback: reuse cached stale rate rather than mixing USD with RUB.
     if code in cached_rates:

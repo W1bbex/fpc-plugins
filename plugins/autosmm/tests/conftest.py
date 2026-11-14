@@ -66,6 +66,8 @@ def isolated_autosmm_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(rt, "_resolve_cardinal_root", _isolated_resolve_cardinal_root)
     rt.configure_paths(stub_entry)
     rt.RUNNING = False
+    if hasattr(rt, "STOP_EVENT"):
+        rt.STOP_EVENT.clear()
     rt.clear_memory_contexts()
     if hasattr(rt, "invalidate_panel_balance_cache"):
         rt.invalidate_panel_balance_cache()
@@ -73,6 +75,15 @@ def isolated_autosmm_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     yield cardinal_root
 
     rt.RUNNING = False
+    if hasattr(rt, "STOP_EVENT"):
+        rt.STOP_EVENT.set()
+    fe = sys.modules.get("src.core.funpay_events")
+    if fe is not None and hasattr(fe, "stop_event_workers"):
+        fe.stop_event_workers(drain=False, timeout=2.0)
+    if hasattr(rt, "join_background_threads"):
+        rt.join_background_threads(timeout=2.0)
+    if hasattr(rt, "STOP_EVENT"):
+        rt.STOP_EVENT.clear()
     rt.clear_memory_contexts()
     tmp_resolved = tmp_path.resolve()
     for handler in list(rt.logger.handlers):

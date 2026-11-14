@@ -213,30 +213,31 @@ def _sync_funpay_status_from_event(c: Optional["Cardinal"], message: Any) -> boo
     if not funpay_status or not order_id:
         return False
 
-    order_data = get_order_data(order_id)
-    if not order_data:
-        rt.logger.info(f"FUNPAY STATUS LIVE: заказ #{order_id} не найден в БД AutoSMM (status={funpay_status})")
-        return True
+    with rt.get_order_lock(order_id):
+        order_data = get_order_data(order_id)
+        if not order_data:
+            rt.logger.info(f"FUNPAY STATUS LIVE: заказ #{order_id} не найден в БД AutoSMM (status={funpay_status})")
+            return True
 
-    stored_chat_id = _normalize_chat_id(order_data.get("chat_id"))
-    msg_chat_id = _normalize_chat_id(getattr(message, "chat_id", None))
-    if stored_chat_id is not None and msg_chat_id is not None and stored_chat_id != msg_chat_id:
-        rt.logger.warning(
-            f"FUNPAY STATUS LIVE REJECTED: chat_id mismatch for order=#{order_id} "
-            f"(stored={stored_chat_id}, event={msg_chat_id})"
+        stored_chat_id = _normalize_chat_id(order_data.get("chat_id"))
+        msg_chat_id = _normalize_chat_id(getattr(message, "chat_id", None))
+        if stored_chat_id is not None and msg_chat_id is not None and stored_chat_id != msg_chat_id:
+            rt.logger.warning(
+                f"FUNPAY STATUS LIVE REJECTED: chat_id mismatch for order=#{order_id} "
+                f"(stored={stored_chat_id}, event={msg_chat_id})"
+            )
+            return False
+
+        _apply_funpay_status_update(
+            order_id,
+            order_data,
+            funpay_status,
+            checked_at=rt.now_str(),
+            source="funpay_live",
+            refund_source="funpay_message",
         )
-        return False
-
-    _apply_funpay_status_update(
-        order_id,
-        order_data,
-        funpay_status,
-        checked_at=rt.now_str(),
-        source="funpay_live",
-        refund_source="funpay_message",
-    )
-    rt.logger.info(f"FUNPAY STATUS LIVE: заказ #{order_id} обновлён до '{funpay_status}'")
-    return True
+        rt.logger.info(f"FUNPAY STATUS LIVE: заказ #{order_id} обновлён до '{funpay_status}'")
+        return True
 
 
 def _sync_funpay_status_from_order_event(c: "Cardinal", event: Any) -> bool:
@@ -246,36 +247,37 @@ def _sync_funpay_status_from_order_event(c: "Cardinal", event: Any) -> bool:
     if not order_id:
         return False
 
-    order_data = get_order_data(order_id)
-    if not order_data:
-        return False
-
-    mapped_status = _map_cardinal_order_status_to_funpay_status(getattr(order_obj, "status", None))
-    if not mapped_status:
-        return False
-
-    # Cardinal's OrderShortcut from get_sales() folds PARTIALLY_REFUNDED into REFUNDED;
-    # confirm via full order fetch before irreversible full-refund cancellation.
-    if mapped_status == "refunded":
-        confirm = _fetch_funpay_status_via_cardinal(c, order_id)
-        if not confirm.get("ok"):
-            rt.logger.warning(
-                f"FUNPAY ORDER STATUS EVENT CONFIRM FAILED: order=#{order_id}, "
-                f"error={confirm.get('error')}, detail={confirm.get('detail')}"
-            )
+    with rt.get_order_lock(order_id):
+        order_data = get_order_data(order_id)
+        if not order_data:
             return False
-        mapped_status = str(confirm.get("funpay_status") or mapped_status)
 
-    _apply_funpay_status_update(
-        order_id,
-        order_data,
-        mapped_status,
-        checked_at=rt.now_str(),
-        source="order_status_event",
-        refund_source="order_status_event",
-    )
-    rt.logger.info(f"FUNPAY ORDER STATUS EVENT: заказ #{order_id} обновлён до '{mapped_status}'")
-    return True
+        mapped_status = _map_cardinal_order_status_to_funpay_status(getattr(order_obj, "status", None))
+        if not mapped_status:
+            return False
+
+        # Cardinal's OrderShortcut from get_sales() folds PARTIALLY_REFUNDED into REFUNDED;
+        # confirm via full order fetch before irreversible full-refund cancellation.
+        if mapped_status == "refunded":
+            confirm = _fetch_funpay_status_via_cardinal(c, order_id)
+            if not confirm.get("ok"):
+                rt.logger.warning(
+                    f"FUNPAY ORDER STATUS EVENT CONFIRM FAILED: order=#{order_id}, "
+                    f"error={confirm.get('error')}, detail={confirm.get('detail')}"
+                )
+                return False
+            mapped_status = str(confirm.get("funpay_status") or mapped_status)
+
+        _apply_funpay_status_update(
+            order_id,
+            order_data,
+            mapped_status,
+            checked_at=rt.now_str(),
+            source="order_status_event",
+            refund_source="order_status_event",
+        )
+        rt.logger.info(f"FUNPAY ORDER STATUS EVENT: заказ #{order_id} обновлён до '{mapped_status}'")
+        return True
 
 
 def _map_cardinal_order_status_to_funpay_status(order_status: Any) -> Optional[str]:

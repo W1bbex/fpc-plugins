@@ -47,6 +47,7 @@ from .panel_balances import schedule_single_panel_balance_refresh
 from .refunds import _attempt_panel_cancel_after_funpay_refund, refund_order
 
 AMBIGUOUS_ADD_ERRORS = ("timeout", "network_error", "invalid_json", "http_error", "unknown")
+_TRANSPORT_RISK_DELAY_SECONDS = 3.0
 
 
 def _store_fallback_decision(
@@ -397,8 +398,11 @@ def _handle_transport_error_after_add(
         def _delayed_risk_alert() -> None:
             resolved_after = None
             try:
-                time.sleep(3)
-                resolved_after = _get_panel_balance_for_risk_check(int(service_number or 1))
+                delay = float(_TRANSPORT_RISK_DELAY_SECONDS or 0.0)
+                if delay > 0 and not rt.STOP_EVENT.is_set():
+                    rt.STOP_EVENT.wait(timeout=delay)
+                if not rt.STOP_EVENT.is_set():
+                    resolved_after = _get_panel_balance_for_risk_check(int(service_number or 1))
             except Exception as ex:
                 rt.logger.warning(f"Отложенная проверка баланса после transport-error #{order_id_str} не удалась: {ex}")
             try:
@@ -411,6 +415,7 @@ def _handle_transport_error_after_add(
             name=f"autosmm-transport-alert-{order_id_str}",
             daemon=True,
         )
+        rt.register_background_thread(worker)
         worker.start()
         return worker
 
@@ -607,158 +612,159 @@ def process_link_without_confirmation(c: "Cardinal", data: Dict) -> None:
 
     cfg = load_config()
     fallback_enabled = bool(cfg.get("fallback_enabled", False))
-    existing_order = get_order_data(order_id_str)
+    with rt.get_order_lock(order_id_str):
+        existing_order = get_order_data(order_id_str)
 
-    if existing_order and _apply_refund_gate(c, existing_order, notify_chat_id=buyer_chat_id, force_check=True):
-        with rt.CONTEXT_LOCK:
-            rt.waiting_for_link.pop(order_id_str, None)
-        return
-    if existing_order and _has_panel_order(existing_order):
-        with rt.CONTEXT_LOCK:
-            rt.waiting_for_link.pop(order_id_str, None)
-        _send_buyer_message(c, buyer_chat_id, BUYER_PANEL_CREATED_BLOCK_TEXT)
-        return
+        if existing_order and _apply_refund_gate(c, existing_order, notify_chat_id=buyer_chat_id, force_check=True):
+            with rt.CONTEXT_LOCK:
+                rt.waiting_for_link.pop(order_id_str, None)
+            return
+        if existing_order and _has_panel_order(existing_order):
+            with rt.CONTEXT_LOCK:
+                rt.waiting_for_link.pop(order_id_str, None)
+            _send_buyer_message(c, buyer_chat_id, BUYER_PANEL_CREATED_BLOCK_TEXT)
+            return
 
-    order_lot_key = data.get("lot_key") or (existing_order or {}).get("lot_key")
-    order_lot_title = data.get("lot_title") or (existing_order or {}).get("lot_title") or ""
-    fallback_service_id, fallback_service_number = _get_lot_fallback_targets(
-        cfg,
-        service_id,
-        service_number,
-        lot_key=order_lot_key,
-        lot_title=order_lot_title,
-    )
-
-    try:
-        claimed, claim_reason, current_order = claim_order_for_panel_submission(
-            order_id_str,
-            saved_link=link_,
-            service_number=service_number,
-            seed_fields={
-                "chat_id": buyer_chat_id,
-                "buyer_id": data.get("buyer_id"),
-                "buyer_username": data.get("buyer_username") or "",
-                "lot_key": order_lot_key,
-                "lot_title": order_lot_title,
-                "service_id": service_id,
-                "quantity": real_amount,
-                "summa": lot_price,
-            },
+        order_lot_key = data.get("lot_key") or (existing_order or {}).get("lot_key")
+        order_lot_title = data.get("lot_title") or (existing_order or {}).get("lot_title") or ""
+        fallback_service_id, fallback_service_number = _get_lot_fallback_targets(
+            cfg,
+            service_id,
+            service_number,
+            lot_key=order_lot_key,
+            lot_title=order_lot_title,
         )
-    except Exception as exc:
+
+        try:
+            claimed, claim_reason, current_order = claim_order_for_panel_submission(
+                order_id_str,
+                saved_link=link_,
+                service_number=service_number,
+                seed_fields={
+                    "chat_id": buyer_chat_id,
+                    "buyer_id": data.get("buyer_id"),
+                    "buyer_username": data.get("buyer_username") or "",
+                    "lot_key": order_lot_key,
+                    "lot_title": order_lot_title,
+                    "service_id": service_id,
+                    "quantity": real_amount,
+                    "summa": lot_price,
+                },
+            )
+        except Exception as exc:
+            with rt.CONTEXT_LOCK:
+                rt.waiting_for_link.pop(order_id_str, None)
+            rt.logger.exception(f"PRE-ADD CLAIM FAILED (ORDER ABORTED WITHOUT PANEL CALL): order=#{order_id_str}, error={exc}")
+            try:
+                resolved_chat_id = _normalize_chat_id(buyer_chat_id)
+                if resolved_chat_id is not None:
+                    _send_buyer_message(c, resolved_chat_id, BUYER_ADD_TRANSPORT_MANUAL_TEXT)
+            except Exception as notify_exc:
+                rt.logger.debug(
+                    "Pre-add claim buyer notification failed for order #%s: %s",
+                    order_id_str,
+                    notify_exc,
+                )
+            return
+
         with rt.CONTEXT_LOCK:
             rt.waiting_for_link.pop(order_id_str, None)
-        rt.logger.exception(f"PRE-ADD CLAIM FAILED (ORDER ABORTED WITHOUT PANEL CALL): order=#{order_id_str}, error={exc}")
-        try:
+        if not claimed:
             resolved_chat_id = _normalize_chat_id(buyer_chat_id)
-            if resolved_chat_id is not None:
-                _send_buyer_message(c, resolved_chat_id, BUYER_ADD_TRANSPORT_MANUAL_TEXT)
-        except Exception as notify_exc:
-            rt.logger.debug(
-                "Pre-add claim buyer notification failed for order #%s: %s",
-                order_id_str,
-                notify_exc,
+            _handle_unclaimed_submission(c, order_id_str, resolved_chat_id, claim_reason, current_order)
+            return
+
+        balance_before = _get_panel_balance_for_risk_check(service_number)
+        lot_data = _find_lot_data_for_order(
+            cfg,
+            service_id,
+            service_number,
+            lot_title=order_lot_title,
+            lot_key=order_lot_key,
+        )
+        panel_link = _format_target_for_panel(link_, lot_data)
+
+        ok, panel_order_id, payload = send_order_to_service(
+            c=c,
+            service_number=service_number,
+            service_id=service_id,
+            link=panel_link,
+            quantity=real_amount,
+        )
+        if ok and panel_order_id is not None:
+            rt.logger.info("PRIMARY ADD: SUCCESS")
+            _finalize_created_order(
+                c=c,
+                cfg=cfg,
+                buyer_chat_id=buyer_chat_id,
+                order_id_funpay=order_id_str,
+                panel_order_id=panel_order_id,
+                link_=link_,
+                real_amount=real_amount,
+                service_number=service_number,
+                lot_price=lot_price,
             )
-        return
+            return
 
-    with rt.CONTEXT_LOCK:
-        rt.waiting_for_link.pop(order_id_str, None)
-    if not claimed:
-        resolved_chat_id = _normalize_chat_id(buyer_chat_id)
-        _handle_unclaimed_submission(c, order_id_str, resolved_chat_id, claim_reason, current_order)
-        return
+        primary_error = payload.get("error", "unknown")
+        primary_detail = payload.get("detail", str(payload))
+        rt.logger.warning(f"PRIMARY ERROR: {primary_error}")
 
-    balance_before = _get_panel_balance_for_risk_check(service_number)
-    lot_data = _find_lot_data_for_order(
-        cfg,
-        service_id,
-        service_number,
-        lot_title=order_lot_title,
-        lot_key=order_lot_key,
-    )
-    panel_link = _format_target_for_panel(link_, lot_data)
+        if primary_error in AMBIGUOUS_ADD_ERRORS:
+            _handle_transport_error_after_add(
+                c=c,
+                order_id_funpay=order_id_str,
+                buyer_chat_id=buyer_chat_id,
+                service_number=service_number,
+                service_id=service_id,
+                real_amount=real_amount,
+                link_=link_,
+                primary_error=primary_error,
+                primary_detail=primary_detail,
+                balance_before=balance_before,
+                lot_price=lot_price,
+                lot_title=order_lot_title,
+                wait_before_balance_check=True,
+            )
+            return
 
-    ok, panel_order_id, payload = send_order_to_service(
-        c=c,
-        service_number=service_number,
-        service_id=service_id,
-        link=panel_link,
-        quantity=real_amount,
-    )
-    if ok and panel_order_id is not None:
-        rt.logger.info("PRIMARY ADD: SUCCESS")
-        _finalize_created_order(
+        block_spec = _get_fallback_block_spec(
+            primary_error,
+            primary_detail,
+            service_number,
+            fallback_enabled,
+            current_order or existing_order,
+            fallback_service_id,
+            fallback_service_number,
+        )
+        if block_spec is not None:
+            reason_code, detailed_reason, bot_action, log_manual_check = block_spec
+            _block_fallback_and_refund(
+                c,
+                order_id_str,
+                buyer_chat_id,
+                service_number,
+                primary_error,
+                reason_code,
+                detailed_reason=detailed_reason,
+                bot_action=bot_action,
+                log_manual_check=log_manual_check,
+            )
+            return
+
+        _execute_fallback_order_submission(
             c=c,
             cfg=cfg,
             buyer_chat_id=buyer_chat_id,
             order_id_funpay=order_id_str,
-            panel_order_id=panel_order_id,
+            panel_link=panel_link,
             link_=link_,
             real_amount=real_amount,
             service_number=service_number,
-            lot_price=lot_price,
-        )
-        return
-
-    primary_error = payload.get("error", "unknown")
-    primary_detail = payload.get("detail", str(payload))
-    rt.logger.warning(f"PRIMARY ERROR: {primary_error}")
-
-    if primary_error in AMBIGUOUS_ADD_ERRORS:
-        _handle_transport_error_after_add(
-            c=c,
-            order_id_funpay=order_id_str,
-            buyer_chat_id=buyer_chat_id,
-            service_number=service_number,
-            service_id=service_id,
-            real_amount=real_amount,
-            link_=link_,
+            fallback_service_id=fallback_service_id,
+            fallback_service_number=int(fallback_service_number),
             primary_error=primary_error,
             primary_detail=primary_detail,
-            balance_before=balance_before,
             lot_price=lot_price,
             lot_title=order_lot_title,
-            wait_before_balance_check=True,
         )
-        return
-
-    block_spec = _get_fallback_block_spec(
-        primary_error,
-        primary_detail,
-        service_number,
-        fallback_enabled,
-        current_order or existing_order,
-        fallback_service_id,
-        fallback_service_number,
-    )
-    if block_spec is not None:
-        reason_code, detailed_reason, bot_action, log_manual_check = block_spec
-        _block_fallback_and_refund(
-            c,
-            order_id_str,
-            buyer_chat_id,
-            service_number,
-            primary_error,
-            reason_code,
-            detailed_reason=detailed_reason,
-            bot_action=bot_action,
-            log_manual_check=log_manual_check,
-        )
-        return
-
-    _execute_fallback_order_submission(
-        c=c,
-        cfg=cfg,
-        buyer_chat_id=buyer_chat_id,
-        order_id_funpay=order_id_str,
-        panel_link=panel_link,
-        link_=link_,
-        real_amount=real_amount,
-        service_number=service_number,
-        fallback_service_id=fallback_service_id,
-        fallback_service_number=int(fallback_service_number),
-        primary_error=primary_error,
-        primary_detail=primary_detail,
-        lot_price=lot_price,
-        lot_title=order_lot_title,
-    )

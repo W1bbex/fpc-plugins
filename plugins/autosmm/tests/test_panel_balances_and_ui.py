@@ -470,7 +470,7 @@ class RegressionContractsTests(unittest.TestCase):
                     return {"ok": True, "balance": 10.0, "currency": "RUB"}
 
                 with (
-                    mock.patch.object(panel_submission.time, "sleep"),
+                    mock.patch.object(panel_submission, "_TRANSPORT_RISK_DELAY_SECONDS", 0.0),
                     mock.patch.object(panel_submission, "_get_panel_balance_for_risk_check", side_effect=delayed_risk),
                     mock.patch.object(panel_submission, "_send_buyer_message", side_effect=lambda *a: buyer_sent.append(a)),
                     mock.patch.object(panel_submission, "_send_transport_error_after_add_alert", side_effect=lambda **kw: alerts_sent.append(kw)),
@@ -644,6 +644,49 @@ class RegressionContractsTests(unittest.TestCase):
                 panel_balances._cache_inflight_dict_locked().pop("all", None)
         self.assertTrue(scheduled)
         self.assertEqual(captured_targets, [2])
+
+    def test_delayed_risk_alert_wakes_immediately_on_stop_event(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "autosmm.db"
+            orig_db = rt.DB_PATH
+            rt.STOP_EVENT.clear()
+            try:
+                rt.DB_PATH = str(db_path)
+                alerts_sent = []
+                started_at = time.monotonic()
+                with (
+                    mock.patch.object(panel_submission, "_TRANSPORT_RISK_DELAY_SECONDS", 5.0),
+                    mock.patch.object(panel_submission, "_get_panel_balance_for_risk_check") as bal_mock,
+                    mock.patch.object(
+                        panel_submission,
+                        "_send_transport_error_after_add_alert",
+                        side_effect=lambda **kw: alerts_sent.append(kw),
+                    ),
+                ):
+                    worker = panel_submission._handle_transport_error_after_add(
+                        SimpleNamespace(),
+                        "FP-STOP-RISK",
+                        101,
+                        1,
+                        1,
+                        100,
+                        "https://t.me/test",
+                        "timeout",
+                        "timed out",
+                        wait_before_balance_check=True,
+                    )
+                    self.assertIsNotNone(worker)
+                    rt.STOP_EVENT.set()
+                    worker.join(timeout=1.5)
+                    elapsed = time.monotonic() - started_at
+                    self.assertFalse(worker.is_alive())
+                    self.assertLess(elapsed, 1.5)
+                    bal_mock.assert_not_called()
+                    self.assertEqual(len(alerts_sent), 1)
+                    self.assertIsNone(alerts_sent[0]["balance_after"])
+            finally:
+                rt.STOP_EVENT.clear()
+                rt.DB_PATH = orig_db
 
 
 if __name__ == "__main__":

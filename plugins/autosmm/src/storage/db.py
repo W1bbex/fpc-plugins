@@ -8,7 +8,7 @@ import logging
 import os
 import sqlite3
 import threading
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Dict, Iterator, Optional, Tuple
 
 from .. import runtime as rt
 
@@ -19,6 +19,8 @@ DEFAULT_CONNECT_TIMEOUT = 15.0
 
 _DB_LOCKS_GUARD = threading.Lock()
 _DB_LOCKS: Dict[str, threading.RLock] = {}
+_SCHEMA_CACHE_LOCK = threading.Lock()
+_INITIALIZED_DB_SIGNATURES: Dict[str, Tuple[int, int, int]] = {}
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -146,9 +148,64 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     )
 
 
+def _stat_signature(path: str) -> Optional[Tuple[int, int, int]]:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    if not st.st_ino:
+        return None
+    return (int(st.st_dev), int(st.st_ino), int(getattr(st, "st_ctime_ns", 0)))
+
+
+def _mark_db_initialized(target: str) -> None:
+    key = os.path.normcase(target)
+    sig = _stat_signature(target)
+    if sig is None:
+        return
+    with _SCHEMA_CACHE_LOCK:
+        _INITIALIZED_DB_SIGNATURES[key] = sig
+
+
+def invalidate_schema_cache(db_path: Optional[str] = None) -> None:
+    """Forget cached schema initialization state so the next access re-verifies the DB file."""
+    with _SCHEMA_CACHE_LOCK:
+        if db_path is None:
+            _INITIALIZED_DB_SIGNATURES.clear()
+            return
+        _INITIALIZED_DB_SIGNATURES.pop(os.path.normcase(_resolve_db_path(db_path)), None)
+
+
+def _is_db_schema_cached(target: str) -> bool:
+    key = os.path.normcase(target)
+    current_sig = _stat_signature(target)
+    if current_sig is None:
+        return False
+    with _SCHEMA_CACHE_LOCK:
+        return _INITIALIZED_DB_SIGNATURES.get(key) == current_sig
+
+
+def _ensure_db_initialized(target: str) -> None:
+    if _is_db_schema_cached(target):
+        return
+    init_db(target)
+
+
 @contextmanager
-def _connect(db_path: Optional[str] = None) -> Iterator[sqlite3.Connection]:
+def _connect(db_path: Optional[str] = None, *, read_only: bool = False) -> Iterator[sqlite3.Connection]:
     target = _resolve_db_path(db_path)
+    if read_only:
+        _ensure_db_initialized(target)
+        conn = sqlite3.connect(target, timeout=DEFAULT_CONNECT_TIMEOUT)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA busy_timeout=10000;")
+            conn.execute("PRAGMA query_only=ON;")
+            yield conn
+        finally:
+            conn.close()
+        return
+
     parent = os.path.dirname(target)
     if parent:
         os.makedirs(parent, exist_ok=True)
@@ -166,11 +223,12 @@ def _connect(db_path: Optional[str] = None) -> Iterator[sqlite3.Connection]:
             raise
         finally:
             conn.close()
+        _mark_db_initialized(target)
 
 
 def init_db(db_path: Optional[str] = None) -> None:
     """Ensure the SQLite database file, schema tables, and indexes exist."""
-    with _connect(db_path):
+    with _connect(db_path, read_only=False):
         pass
 
 

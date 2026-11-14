@@ -28,6 +28,14 @@ def h(value: Any) -> str:
     return html.escape(str(value))
 
 
+def _extract_call_ids(call: Any) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    msg = getattr(call, "message", None)
+    chat_id = getattr(getattr(msg, "chat", None), "id", None)
+    message_id = getattr(msg, "message_id", None)
+    user_id = getattr(getattr(call, "from_user", None), "id", None)
+    return chat_id, message_id, user_id
+
+
 def clean_tg_text(text: Any) -> str:
     value = str(text or "").strip()
     return re.sub(r"\n{3,}", "\n\n", value)
@@ -269,6 +277,7 @@ def register_navigation_prefix(prefix: str, handler: Callable[[types.CallbackQue
 
 
 def _dispatch_navigation_callback(call: types.CallbackQuery, target: str) -> None:
+    _safe_answer_callback(call)
     target = str(target or "asmm:return_to_settings")
     handler = _NAVIGATION_TARGETS.get(target)
     if handler is not None:
@@ -284,16 +293,24 @@ def _dispatch_navigation_callback(call: types.CallbackQuery, target: str) -> Non
 
 
 def ui_input_back_callback(call: types.CallbackQuery) -> None:
-    state = _get_ui_input_state(call.message.chat.id)
-    _clear_step_handler(call.message.chat.id)
-    _clear_ui_input_state(call.message.chat.id)
+    chat_id, _, _ = _extract_call_ids(call)
+    if chat_id is None:
+        _safe_answer_callback(call)
+        return
+    state = _get_ui_input_state(chat_id)
+    _clear_step_handler(chat_id)
+    _clear_ui_input_state(chat_id)
     _dispatch_navigation_callback(call, state.get("back_target") if state else "asmm:return_to_settings")
 
 
 def ui_input_cancel_callback(call: types.CallbackQuery) -> None:
-    state = _get_ui_input_state(call.message.chat.id)
-    _clear_step_handler(call.message.chat.id)
-    _clear_ui_input_state(call.message.chat.id)
+    chat_id, _, _ = _extract_call_ids(call)
+    if chat_id is None:
+        _safe_answer_callback(call)
+        return
+    state = _get_ui_input_state(chat_id)
+    _clear_step_handler(chat_id)
+    _clear_ui_input_state(chat_id)
     fallback_target = state.get("back_target") if state else "asmm:return_to_settings"
     target = state.get("cancel_target") if state and state.get("cancel_target") else fallback_target
     _dispatch_navigation_callback(call, target)
@@ -318,7 +335,14 @@ def _register_guarded_step_handler(
     next_handler: Any,
     *handler_args: Any,
     expected_user_id: Optional[int] = None,
+    allowed_commands: Optional[Any] = None,
 ) -> None:
+    allowed = {
+        str(cmd).strip().lower()
+        for cmd in (allowed_commands or getattr(next_handler, "allowed_step_commands", ()) or ())
+        if str(cmd).strip()
+    }
+
     def _guarded_step(message: types.Message) -> Any:
         if not _is_step_sender_allowed(message, expected_user_id):
             sender_id = getattr(getattr(message, "from_user", None), "id", None)
@@ -330,13 +354,15 @@ def _register_guarded_step_handler(
             return None
         raw_text = getattr(message, "text", None)
         if isinstance(raw_text, str) and raw_text.lstrip().startswith("/"):
-            chat_id = getattr(getattr(message, "chat", None), "id", None)
-            sender_id = getattr(getattr(message, "from_user", None), "id", None)
-            if chat_id is not None:
-                _clear_step_handler(chat_id)
-                _clear_navigation_states(chat_id)
-            _clear_tg_state(chat_id, sender_id)
-            return None
+            cmd_token = raw_text.lstrip().split(None, 1)[0].split("@", 1)[0].lower()
+            if cmd_token not in allowed:
+                chat_id = getattr(getattr(message, "chat", None), "id", None)
+                sender_id = getattr(getattr(message, "from_user", None), "id", None)
+                if chat_id is not None:
+                    _clear_step_handler(chat_id)
+                    _clear_navigation_states(chat_id)
+                _clear_tg_state(chat_id, sender_id)
+                return None
         return next_handler(message, *handler_args)
 
     rt.bot.register_next_step_handler(anchor_message, _guarded_step)
@@ -375,8 +401,9 @@ def _start_ui_input_flow(
     back_target: str = "asmm:return_to_settings",
     cancel_target: Optional[str] = None,
 ) -> None:
-    chat_id = call.message.chat.id
-    initiator_user_id = getattr(getattr(call, "from_user", None), "id", None)
+    chat_id, message_id, initiator_user_id = _extract_call_ids(call)
+    if chat_id is None:
+        return
     _clear_step_handler(chat_id)
     _clear_lot_input_state(chat_id)
     _set_ui_input_state(
@@ -388,12 +415,21 @@ def _start_ui_input_flow(
         cancel_target=cancel_target,
         initiator_user_id=initiator_user_id,
     )
-    msg_ = _safe_edit_message_text(
-        prompt_text,
-        chat_id,
-        call.message.message_id,
-        reply_markup=_build_ui_input_keyboard(chat_id),
-    ) or call.message
+    if message_id is not None:
+        msg_ = _safe_edit_message_text(
+            prompt_text,
+            chat_id,
+            message_id,
+            parse_mode="HTML",
+            reply_markup=_build_ui_input_keyboard(chat_id),
+        ) or call.message
+    else:
+        msg_ = rt.bot.send_message(
+            chat_id,
+            prompt_text,
+            parse_mode="HTML",
+            reply_markup=_build_ui_input_keyboard(chat_id),
+        )
     rt.logger.debug(
         f"[TG STEP START] chat_id={chat_id}, prompt='{prompt_text}', "
         f"handler={getattr(next_handler, '__name__', str(next_handler))}"
@@ -406,7 +442,12 @@ def _repeat_ui_input_flow(chat_id: int, error_text: str = "") -> None:
     if not state:
         return
     text_ = f"{error_text}\n\n{state['prompt_text']}" if error_text else state["prompt_text"]
-    msg_ = rt.bot.send_message(chat_id, text_, reply_markup=_build_ui_input_keyboard(chat_id))
+    msg_ = rt.bot.send_message(
+        chat_id,
+        text_,
+        parse_mode="HTML",
+        reply_markup=_build_ui_input_keyboard(chat_id),
+    )
     _register_guarded_step_handler(
         msg_,
         state["next_handler"],
@@ -454,12 +495,11 @@ def _is_authorized_tg_user(user_id: Optional[int]) -> bool:
 
 
 def _clear_screen_state(call: types.CallbackQuery) -> None:
-    _clear_step_handler(call.message.chat.id)
-    _clear_navigation_states(call.message.chat.id)
-    _clear_tg_state(
-        getattr(getattr(call, "message", None), "chat", None) and call.message.chat.id,
-        getattr(getattr(call, "from_user", None), "id", None),
-    )
+    chat_id, _, user_id = _extract_call_ids(call)
+    if chat_id is not None:
+        _clear_step_handler(chat_id)
+        _clear_navigation_states(chat_id)
+    _clear_tg_state(chat_id, user_id)
 
 
 def _inline_kb(*buttons: Tuple[str, str], row_width: int = 1) -> InlineKeyboardMarkup:
@@ -477,11 +517,14 @@ def _edit_html_screen(
     clean: bool = False,
     disable_preview: bool = False,
 ) -> None:
+    chat_id, message_id, _ = _extract_call_ids(call)
+    if chat_id is None or message_id is None:
+        return
     payload = clean_tg_text(text_value) if clean else text_value
     _safe_edit_message_text(
         payload,
-        call.message.chat.id,
-        call.message.message_id,
+        chat_id,
+        message_id,
         parse_mode="HTML",
         reply_markup=kb,
         **({"disable_web_page_preview": True} if disable_preview else {}),

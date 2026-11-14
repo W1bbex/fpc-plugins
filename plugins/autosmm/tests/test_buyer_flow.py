@@ -152,7 +152,7 @@ class BuyerFlowTests(unittest.TestCase):
                 mock.patch.object(panel_submission, "refund_order") as mock_refund,
                 mock.patch.object(panel_submission, "_send_buyer_message") as mock_buyer_msg,
                 mock.patch.object(panel_submission, "_send_transport_error_after_add_alert") as mock_alert,
-                mock.patch.object(panel_submission.time, "sleep"),
+                mock.patch.object(panel_submission, "_TRANSPORT_RISK_DELAY_SECONDS", 0.0),
             ):
                 buyer_flow._upsert_buyer_flow_order_record(
                     chat_id=777,
@@ -677,6 +677,72 @@ class BuyerFlowEdgeTests(unittest.TestCase):
                 self.assertNotIn("не удалось оформить возврат", combined)
                 self.assertIn("отменён", combined)
         finally:
+            rt.DB_PATH = orig_db
+            rt.waiting_for_link.clear()
+            rt.waiting_for_link.update(orig_wait)
+
+    def test_startup_recovery_does_not_block_and_verifies_refunds_async(self):
+        import tempfile
+        import threading
+        import time
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest import mock
+        from src import runtime as rt
+        from src.core import buyer_flow, engine
+        from src.storage import db, db_orders
+
+        orig_db = rt.DB_PATH
+        orig_wait = dict(rt.waiting_for_link)
+        orig_running = rt.RUNNING
+        rt.STOP_EVENT.clear()
+        rt.RUNNING = True
+        gate = threading.Event()
+        batch_called = threading.Event()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                rt.DB_PATH = str(Path(tmp) / "autosmm.db")
+                db.init_db(rt.DB_PATH)
+                db_orders.upsert_order(
+                    7001,
+                    "FP-RECOV-ASYNC",
+                    None,
+                    "waiting_link",
+                    100.0,
+                    "",
+                    200,
+                    1,
+                    funpay_status="open",
+                    buyer_id=55,
+                    buyer_username="buyer_async",
+                    buyer_flow_state=engine.BUYER_STATE_WAITING_LINK,
+                )
+
+                def slow_batch(cardinal_arg, order_ids):
+                    batch_called.set()
+                    gate.wait(timeout=2.0)
+                    return {"FP-RECOV-ASYNC": {"ok": True, "funpay_status": "refunded"}}
+
+                cardinal = SimpleNamespace(account=SimpleNamespace(id=1), send_message=mock.MagicMock())
+                with mock.patch.object(buyer_flow, "_fetch_funpay_statuses_batch", side_effect=slow_batch):
+                    t0 = time.monotonic()
+                    buyer_flow._recover_buyer_flow_runtime(cardinal)
+                    elapsed = time.monotonic() - t0
+                    self.assertLess(elapsed, 0.25)
+                    self.assertIn("FP-RECOV-ASYNC", rt.waiting_for_link)
+                    self.assertTrue(batch_called.wait(timeout=1.5))
+                    gate.set()
+                    rt.join_background_threads(timeout=2.0)
+
+                stored = db_orders.get_order("FP-RECOV-ASYNC")
+                self.assertEqual(stored["funpay_status"], "refunded")
+                self.assertEqual(stored["buyer_flow_state"], "refunded")
+                self.assertNotIn("FP-RECOV-ASYNC", rt.waiting_for_link)
+        finally:
+            gate.set()
+            rt.join_background_threads(timeout=2.0)
+            rt.RUNNING = orig_running
+            rt.STOP_EVENT.clear()
             rt.DB_PATH = orig_db
             rt.waiting_for_link.clear()
             rt.waiting_for_link.update(orig_wait)

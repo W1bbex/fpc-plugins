@@ -23,6 +23,7 @@ from .common import (
     _clear_navigation_states,
     _clear_step_handler,
     _clear_tg_state,
+    _extract_call_ids,
     _is_authorized_tg_user,
     _safe_answer_callback,
     _safe_edit_message_text,
@@ -35,9 +36,12 @@ MAX_BACKUP_UPLOAD_BYTES = 20 * 1024 * 1024
 
 
 def _render_files_menu(call: types.CallbackQuery) -> None:
-    _clear_step_handler(call.message.chat.id)
-    _clear_navigation_states(call.message.chat.id)
-    _clear_tg_state(call.message.chat.id, getattr(getattr(call, "from_user", None), "id", None))
+    chat_id, message_id, user_id = _extract_call_ids(call)
+    if chat_id is None:
+        return
+    _clear_step_handler(chat_id)
+    _clear_navigation_states(chat_id)
+    _clear_tg_state(chat_id, user_id)
 
     txt_ = (
         "<b>📁 Бэкап / файлы AutoSMM</b>\n\n"
@@ -51,7 +55,10 @@ def _render_files_menu(call: types.CallbackQuery) -> None:
         InlineKeyboardButton("🧹 Очистка AutoSMM", callback_data="asmm:cleanup_menu"),
         InlineKeyboardButton("◀️ Назад", callback_data="asmm:return_to_settings"),
     )
-    _safe_edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb_)
+    if message_id is not None:
+        _safe_edit_message_text(txt_, chat_id, message_id, parse_mode="HTML", reply_markup=kb_)
+    else:
+        rt.bot.send_message(chat_id, txt_, parse_mode="HTML", reply_markup=kb_)
 
 
 def files_menu(call: types.CallbackQuery) -> None:
@@ -100,6 +107,9 @@ def auto_smm_delete(message: types.Message) -> None:
 
 def full_backup_prompt(call: types.CallbackQuery) -> None:
     _safe_answer_callback(call)
+    chat_id, message_id, _ = _extract_call_ids(call)
+    if chat_id is None or message_id is None:
+        return
     kb_ = InlineKeyboardMarkup(row_width=1)
     kb_.add(
         InlineKeyboardButton("📤 Создать бэкап", callback_data="asmm:full_backup_confirm"),
@@ -111,34 +121,55 @@ def full_backup_prompt(call: types.CallbackQuery) -> None:
         "Также внутри могут быть API-ключи панелей.\n\n"
         "Не отправляйте этот файл посторонним."
     )
-    _safe_edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb_)
+    _safe_edit_message_text(txt_, chat_id, message_id, parse_mode="HTML", reply_markup=kb_)
 
 
 def full_backup_confirm(call: types.CallbackQuery) -> None:
     _safe_answer_callback(call)
-    backup_path = _create_full_backup(reason="manual_export")
+    chat_id, _, _ = _extract_call_ids(call)
+    if chat_id is None:
+        return
+    try:
+        backup_path = _create_full_backup(reason="manual_export")
+    except Exception as ex:
+        rt.logger.exception(f"Не удалось создать ручной бэкап AutoSMM: {ex}")
+        backup_path = None
     if not backup_path:
-        rt.bot.send_message(call.message.chat.id, "❌ Не удалось создать бэкап AutoSMM.", reply_markup=_files_back_kb())
+        rt.bot.send_message(
+            chat_id,
+            "❌ Не удалось создать бэкап AutoSMM.",
+            reply_markup=_files_back_kb(),
+            parse_mode="HTML",
+        )
         files_menu(call)
         return
     try:
         with open(backup_path, "rb") as backup_file:
-            rt.bot.send_document(call.message.chat.id, backup_file, caption="📤 Бэкап AutoSMM")
+            rt.bot.send_document(chat_id, backup_file, caption="📤 Бэкап AutoSMM")
     except Exception as ex:
-        rt.bot.send_message(call.message.chat.id, f"❌ Не удалось отправить бэкап: {ex}", reply_markup=_files_back_kb())
+        rt.bot.send_message(
+            chat_id,
+            f"❌ Не удалось отправить бэкап: {h(ex)}",
+            reply_markup=_files_back_kb(),
+            parse_mode="HTML",
+        )
     files_menu(call)
 
 
 def restore_backup_prompt(call: types.CallbackQuery) -> None:
     _safe_answer_callback(call)
-    _clear_step_handler(call.message.chat.id)
-    _clear_navigation_states(call.message.chat.id)
-    _set_tg_state(
-        call.message.chat.id,
-        call.message.message_id,
-        call.from_user.id,
-        STATE_RESTORE_BACKUP,
-    )
+    chat_id, message_id, user_id = _extract_call_ids(call)
+    if chat_id is None:
+        return
+    _clear_step_handler(chat_id)
+    _clear_navigation_states(chat_id)
+    if user_id is not None and message_id is not None:
+        _set_tg_state(
+            chat_id,
+            message_id,
+            user_id,
+            STATE_RESTORE_BACKUP,
+        )
     kb_ = InlineKeyboardMarkup(row_width=1)
     kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="asmm:files_menu"))
     txt_ = (
@@ -146,13 +177,19 @@ def restore_backup_prompt(call: types.CallbackQuery) -> None:
         "Отправьте JSON-файл бэкапа AutoSMM.\n\n"
         "Перед загрузкой AutoSMM создаст аварийный бэкап текущих данных."
     )
-    _safe_edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb_)
+    if message_id is not None:
+        _safe_edit_message_text(txt_, chat_id, message_id, parse_mode="HTML", reply_markup=kb_)
+    else:
+        rt.bot.send_message(chat_id, txt_, parse_mode="HTML", reply_markup=kb_)
 
 
 def autosmm_cleanup_menu(call: types.CallbackQuery) -> None:
     _safe_answer_callback(call)
-    _clear_step_handler(call.message.chat.id)
-    _clear_navigation_states(call.message.chat.id)
+    chat_id, message_id, _ = _extract_call_ids(call)
+    if chat_id is None or message_id is None:
+        return
+    _clear_step_handler(chat_id)
+    _clear_navigation_states(chat_id)
     txt_ = (
         "🧹 <b>Очистка AutoSMM</b>\n\n"
         "Выберите, что нужно очистить.\n\n"
@@ -163,11 +200,14 @@ def autosmm_cleanup_menu(call: types.CallbackQuery) -> None:
         InlineKeyboardButton("🧹 Очистить данные AutoSMM", callback_data="asmm:full_delete_prompt"),
         InlineKeyboardButton("◀️ Назад", callback_data="asmm:files_menu"),
     )
-    _safe_edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb_)
+    _safe_edit_message_text(txt_, chat_id, message_id, parse_mode="HTML", reply_markup=kb_)
 
 
 def full_autosmm_delete_prompt(call: types.CallbackQuery) -> None:
     _safe_answer_callback(call)
+    chat_id, message_id, _ = _extract_call_ids(call)
+    if chat_id is None or message_id is None:
+        return
     kb_ = InlineKeyboardMarkup(row_width=1)
     kb_.add(
         InlineKeyboardButton("✅ Да, очистить", callback_data="asmm:full_delete_confirm"),
@@ -183,20 +223,24 @@ def full_autosmm_delete_prompt(call: types.CallbackQuery) -> None:
         "• состояние плагина.\n\n"
         "Перед удалением AutoSMM создаст аварийный бэкап."
     )
-    _safe_edit_message_text(txt_, call.message.chat.id, call.message.message_id, parse_mode="HTML", reply_markup=kb_)
+    _safe_edit_message_text(txt_, chat_id, message_id, parse_mode="HTML", reply_markup=kb_)
 
 
 def full_autosmm_delete_confirm(call: types.CallbackQuery) -> None:
     _safe_answer_callback(call)
-    try:
-        _safe_edit_message_text(
-            "⏳ <b>Выполняю очистку данных AutoSMM...</b>",
-            call.message.chat.id,
-            call.message.message_id,
-            parse_mode="HTML",
-        )
-    except Exception as exc:
-        rt.logger.debug(f"Could not clear cleanup confirmation keyboard: {exc}")
+    chat_id, message_id, _ = _extract_call_ids(call)
+    if chat_id is None:
+        return
+    if message_id is not None:
+        try:
+            _safe_edit_message_text(
+                "⏳ <b>Выполняю очистку данных AutoSMM...</b>",
+                chat_id,
+                message_id,
+                parse_mode="HTML",
+            )
+        except Exception as exc:
+            rt.logger.debug(f"Could not clear cleanup confirmation keyboard: {exc}")
 
     class _Msg:
         chat = call.message.chat
@@ -246,7 +290,11 @@ def _send_log_file_async(chat_id: int, caption_prefix: str, on_empty_text: str =
 
 
 def export_errors(call: types.CallbackQuery) -> None:
-    _send_log_file_async(call.message.chat.id, "📝 <b>Логи AutoSMM</b>", on_empty_text="Логи ошибок пока не найдены.")
+    chat_id, _, _ = _extract_call_ids(call)
+    if chat_id is None:
+        _safe_answer_callback(call)
+        return
+    _send_log_file_async(chat_id, "📝 <b>Логи AutoSMM</b>", on_empty_text="Логи ошибок пока не найдены.")
     _safe_answer_callback(call, "Логи отправляются...")
     _render_files_menu(call)
 

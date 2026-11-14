@@ -518,3 +518,65 @@ class OrdersConcurrencyAndAlertsTests(unittest.TestCase):
         finally:
             rt.DB_PATH = orig_db
 
+    def test_check_pending_orders_batch_stops_mid_chunk_when_running_cleared(self):
+        from src.storage import db
+
+        orig_db = rt.DB_PATH
+        orig_running = rt.RUNNING
+        rt.STOP_EVENT.clear()
+        rt.RUNNING = True
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                rt.DB_PATH = str(Path(tmp) / "autosmm.db")
+                db.init_db(rt.DB_PATH)
+                storage.save_orders_data(
+                    [
+                        {
+                            "order_id": "FP-STOP-1",
+                            "chat_id": 100,
+                            "id_zakaz": 801,
+                            "panel_order_id": 801,
+                            "service_number": 1,
+                            "status": "pending",
+                            "funpay_status": "open",
+                        },
+                        {
+                            "order_id": "FP-STOP-2",
+                            "chat_id": 100,
+                            "id_zakaz": 802,
+                            "panel_order_id": 802,
+                            "service_number": 1,
+                            "status": "pending",
+                            "funpay_status": "open",
+                        },
+                    ]
+                )
+                applied_ids = []
+
+                def apply_and_stop(cardinal_arg, order_row, result, **_kwargs):
+                    applied_ids.append(order_row["order_id"])
+                    rt.RUNNING = False
+                    rt.STOP_EVENT.set()
+
+                with (
+                    mock.patch.object(
+                        orders,
+                        "_fetch_batch_order_status",
+                        return_value={
+                            "ok": True,
+                            "entries": {
+                                "801": {"status": "Completed", "remains": 0, "charge": 1.0},
+                                "802": {"status": "Completed", "remains": 0, "charge": 1.0},
+                            },
+                        },
+                    ),
+                    mock.patch.object(orders, "_apply_status_result", side_effect=apply_and_stop),
+                ):
+                    orders._check_pending_orders_batch(mock.MagicMock())
+
+                self.assertEqual(len(applied_ids), 1)
+        finally:
+            rt.STOP_EVENT.clear()
+            rt.RUNNING = orig_running
+            rt.DB_PATH = orig_db
+

@@ -291,7 +291,7 @@ def get_order(order_id: str, db_path: Optional[str] = None) -> Optional[Dict[str
     target_id = str(order_id or "").strip()
     if not target_id:
         return None
-    with _connect(db_path) as conn:
+    with _connect(db_path, read_only=True) as conn:
         row = conn.execute("SELECT * FROM orders WHERE order_id = ?", (target_id,)).fetchone()
         return _row_to_order_dict(row) if row is not None else None
 
@@ -315,7 +315,7 @@ def list_orders(
         params.extend(excluded)
     where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     sql = f"SELECT * FROM orders {where_sql} ORDER BY created_at ASC, rowid ASC"
-    with _connect(db_path) as conn:
+    with _connect(db_path, read_only=True) as conn:
         rows = conn.execute(sql, params).fetchall()
         return [_row_to_order_dict(row) for row in rows]
 

@@ -22,8 +22,8 @@ from ..services.telemetry import (
 from ..storage.storage import CONFIG_LOCK, load_config, load_valid_links, reset_valid_links_to_defaults, save_config, save_valid_links
 from .common import (
     _build_ui_input_keyboard, _clear_navigation_states, _clear_screen_state, _clear_step_handler,
-    _clear_ui_input_state, _decode_callback_value, _edit_html_screen, _edit_screen_if_revision_matches,
-    _encode_callback_value, _get_ui_input_state, _inline_kb, _is_delete_confirm_grace_active,
+    _clear_tg_state, _clear_ui_input_state, _decode_callback_value, _edit_html_screen, _edit_screen_if_revision_matches,
+    _encode_callback_value, _extract_call_ids, _get_ui_input_state, _inline_kb, _is_delete_confirm_grace_active,
     _register_guarded_step_handler, _repeat_ui_input_flow, _safe_answer_callback, _safe_edit_message_text,
     _send_or_edit_text, _set_delete_confirm_grace, _start_ui_input_flow, clean_tg_text, h,
     register_navigation_prefix, register_navigation_target,
@@ -122,10 +122,18 @@ def build_main_menu_text_and_kb(cfg: Dict[str, Any]) -> Tuple[str, InlineKeyboar
 
 
 def auto_smm_settings(message: types.Message) -> None:
+    chat_id = getattr(getattr(message, "chat", None), "id", None)
+    user_id = getattr(getattr(message, "from_user", None), "id", None)
+    if chat_id is not None:
+        _clear_step_handler(chat_id)
+        _clear_navigation_states(chat_id)
+        _clear_tg_state(chat_id, user_id)
     if not _telemetry_gate_allows_menu():
-        _show_telemetry_gate(message.chat.id)
+        if chat_id is not None:
+            _show_telemetry_gate(chat_id)
         return
-    _open_main_settings_menu(message.chat.id)
+    if chat_id is not None:
+        _open_main_settings_menu(chat_id)
     _maybe_send_telemetry_ping(rt.cardinal_instance, force=False)
 
 
@@ -346,10 +354,14 @@ def add_website(message: types.Message, new_site: str) -> None:
     if not normalized_site or not _is_plausible_allowed_domain(normalized_site):
         rt.bot.send_message(message.chat.id, "❌ Не удалось определить корректный домен сайта.")
         return
-    valid_links = load_valid_links()
-    if normalized_site not in valid_links:
-        valid_links.append(normalized_site)
-        save_valid_links(valid_links)
+    added = False
+    with CONFIG_LOCK:
+        valid_links = load_valid_links()
+        if normalized_site not in valid_links:
+            valid_links.append(normalized_site)
+            save_valid_links(valid_links)
+            added = True
+    if added:
         rt.bot.send_message(message.chat.id, f"✅ Сайт {normalized_site} успешно добавлен в список.")
     else:
         rt.bot.send_message(message.chat.id, f"❌ Сайт {normalized_site} уже есть в списке.")
@@ -486,10 +498,14 @@ def process_add_website(message: types.Message) -> None:
 
 def _delete_allowed_website_and_refresh(call: types.CallbackQuery, domain: str) -> None:
     domain = _normalize_allowed_domain(domain)
-    valid_links = load_valid_links()
-    if domain in valid_links:
-        valid_links.remove(domain)
-        save_valid_links(valid_links)
+    removed = False
+    with CONFIG_LOCK:
+        valid_links = load_valid_links()
+        if domain in valid_links:
+            valid_links.remove(domain)
+            save_valid_links(valid_links)
+            removed = True
+    if removed:
         _safe_answer_callback(call, "Удалено")
     else:
         _safe_answer_callback(call, "Сайт уже отсутствует")
@@ -556,7 +572,8 @@ def set_notification_chat_id(call: types.CallbackQuery) -> None:
 
 def process_notification_chat_id(message: types.Message) -> None:
     raw_text = str(getattr(message, "text", None) or "").strip()
-    if raw_text.lower() == "/chatid":
+    cmd_token = raw_text.split(None, 1)[0].split("@", 1)[0].lower() if raw_text else ""
+    if cmd_token == "/chatid":
         rt.bot.send_message(
             message.chat.id,
             f"ID этого чата: {message.chat.id}\n\nОтправьте ID чата числом или нажмите «Использовать этот чат» в меню уведомлений.",
@@ -576,6 +593,8 @@ def process_notification_chat_id(message: types.Message) -> None:
         return
     try:
         new_chat_id = int(raw_text)
+        if new_chat_id == 0:
+            raise ValueError("zero chat_id")
         _update_config_value("notification_chat_id", new_chat_id)
         _clear_ui_input_state(message.chat.id)
         rt.bot.send_message(
@@ -584,7 +603,10 @@ def process_notification_chat_id(message: types.Message) -> None:
             reply_markup=_inline_kb(("◀️ Назад", "asmm:seller_notifications_settings")),
         )
     except ValueError:
-        _repeat_ui_input_flow(message.chat.id, "❌ Ошибка: отправьте ID чата числом.")
+        _repeat_ui_input_flow(message.chat.id, "❌ Ошибка: отправьте корректный ID чата числом (не 0).")
+
+
+process_notification_chat_id.allowed_step_commands = ("/chatid",)
 
 
 def misc_settings_callback(call: types.CallbackQuery) -> None:

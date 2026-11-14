@@ -17,6 +17,7 @@ from .common import (
     _clear_ui_input_state,
     _decode_callback_value,
     _encode_callback_value,
+    _extract_call_ids,
     _get_lot_card_context,
     _get_lot_input_state,
     _get_lot_page_context,
@@ -68,6 +69,28 @@ def _open_lots_page(chat_id: int, message_id: int, page: int) -> None:
     )
 
 
+def _format_search_results_text(term: str, *, has_results: bool, current_page: int, total_pages: int) -> str:
+    max_term_len = 200
+    display_term = term[:max_term_len] + ("..." if len(term) > max_term_len else "")
+    page_suffix = f" (стр. {current_page + 1}/{total_pages})" if has_results and total_pages > 1 else ""
+
+    def _build(candidate_term: str, truncated: bool = False) -> str:
+        suffix = "..." if truncated else ""
+        escaped = f"{h(candidate_term)}{suffix}"
+        if has_results:
+            return f"🔍 Результаты поиска для '{escaped}'{page_suffix}:"
+        return f"❌ Лоты по запросу '{escaped}' не найдены."
+
+    text_ = _build(display_term, truncated=False)
+    if len(text_) <= 4096:
+        return text_
+
+    trimmed = display_term
+    while trimmed and len(_build(trimmed, truncated=True)) > 4096:
+        trimmed = trimmed[: max(0, len(trimmed) - max(1, len(trimmed) // 8))]
+    return _build(trimmed, truncated=True)[:4096]
+
+
 def _render_search_results(
     chat_id: int,
     search_term: str,
@@ -115,10 +138,12 @@ def _render_search_results(
             nav_buttons.append(InlineKeyboardButton("➡️", callback_data=f"asmm:search_page_{current_page + 1}"))
         if nav_buttons:
             kb.row(*nav_buttons)
-        page_suffix = f" (стр. {current_page + 1}/{total_pages})" if total_pages > 1 else ""
-        text_ = f"🔍 Результаты поиска для '{h(term)}'{page_suffix}:"
-    else:
-        text_ = f"❌ Лоты по запросу '{h(term)}' не найдены."
+    text_ = _format_search_results_text(
+        term,
+        has_results=bool(chunk),
+        current_page=current_page,
+        total_pages=total_pages,
+    )
 
     kb.add(InlineKeyboardButton("🔍 Новый поиск", callback_data="asmm:search_lot"))
     kb.add(InlineKeyboardButton("◀️ Назад", callback_data="asmm:lot_settings"))
@@ -131,23 +156,29 @@ def _render_search_results(
 
 def search_results_back(call: types.CallbackQuery) -> None:
     _safe_answer_callback(call)
-    ctx = rt.SEARCH_RESULT_CONTEXT.get(int(call.message.chat.id))
+    chat_id, message_id, _ = _extract_call_ids(call)
+    if chat_id is None:
+        return
+    ctx = rt.SEARCH_RESULT_CONTEXT.get(int(chat_id))
     if not ctx or not ctx.get("term"):
         lot_settings(call)
         return
-    _clear_step_handler(call.message.chat.id)
-    _clear_navigation_states(call.message.chat.id)
+    _clear_step_handler(chat_id)
+    _clear_navigation_states(chat_id)
     _render_search_results(
-        call.message.chat.id,
+        chat_id,
         ctx["term"],
-        call.message.message_id,
+        message_id,
         page=int(ctx.get("page") or 0),
     )
 
 
 def search_page_navigation(call: types.CallbackQuery) -> None:
     _safe_answer_callback(call)
-    ctx = rt.SEARCH_RESULT_CONTEXT.get(int(call.message.chat.id))
+    chat_id, message_id, _ = _extract_call_ids(call)
+    if chat_id is None:
+        return
+    ctx = rt.SEARCH_RESULT_CONTEXT.get(int(chat_id))
     if not ctx or not ctx.get("term"):
         lot_settings(call)
         return
@@ -155,23 +186,26 @@ def search_page_navigation(call: types.CallbackQuery) -> None:
         page = int(str(call.data or "").rsplit("_", 1)[-1])
     except ValueError:
         page = 0
-    _clear_step_handler(call.message.chat.id)
-    _clear_navigation_states(call.message.chat.id)
-    _render_search_results(call.message.chat.id, ctx["term"], call.message.message_id, page=page)
+    _clear_step_handler(chat_id)
+    _clear_navigation_states(chat_id)
+    _render_search_results(chat_id, ctx["term"], message_id, page=page)
 
 
 def edit_lot_from_search(call: types.CallbackQuery) -> None:
     _safe_answer_callback(call)
+    chat_id, message_id, _ = _extract_call_ids(call)
+    if chat_id is None:
+        return
     lot_key = _decode_prefixed_lot_key(call, "asmm:edit_lot_search_")
-    _clear_step_handler(call.message.chat.id)
-    _clear_navigation_states(call.message.chat.id)
+    _clear_step_handler(chat_id)
+    _clear_navigation_states(chat_id)
     if not lot_key:
         lot_settings(call)
         return
     _show_lot_card(
-        call.message.chat.id,
+        chat_id,
         lot_key,
-        call.message.message_id,
+        message_id,
         back_callback="asmm:search_results_back",
         back_label="◀️ Назад",
     )
@@ -187,13 +221,13 @@ def _show_lot_card(
     cfg = load_config()
     lot_map = cfg.get("lot_mapping", {})
     if lot_key not in lot_map:
-        text_ = f"❌ Лот {lot_key} не найден."
+        text_ = f"❌ Лот {h(lot_key)} не найден."
         fallback_back = back_callback or _build_return_to_lots_callback(chat_id)
         kb_missing = _inline_kb((back_label or "◀️ Назад", fallback_back))
         if message_id is not None:
-            _safe_edit_message_text(text_, chat_id, message_id, reply_markup=kb_missing)
+            _safe_edit_message_text(text_, chat_id, message_id, parse_mode="HTML", reply_markup=kb_missing)
         else:
-            rt.bot.send_message(chat_id, text_, reply_markup=kb_missing)
+            rt.bot.send_message(chat_id, text_, parse_mode="HTML", reply_markup=kb_missing)
         return
 
     if not back_callback:
@@ -253,13 +287,11 @@ def _show_lot_card(
 
 
 def cycle_link_fmt_callback(call: types.CallbackQuery) -> None:
-    lot_key = _decode_prefixed_lot_key(call, "asmm:cycle_link_fmt_")
-    cfg = load_config()
-    lot_map = cfg.get("lot_mapping", {})
-    if lot_key not in lot_map:
-        _safe_answer_callback(call, "❌ Лот не найден")
+    chat_id, message_id, _ = _extract_call_ids(call)
+    if chat_id is None:
+        _safe_answer_callback(call)
         return
-
+    lot_key = _decode_prefixed_lot_key(call, "asmm:cycle_link_fmt_")
     order_formats = ["as_is", "clean_username", "username_at", "full_url"]
     format_short_names = {
         "as_is": "Как введено",
@@ -267,30 +299,55 @@ def cycle_link_fmt_callback(call: types.CallbackQuery) -> None:
         "username_at": "Username (@...)",
         "full_url": "Полная ссылка",
     }
-    current_fmt = lot_map[lot_key].get("link_format", "as_is")
-    next_idx = (order_formats.index(current_fmt) + 1) % len(order_formats) if current_fmt in order_formats else 0
-    new_fmt = order_formats[next_idx]
-    lot_map[lot_key]["link_format"] = new_fmt
-    cfg["lot_mapping"] = lot_map
-    save_config(cfg)
+    new_fmt: Optional[str] = None
+    with CONFIG_LOCK:
+        cfg = load_config()
+        lot_map = cfg.get("lot_mapping", {})
+        if lot_key in lot_map:
+            current_fmt = lot_map[lot_key].get("link_format", "as_is")
+            next_idx = (order_formats.index(current_fmt) + 1) % len(order_formats) if current_fmt in order_formats else 0
+            new_fmt = order_formats[next_idx]
+            lot_map[lot_key]["link_format"] = new_fmt
+            cfg["lot_mapping"] = lot_map
+            save_config(cfg)
+
+    if new_fmt is None:
+        _safe_answer_callback(call, "❌ Лот не найден")
+        return
+
     _safe_answer_callback(call, f"Формат: {format_short_names.get(new_fmt, new_fmt)}")
-    card_ctx = _get_lot_card_context(call.message.chat.id) or {}
+    card_ctx = _get_lot_card_context(chat_id) or {}
     _show_lot_card(
-        call.message.chat.id,
+        chat_id,
         lot_key,
-        call.message.message_id,
+        message_id,
         back_callback=card_ctx.get("back_callback"),
         back_label=card_ctx.get("back_label"),
     )
 
 
 def _start_lot_edit_flow(call: types.CallbackQuery, lot_key: str, mode: str, prompt_text: str, next_handler: Any) -> None:
-    chat_id = call.message.chat.id
-    initiator_user_id = getattr(getattr(call, "from_user", None), "id", None)
+    chat_id, message_id, initiator_user_id = _extract_call_ids(call)
+    if chat_id is None:
+        return
     _clear_step_handler(chat_id)
     _clear_ui_input_state(chat_id)
     _set_lot_input_state(chat_id, lot_key, mode, prompt_text, next_handler, initiator_user_id=initiator_user_id)
-    msg_ = _safe_edit_message_text(prompt_text, chat_id, call.message.message_id, reply_markup=_build_lot_input_keyboard()) or call.message
+    if message_id is not None:
+        msg_ = _safe_edit_message_text(
+            prompt_text,
+            chat_id,
+            message_id,
+            parse_mode="HTML",
+            reply_markup=_build_lot_input_keyboard(),
+        ) or call.message
+    else:
+        msg_ = rt.bot.send_message(
+            chat_id,
+            prompt_text,
+            parse_mode="HTML",
+            reply_markup=_build_lot_input_keyboard(),
+        )
     rt.logger.debug(
         f"[TG STEP START] chat_id={chat_id}, lot={lot_key}, mode={mode}, "
         f"prompt='{prompt_text}', handler={getattr(next_handler, '__name__', str(next_handler))}"
@@ -300,14 +357,17 @@ def _start_lot_edit_flow(call: types.CallbackQuery, lot_key: str, mode: str, pro
 
 def lot_input_back_callback(call: types.CallbackQuery) -> None:
     _safe_answer_callback(call)
-    state = _get_lot_input_state(call.message.chat.id)
-    _clear_step_handler(call.message.chat.id)
-    _clear_lot_input_state(call.message.chat.id)
+    chat_id, message_id, _ = _extract_call_ids(call)
+    if chat_id is None:
+        return
+    state = _get_lot_input_state(chat_id)
+    _clear_step_handler(chat_id)
+    _clear_lot_input_state(chat_id)
     if state and state.get("lot_key"):
         _show_lot_card(
-            call.message.chat.id,
+            chat_id,
             state["lot_key"],
-            call.message.message_id,
+            message_id,
             back_callback=state.get("back_target"),
             back_label=state.get("back_label"),
         )
@@ -426,26 +486,36 @@ def _apply_lot_field_update(
     success_text: str,
     require_service_exists: bool = False,
 ) -> None:
+    error_action: Optional[Tuple[str, str]] = None
+    updated_key = lot_key
     with CONFIG_LOCK:
         cfg = load_config()
         if require_service_exists and str(value) not in cfg.get("services", {}):
-            _repeat_lot_edit_flow(message.chat.id, f"❌ Ошибка: панель #{h(value)} не существует.")
-            return
-        lot_map = cfg.get("lot_mapping", {})
-        if lot_key not in lot_map:
+            error_action = ("repeat", f"❌ Ошибка: панель #{h(value)} не существует.")
+        else:
+            lot_map = cfg.get("lot_mapping", {})
+            if lot_key not in lot_map:
+                error_action = ("missing", f"❌ Лот {h(lot_key)} не найден.")
+            else:
+                target_lot = lot_map[lot_key]
+                target_lot[field_name] = value
+                cfg["lot_mapping"] = lot_map
+                reindex_lots(cfg)
+                updated_key = next((k for k, v in (cfg.get("lot_mapping") or {}).items() if v is target_lot), lot_key)
+
+    if error_action is not None:
+        kind, msg_text = error_action
+        if kind == "repeat":
+            _repeat_lot_edit_flow(message.chat.id, msg_text)
+        else:
             _clear_lot_input_state(message.chat.id)
             rt.bot.send_message(
                 message.chat.id,
-                f"❌ Лот {h(lot_key)} не найден.",
+                msg_text,
                 parse_mode="HTML",
                 reply_markup=_inline_kb(("◀️ Назад", "asmm:lot_settings")),
             )
-            return
-        target_lot = lot_map[lot_key]
-        target_lot[field_name] = value
-        cfg["lot_mapping"] = lot_map
-        reindex_lots(cfg)
-        updated_key = next((k for k, v in (cfg.get("lot_mapping") or {}).items() if v is target_lot), lot_key)
+        return
     _finish_lot_edit(message, updated_key, success_text)
 
 
@@ -478,13 +548,13 @@ def process_name_change(message: types.Message, lot_key: str) -> None:
 def process_id_change(message: types.Message, lot_key: str) -> None:
     new_id = _parse_int_or_repeat(message, "❌ Ошибка: ID услуги должно быть положительным числом.", min_value=1)
     if new_id is not None:
-        _apply_lot_field_update(message, lot_key, "service_id", new_id, f"✅ ID услуги для {lot_key} изменён на {new_id}.")
+        _apply_lot_field_update(message, lot_key, "service_id", new_id, f"✅ ID услуги для {h(lot_key)} изменён на {h(new_id)}.")
 
 
 def process_quantity_change(message: types.Message, lot_key: str) -> None:
     new_q = _parse_int_or_repeat(message, "❌ Ошибка: Количество должно быть положительным числом.", min_value=1)
     if new_q is not None:
-        _apply_lot_field_update(message, lot_key, "quantity", new_q, f"✅ Количество для {lot_key} изменено на {new_q}.")
+        _apply_lot_field_update(message, lot_key, "quantity", new_q, f"✅ Количество для {h(lot_key)} изменено на {h(new_q)}.")
 
 
 def process_service_num_change(message: types.Message, lot_key: str) -> None:
@@ -492,7 +562,7 @@ def process_service_num_change(message: types.Message, lot_key: str) -> None:
     if new_snum is not None:
         _apply_lot_field_update(
             message, lot_key, "service_number", new_snum,
-            f"✅ Номер сервиса для {lot_key} изменён на {new_snum}.", require_service_exists=True,
+            f"✅ Номер сервиса для {h(lot_key)} изменён на {h(new_snum)}.", require_service_exists=True,
         )
 
 
@@ -501,14 +571,14 @@ def process_fallback_snum_change(message: types.Message, lot_key: str) -> None:
     if new_snum is not None:
         _apply_lot_field_update(
             message, lot_key, "fallback_service_number", new_snum,
-            f"✅ Номер резервной панели для {lot_key} изменён на {new_snum}.", require_service_exists=True,
+            f"✅ Номер резервной панели для {h(lot_key)} изменён на {h(new_snum)}.", require_service_exists=True,
         )
 
 
 def process_fallback_id_change(message: types.Message, lot_key: str) -> None:
     new_id = _parse_int_or_repeat(message, "❌ Ошибка: ID резервной услуги должен быть положительным числом.", min_value=1)
     if new_id is not None:
-        _apply_lot_field_update(message, lot_key, "fallback_service_id", new_id, f"✅ ID резервной услуги для {lot_key} изменён на {new_id}.")
+        _apply_lot_field_update(message, lot_key, "fallback_service_id", new_id, f"✅ ID резервной услуги для {h(lot_key)} изменён на {h(new_id)}.")
 
 
 def process_new_lot_id_step(message: types.Message) -> None:
@@ -639,7 +709,7 @@ def change_name(call: types.CallbackQuery) -> None:
     if not lot_key:
         lot_settings(call)
         return
-    _start_lot_edit_flow(call, lot_key, "change_name", f"Введите новое название для {lot_key}:", process_name_change)
+    _start_lot_edit_flow(call, lot_key, "change_name", f"Введите новое название для {h(lot_key)}:", process_name_change)
 
 
 def change_id(call: types.CallbackQuery) -> None:
@@ -648,7 +718,7 @@ def change_id(call: types.CallbackQuery) -> None:
     if not lot_key:
         lot_settings(call)
         return
-    _start_lot_edit_flow(call, lot_key, "change_id", f"Введите новый ID услуги для {lot_key}:", process_id_change)
+    _start_lot_edit_flow(call, lot_key, "change_id", f"Введите новый ID услуги для {h(lot_key)}:", process_id_change)
 
 
 def change_quantity(call: types.CallbackQuery) -> None:
@@ -657,7 +727,7 @@ def change_quantity(call: types.CallbackQuery) -> None:
     if not lot_key:
         lot_settings(call)
         return
-    _start_lot_edit_flow(call, lot_key, "change_quantity", f"Введите новое количество для {lot_key}:", process_quantity_change)
+    _start_lot_edit_flow(call, lot_key, "change_quantity", f"Введите новое количество для {h(lot_key)}:", process_quantity_change)
 
 
 def change_snum(call: types.CallbackQuery) -> None:
@@ -666,7 +736,7 @@ def change_snum(call: types.CallbackQuery) -> None:
     if not lot_key:
         lot_settings(call)
         return
-    _start_lot_edit_flow(call, lot_key, "change_snum", f"Введите номер панели для {lot_key}:", process_service_num_change)
+    _start_lot_edit_flow(call, lot_key, "change_snum", f"Введите номер панели для {h(lot_key)}:", process_service_num_change)
 
 
 def change_fallback_snum_prompt(call: types.CallbackQuery) -> None:
@@ -675,7 +745,7 @@ def change_fallback_snum_prompt(call: types.CallbackQuery) -> None:
     if not lot_key:
         lot_settings(call)
         return
-    _start_lot_edit_flow(call, lot_key, "change_fallback_snum", f"Введите номер резервной панели для {lot_key}:", process_fallback_snum_change)
+    _start_lot_edit_flow(call, lot_key, "change_fallback_snum", f"Введите номер резервной панели для {h(lot_key)}:", process_fallback_snum_change)
 
 
 def change_fallback_id_prompt(call: types.CallbackQuery) -> None:
@@ -684,7 +754,7 @@ def change_fallback_id_prompt(call: types.CallbackQuery) -> None:
     if not lot_key:
         lot_settings(call)
         return
-    _start_lot_edit_flow(call, lot_key, "change_fallback_id", f"Введите ID резервной услуги для {lot_key}:", process_fallback_id_change)
+    _start_lot_edit_flow(call, lot_key, "change_fallback_id", f"Введите ID резервной услуги для {h(lot_key)}:", process_fallback_id_change)
 
 
 def delete_one_lot_callback(call: types.CallbackQuery) -> None:
