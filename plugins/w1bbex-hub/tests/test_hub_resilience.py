@@ -360,3 +360,137 @@ def test_menu_background_registers_watcher_during_inflight_worker(isolated_hub: 
 
     worker_release.set()
     assert draw_called.wait(timeout=3)
+
+
+def test_download_plugin_handles_uppercase_extension_case_insensitively(
+    isolated_hub: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        hub_api,
+        "get_plugins",
+        lambda: [{"id": "upper", "name": "Upper", "filename": "Upper.PYD", "version": "1.0", "latest_version": "1.0"}],
+    )
+    fake_resp = SimpleNamespace(
+        status_code=200,
+        headers={"Content-Type": "application/octet-stream", "X-Filename": "Upper_Build.PYD"},
+        content=b"\x00upper-binary",
+    )
+    monkeypatch.setattr(installer.requests, "post", lambda *a, **kw: fake_resp)
+
+    cardinal = make_fake_cardinal()
+    ok, msg = installer.download_plugin(cardinal, "upper", None, SimpleNamespace(id=42, username="u"))
+    assert ok is True
+    entry = storage.load_data()["installed"]["upper"]
+    saved = list(Path(entry["bin_dir"]).glob("*.pyd"))
+    assert len(saved) == 1
+    assert saved[0].name.endswith(".pyd")
+
+
+def test_download_plugin_rolls_back_archived_legacy_files_on_failure(
+    isolated_hub: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    legacy_file = Path(runtime.PATHS.plugins_dir) / "LegacyMod.py"
+    legacy_file.write_text(
+        "UUID = '22222222-2222-2222-2222-222222222222'\nCREDITS = '@w1bbex'\nNAME = 'Legacy'\nVERSION = '1.0'\nBIND_TO_PRE_INIT = []\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        hub_api,
+        "get_plugins",
+        lambda: [{"id": "legacy", "name": "Legacy", "uuid": "22222222-2222-2222-2222-222222222222", "credits": "@w1bbex", "version": "2.0"}],
+    )
+    fake_resp = SimpleNamespace(
+        status_code=200,
+        headers={"Content-Type": "text/plain"},
+        content=b"NAME = 'Legacy'\nVERSION = '2.0'\nUUID = '22222222-2222-2222-2222-222222222222'\nBIND_TO_PRE_INIT = []\n",
+    )
+    monkeypatch.setattr(installer.requests, "post", lambda *a, **kw: fake_resp)
+    monkeypatch.setattr(installer, "generate_loader", lambda *a, **kw: (_ for _ in ()).throw(OSError("disk full")))
+
+    cardinal = make_fake_cardinal()
+    ok, msg = installer.download_plugin(cardinal, "legacy", None, SimpleNamespace(id=42, username="u"))
+    assert ok is False
+    assert legacy_file.exists()
+
+
+def test_download_plugin_preserves_catalog_uuid_when_offline(
+    isolated_hub: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage.save_data({
+        "installed": {
+            "offline_mod": {
+                "name": "OfflineMod",
+                "version": "1.0",
+                "catalog": {"uuid": "persistent-uuid-42", "credits": "@w1bbex", "is_free": True},
+            }
+        },
+        "keys": {},
+    })
+    monkeypatch.setattr(hub_api, "get_plugins", lambda: [])
+    fake_resp = SimpleNamespace(
+        status_code=200,
+        headers={"Content-Type": "text/plain"},
+        content=b"NAME = 'OfflineMod'\nVERSION = '1.1'\nUUID = 'persistent-uuid-42'\nBIND_TO_PRE_INIT = []\n",
+    )
+    monkeypatch.setattr(installer.requests, "post", lambda *a, **kw: fake_resp)
+
+    cardinal = make_fake_cardinal()
+    ok, _ = installer.download_plugin(cardinal, "offline_mod", None, SimpleNamespace(id=42, username="u"))
+    assert ok is True
+    data = storage.load_data()
+    assert data["installed"]["offline_mod"]["catalog"]["uuid"] == "persistent-uuid-42"
+    assert data["installed"]["offline_mod"]["catalog"]["is_free"] is True
+
+
+def test_download_and_update_hub_rejects_older_version_downgrade(
+    isolated_hub: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old_version_src = (
+        f"VERSION = '0.1.0'\nUUID = {installer.HUB_UUID!r}\nBIND_TO_PRE_INIT = []\n"
+    ).encode("utf-8")
+    fake_resp = SimpleNamespace(
+        status_code=200,
+        content=old_version_src,
+        headers={"Content-Type": "text/plain"},
+    )
+    monkeypatch.setattr(installer.requests, "get", lambda *a, **kw: fake_resp)
+
+    ok, reason = installer.download_and_update_hub()
+    assert ok is False
+    assert "старее текущей" in reason
+
+
+def test_interval_input_slash_command_cancels_and_deletes_prompt(
+    isolated_hub: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cardinal = make_fake_cardinal(authorized_users={42})
+    controller = handlers.HubController(cardinal)
+    cb = _make_callback(data="hub:custom_interval")
+
+    slash_msg = SimpleNamespace(
+        text="/help",
+        from_user=SimpleNamespace(id=42),
+        chat=SimpleNamespace(id=777),
+        message_id=902,
+    )
+    controller._process_interval_input(slash_msg, cb, prompt_msg_id=102)
+    assert cardinal.telegram.bot.delete_message.called
+    deleted_id = cardinal.telegram.bot.delete_message.call_args[0][1]
+    assert deleted_id == 102
+
+
+def test_outcomes_error_messages_truncated_under_3500_chars() -> None:
+    long_err = "Fatal error: " + "X" * 6000
+    html_text, _ = ui.render_install_result("mod", "Mod", False, long_err, is_update=False)
+    assert len(html_text) <= 4096
+
+    upd_html, _ = ui.render_hub_update_error(long_err)
+    assert len(upd_html) <= 4096
+
+
+def test_matches_creator_and_plugin_label_from_info_none_safe() -> None:
+    assert core.plugin_label_from_info("mod", {"name": None}) == "Mod"
+    assert core.plugin_label_from_info("mod", None) == "Mod"
+    assert core._matches_creator("W1bbex", "@w1bbex") is True
+    assert core._matches_creator("@w1bbex", "W1bbex") is True
+    assert core._matches_creator(None, "@w1bbex") is False

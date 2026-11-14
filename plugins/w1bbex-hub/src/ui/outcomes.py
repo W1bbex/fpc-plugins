@@ -63,7 +63,7 @@ def render_install_result(
         kb.row(Btn("Главная", "hub:main"))
     else:
         card = CardBuilder(tg_icon("cross"), f"Не удалось установить {plugin_label}")
-        card.quote(esc(message))
+        card.quote(esc(message[:3500]))
         kb.row(Btn("Повторить", f"hub:install:{plugin_id}", style="primary"))
         kb.row(
             Btn("К плагину", f"hub:info:{plugin_id}"),
@@ -138,7 +138,7 @@ def render_hub_update_result(disk_ver: Optional[str]) -> tuple[str, InlineKeyboa
 def render_hub_update_error(message: str) -> tuple[str, InlineKeyboardMarkup]:
     """Render error card when W1bbex Hub self-update fails."""
     card = CardBuilder(tg_icon("cross"), "Не удалось обновить W1bbex Hub")
-    card.quote(esc(message))
+    card.quote(esc(message[:3500]))
     kb = KeyboardBuilder()
     kb.row(Btn("Повторить", "hub:download_hub", style="primary"))
     kb.row(Btn("Главная", "hub:main"))

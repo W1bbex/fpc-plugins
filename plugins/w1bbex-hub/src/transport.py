@@ -14,9 +14,12 @@ def _is_authorized(tg: Any, user: Any) -> bool:
     """Return True when the Telegram user belongs to Cardinal's authorized admins."""
     if tg is None or user is None:
         return False
+    user_id = getattr(user, "id", None)
+    if user_id is None:
+        return False
     auth_users = getattr(tg, "authorized_users", None)
     if isinstance(auth_users, (dict, set, list, tuple)):
-        return getattr(user, "id", None) in auth_users
+        return user_id in auth_users
     return False
 
 

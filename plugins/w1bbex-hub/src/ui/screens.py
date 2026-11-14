@@ -11,19 +11,11 @@ from telebot.types import InlineKeyboardMarkup
 
 from ..runtime import VERSION
 from .formatters import (
-    STATUS_BADGES, catalog_caption, description_preview, format_command_lines,
+    catalog_caption, description_preview, format_command_lines,
     format_primary_command,
 )
 from .icons import tg_icon
 from .kit import Btn, CardBuilder, KeyboardBuilder, code, esc, sanitize_telegram_html
-from .outcomes import (
-    rebuild_notification_toggle_markup, render_activate_key_prompt,
-    render_catalog_unavailable, render_delete_confirm, render_delete_result,
-    render_hub_update_error, render_hub_update_result, render_install_result,
-    render_key_activated, render_licenses, render_missing_key_notice,
-    render_post_restart_report, render_resources, render_restart_in_progress,
-    render_trial_activated, render_trial_prompt, render_update_notification,
-)
 
 CATALOG_PAGE_SIZE = 5
 
@@ -136,7 +128,7 @@ def render_plugins_menu(
         card.paragraph(f"Страница {page + 1} из {pages} · Всего {len(states)}")
         buttons = []
         if page:
-            buttons.append(Btn("Назад", f"hub:catalog:{view}:{page - 1}", icon="back"))
+            buttons.append(Btn("⬅️ Пред. страница", f"hub:catalog:{view}:{page - 1}", icon="back"))
         if page + 1 < pages:
             buttons.append(Btn("Далее", f"hub:catalog:{view}:{page + 1}"))
         kb.row(*buttons)

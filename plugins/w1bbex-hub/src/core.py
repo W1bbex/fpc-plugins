@@ -26,7 +26,7 @@ def sanitize_segment(raw: Any, fallback: str) -> str:
 
 def plugin_label_from_info(plugin_id: str, plugin_info: Optional[dict[str, Any]]) -> str:
     """Derive a safe plugin stub name from catalog metadata or plugin ID."""
-    raw_name = str(plugin_info.get("name", "")).split(" ")[0] if plugin_info else ""
+    raw_name = str((plugin_info.get("name") if plugin_info else None) or "").split(" ")[0]
     return sanitize_segment(raw_name, sanitize_segment(plugin_id, "plugin").capitalize())
 
 
@@ -119,7 +119,9 @@ def extract_py_plugin_metadata(file_path: str) -> dict[str, Any]:
 def _matches_creator(file_credits: Optional[str], expected_credits: Optional[str]) -> bool:
     if not file_credits or not expected_credits:
         return False
-    return expected_credits.strip().lower() in file_credits.strip().lower()
+    exp = expected_credits.strip().lower().lstrip("@")
+    fc = file_credits.strip().lower().lstrip("@")
+    return bool(exp and (exp in fc or fc in exp))
 
 
 def scan_legacy_plugin_files() -> list[tuple[str, str, dict[str, Any]]]:

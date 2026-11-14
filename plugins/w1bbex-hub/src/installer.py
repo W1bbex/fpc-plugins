@@ -17,6 +17,7 @@ import requests
 from .core import (
     _iter_matching_legacy_files,
     extract_py_plugin_metadata,
+    is_newer_version,
     plugin_label_from_info,
     sanitize_segment,
 )
@@ -37,6 +38,7 @@ from .runtime import (
     PLUGIN_FS_LOCK,
     SUPPORTED_PLUGIN_EXTENSIONS,
     UUID as HUB_UUID,
+    VERSION,
     logger,
 )
 from .storage import (
@@ -85,14 +87,17 @@ def archive_legacy_plugins(
     target_uuid: Optional[str],
     expected_credits: Optional[str] = "@w1bbex",
     exclude_paths: Optional[list[str]] = None,
-) -> list[str]:
-    """Move manual or legacy @w1bbex plugins matching target_uuid into plugins/w1bbex/archive/."""
+) -> list[tuple[str, str]]:
+    """Move manual or legacy @w1bbex plugins matching target_uuid into plugins/w1bbex/archive/.
+
+    Returns list of (original_path, archive_path) tuples for rollback safety.
+    """
     matches = _iter_matching_legacy_files(target_uuid, expected_credits, exclude_paths)
     if not matches:
         return []
 
     archive_dir = os.path.join(PATHS.plugins_dir, "w1bbex", "archive")
-    archived: list[str] = []
+    archived: list[tuple[str, str]] = []
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     for filename, file_path, _meta in matches:
@@ -105,7 +110,7 @@ def archive_legacy_plugins(
             counter += 1
         try:
             shutil.move(file_path, dest)
-            archived.append(filename)
+            archived.append((file_path, dest))
             logger.info("Archived legacy plugin %s -> %s", file_path, dest)
         except OSError:
             logger.exception("Failed archiving legacy plugin %s", file_path)
@@ -219,13 +224,13 @@ def download_plugin(
     base_filename = raw_filename.replace("\\", "/").rsplit("/", 1)[-1].strip()
     if (
         not base_filename
-        or not base_filename.endswith(SUPPORTED_PLUGIN_EXTENSIONS)
+        or not base_filename.lower().endswith(SUPPORTED_PLUGIN_EXTENSIONS)
         or base_filename in (".", "..")
     ):
         filename = f"{sanitize_segment(plugin_name, 'plugin')}.py"
     else:
-        ext = next(e for e in SUPPORTED_PLUGIN_EXTENSIONS if base_filename.endswith(e))
-        filename = f"{sanitize_segment(base_filename[:-len(ext)], plugin_name)}{ext}"
+        ext = next(e for e in SUPPORTED_PLUGIN_EXTENSIONS if base_filename.lower().endswith(e.lower()))
+        filename = f"{sanitize_segment(base_filename[:-len(ext)], plugin_name)}{ext.lower()}"
 
     plugin_info = next((x for x in get_plugins() if x.get("id") == plugin_name), None)
     installed_map = load_data().get("installed")
@@ -271,6 +276,7 @@ def download_plugin(
     expected_loader_path = os.path.join(PATHS.plugins_dir, f"{sanitize_segment(plugin_label, 'plugin')}.py")
     prev_save_bytes: Optional[bytes] = None
     prev_loader_bytes: Optional[bytes] = None
+    archived_legacy_pairs: list[tuple[str, str]] = []
     wrote_save = False
     wrote_loader = False
 
@@ -300,7 +306,7 @@ def download_plugin(
                 or extracted_meta.get("credits")
                 or "@w1bbex"
             )
-            archived_files = archive_legacy_plugins(target_uuid=target_uuid, expected_credits=target_credits)
+            archived_legacy_pairs = archive_legacy_plugins(target_uuid=target_uuid, expected_credits=target_credits)
 
             loader_path = generate_loader(
                 plugin_name,
@@ -317,12 +323,25 @@ def download_plugin(
                 os.path.abspath(plugin_dir)
             ):
                 queue_pending_deletion(old_bin_dir)
+
+            existing_catalog = old_entry.get("catalog") if isinstance(old_entry.get("catalog"), dict) else {}
+            catalog_meta = {}
+            for k in ("description", "uuid", "credits", "is_free", "prefix"):
+                val = (plugin_info or {}).get(k)
+                if val is None:
+                    val = existing_catalog.get(k)
+                catalog_meta[k] = val
+
             update_data(
                 lambda d: d.setdefault("installed", {}).__setitem__(
                     plugin_name,
-                    {"name": plugin_label, "version": version, "stub_path": loader_path, "bin_dir": plugin_dir,
-                     "catalog": {k: (plugin_info or {}).get(k) for k in
-                                 ("description", "uuid", "credits", "is_free", "prefix")}},
+                    {
+                        "name": plugin_label,
+                        "version": version,
+                        "stub_path": loader_path,
+                        "bin_dir": plugin_dir,
+                        "catalog": catalog_meta,
+                    },
                 )
             )
     except OSError as exc:
@@ -343,6 +362,13 @@ def download_plugin(
                         os.remove(save_path)
                 except OSError:
                     logger.warning("Rollback failed for binary %s", save_path, exc_info=True)
+            for orig_path, archived_dest in archived_legacy_pairs:
+                try:
+                    if os.path.isfile(archived_dest) and not os.path.exists(orig_path):
+                        shutil.move(archived_dest, orig_path)
+                        logger.info("Restored archived legacy plugin %s <- %s", orig_path, archived_dest)
+                except OSError:
+                    logger.warning("Rollback failed to restore legacy plugin %s from %s", orig_path, archived_dest, exc_info=True)
         if isinstance(exc, PermissionError):
             logger.exception("Plugin binary locked during reinstall of %s", plugin_name)
             return (
@@ -352,9 +378,10 @@ def download_plugin(
         logger.exception("Failed saving plugin %s", plugin_name)
         return False, f"Ошибка сохранения файлов на диск: {exc}"
 
+    archived_names = [os.path.basename(orig) for orig, _ in archived_legacy_pairs]
     archived_note = (
-        f" В архив (plugins/w1bbex/archive): {', '.join(archived_files)}."
-        if archived_files
+        f" В архив (plugins/w1bbex/archive): {', '.join(archived_names)}."
+        if archived_names
         else ""
     )
     return True, f"Плагин {plugin_label} (версия {version}) успешно скачан и установлен.{archived_note}"
@@ -400,7 +427,7 @@ def validate_hub_source(raw_bytes: bytes, content_type: str = "") -> tuple[bool,
     return True, ""
 
 
-def download_and_update_hub(target_path: Optional[str] = None) -> tuple[bool, str]:
+def download_and_update_hub(target_path: Optional[str] = None, *, force: bool = False) -> tuple[bool, str]:
     """Download latest W1bbexHub.py, validate syntax/metadata, and write atomically."""
     try:
         resp = requests.get(f"{API_BASE}/download_client", timeout=15, proxies=NO_PROXY)
@@ -422,6 +449,27 @@ def download_and_update_hub(target_path: Optional[str] = None) -> tuple[bool, st
     ok, reason = validate_hub_source(resp.content, resp.headers.get("Content-Type", ""))
     if not ok:
         return False, reason
+
+    new_version: Optional[str] = None
+    try:
+        source_tree = ast.parse(resp.content.decode("utf-8", errors="replace"))
+        for node in source_tree.body:
+            target_name: Optional[str] = None
+            val_node: Optional[ast.AST] = None
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                target_name = node.targets[0].id
+                val_node = node.value
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                target_name = node.target.id
+                val_node = node.value
+            if target_name == "VERSION" and isinstance(val_node, ast.Constant) and isinstance(val_node.value, str):
+                new_version = val_node.value.strip()
+                break
+    except Exception:
+        new_version = None
+
+    if not force and new_version and is_newer_version(VERSION, new_version):
+        return False, f"Скачанная версия Hub ({new_version}) старее текущей ({VERSION})."
 
     dest = os.path.abspath(target_path or PATHS.hub_file)
     try:

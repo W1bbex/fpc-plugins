@@ -15,7 +15,7 @@ from .kit import (
     sanitize_telegram_html,
     strip_button_styles,
 )
-from .screens import (
+from .outcomes import (
     rebuild_notification_toggle_markup,
     render_activate_key_prompt,
     render_catalog_unavailable,
@@ -26,19 +26,21 @@ from .screens import (
     render_install_result,
     render_key_activated,
     render_licenses,
-    render_main_menu,
     render_missing_key_notice,
-    render_plugin_info,
-    render_plugin_diagnostics,
-    render_settings,
-    render_environment,
-    render_plugins_menu,
     render_post_restart_report,
     render_resources,
     render_restart_in_progress,
     render_trial_activated,
     render_trial_prompt,
     render_update_notification,
+)
+from .screens import (
+    render_environment,
+    render_main_menu,
+    render_plugin_diagnostics,
+    render_plugin_info,
+    render_plugins_menu,
+    render_settings,
 )
 
 __all__ = [

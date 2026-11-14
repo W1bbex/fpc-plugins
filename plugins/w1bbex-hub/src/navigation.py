@@ -205,26 +205,7 @@ class HubNavigation:
                                      cached_only=True, version=self._menu_background.version)
 
     def plugins_menu(self, callback: Any, force_refresh: bool = False,
-                     page: int = 0, view: str = "all", *, background: bool = False) -> Any:
-        if force_refresh and background:
-            action_key = f"refresh:{callback.message.chat.id}:{callback.message.id}"
-            if not self._try_begin_action(action_key):
-                return self._alert(callback, "Обновление каталога уже выполняется")
-            try:
-                self._ack(callback, "Обновляю каталог…")
-            except Exception:
-                logger.debug("Early callback ack failed for plugins_menu", exc_info=True)
-
-            def _worker() -> None:
-                try:
-                    if not STOP_EVENT.is_set():
-                        self._render_plugins_menu(callback, force_refresh=True, page=page, view=view)
-                finally:
-                    self._end_action(action_key)
-
-            threading.Thread(target=_worker, name="hub-catalog-refresh", daemon=True).start()
-            return CB_ANSWERED
-
+                     page: int = 0, view: str = "all") -> Any:
         return self._render_plugins_menu(callback, force_refresh=force_refresh, page=page, view=view)
 
     def _render_plugins_menu(self, callback: Any, force_refresh: bool = False,
@@ -370,6 +351,11 @@ class HubNavigation:
         raw = str(getattr(message, "text", "") or "").strip()
         if raw.startswith("/"):
             self._clear_hub_state(chat_id, user_id)
+            if prompt_msg_id:
+                try:
+                    self.bot.delete_message(chat_id, prompt_msg_id)
+                except Exception:
+                    logger.debug("Could not delete interval prompt message %s", prompt_msg_id, exc_info=True)
             if raw.split()[0].split("@")[0].lower() == "/hub":
                 self.hub_command(message)
             else:

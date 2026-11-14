@@ -10,7 +10,7 @@ from telebot.types import CallbackQuery
 
 from . import hub_api, lifecycle
 from .hub_actions import HubActions
-from .navigation import HubNavigation, get_main_menu_content
+from .navigation import HubNavigation
 from .runtime import CB_ANSWERED, UUID, VERSION, configure_file_logging, logger
 from .storage import update_data
 from .transport import TelegramTransport, _call_tg_html, _is_authorized
