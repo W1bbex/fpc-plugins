@@ -40,9 +40,10 @@ def isolated_hub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     runtime.PLUGINS_CACHE["last_attempt_at"] = 0.0
     runtime.PLUGINS_CACHE["checked_at"] = 0.0
     runtime.PLUGINS_CACHE["error"] = False
-    loaded_handlers = sys.modules.get("src.handlers")
-    if loaded_handlers is not None and hasattr(loaded_handlers, "stop_hub"):
-        loaded_handlers.stop_hub()
+    for mod_name in ("src.lifecycle", "src.handlers"):
+        loaded_mod = sys.modules.get(mod_name)
+        if loaded_mod is not None and hasattr(loaded_mod, "stop_hub"):
+            loaded_mod.stop_hub()
     runtime.STOP_EVENT.set()
 
 

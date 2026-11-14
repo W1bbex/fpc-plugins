@@ -6,7 +6,8 @@ import time
 from types import SimpleNamespace
 from typing import Any
 
-from .core import fetch_hub_latest_version, get_disk_hub_pending_version, is_newer_version
+from .core import get_disk_hub_pending_version, is_newer_version
+from .hub_api import fetch_hub_latest_version
 from .runtime import VERSION, logger
 from .storage import update_data
 from .transport import _call_tg_html

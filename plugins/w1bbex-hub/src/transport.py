@@ -10,6 +10,16 @@ from .ui.icons import without_custom_emojis
 from .ui.kit import has_custom_button_icons, has_styled_buttons, strip_button_icons, strip_button_styles
 
 
+def _is_authorized(tg: Any, user: Any) -> bool:
+    """Return True when the Telegram user belongs to Cardinal's authorized admins."""
+    if tg is None or user is None:
+        return False
+    auth_users = getattr(tg, "authorized_users", None)
+    if isinstance(auth_users, (dict, set, list, tuple)):
+        return getattr(user, "id", None) in auth_users
+    return False
+
+
 def _call_tg_html(invoke: Callable[[str, Any], Any], text: str, reply_markup: Any = None,
                   ignore_not_modified: bool = False) -> Any:
     """Retry only known Telegram presentation failures, preserving readable content."""

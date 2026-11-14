@@ -10,7 +10,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from conftest import REPO_ROOT, make_fake_cardinal
-from src import core, runtime, storage
+from src import core, hub_api, installer, runtime, storage
 
 
 def test_is_newer_version_handles_downgrades_and_prefixes() -> None:
@@ -23,20 +23,20 @@ def test_is_newer_version_handles_downgrades_and_prefixes() -> None:
 
 def test_identity_extractors_never_emit_none_string() -> None:
     cardinal = make_fake_cardinal(fp_id=None, fp_username=None)
-    fp = core.get_funpay_identity(cardinal)
+    fp = hub_api.get_funpay_identity(cardinal)
     assert fp["id"] == ""
     assert fp["username"] == "-"
 
     cardinal_partial = SimpleNamespace(account=SimpleNamespace(id=None, user_id=None, username=None))
-    fp2 = core.get_funpay_identity(cardinal_partial)
+    fp2 = hub_api.get_funpay_identity(cardinal_partial)
     assert fp2["id"] == ""
     assert fp2["username"] == "-"
 
-    tg = core.get_telegram_identity(SimpleNamespace(id=None, username=None))
+    tg = hub_api.get_telegram_identity(SimpleNamespace(id=None, username=None))
     assert tg["id"] == ""
     assert tg["username"] == ""
 
-    tg2 = core.get_telegram_identity(SimpleNamespace(id=777, username="@w1bbex"))
+    tg2 = hub_api.get_telegram_identity(SimpleNamespace(id=777, username="@w1bbex"))
     assert tg2["id"] == "777"
     assert tg2["username"] == "w1bbex"
 
@@ -59,12 +59,12 @@ def test_get_plugins_releases_cache_lock_before_http_and_returns_copies(
         }
         return resp
 
-    monkeypatch.setattr(core.requests, "get", fake_get)
-    items = core.get_plugins()
+    monkeypatch.setattr(hub_api.requests, "get", fake_get)
+    items = hub_api.get_plugins()
     assert lock_held_during_http == [False]
     assert len(items) == 1
     items[0]["name"] = "MUTATED"
-    assert core.get_plugins()[0]["name"] == "AutoOffline"
+    assert hub_api.get_plugins()[0]["name"] == "AutoOffline"
 
 
 def test_download_plugin_preserves_so_extension_and_generates_working_loader(
@@ -91,9 +91,9 @@ def test_download_plugin_preserves_so_extension_and_generates_working_loader(
         resp.content = b"\x7fELF_FAKE_SO_BINARY"
         return resp
 
-    monkeypatch.setattr(core.requests, "post", fake_post)
+    monkeypatch.setattr(installer.requests, "post", fake_post)
     cardinal = make_fake_cardinal()
-    ok, msg = core.download_plugin(cardinal, "autooffline", "AO-1111", SimpleNamespace(id=42, username="buyer"))
+    ok, msg = installer.download_plugin(cardinal, "autooffline", "AO-1111", SimpleNamespace(id=42, username="buyer"))
 
     assert ok is True
     assert "v1.2.0" in msg
@@ -120,7 +120,7 @@ def test_generated_loader_executes_installed_py_plugin(isolated_hub: Path) -> No
         encoding="utf-8",
     )
 
-    loader_path = core.generate_loader(
+    loader_path = installer.generate_loader(
         plugin_name="sample",
         plugin_label="SamplePlugin",
         folder_name="SamplePlugin",
@@ -149,9 +149,9 @@ def test_download_plugin_handles_locked_binary_reinstall_cleanly(
         resp.content = b"MZ"
         return resp
 
-    monkeypatch.setattr(core.requests, "post", fake_post)
-    monkeypatch.setattr(core, "atomic_write_bytes", MagicMock(side_effect=PermissionError("locked")))
-    ok, msg = core.download_plugin(make_fake_cardinal(), "autooffline", "AO-KEY", SimpleNamespace(id=1, username="u"))
+    monkeypatch.setattr(installer.requests, "post", fake_post)
+    monkeypatch.setattr(installer, "atomic_write_bytes", MagicMock(side_effect=PermissionError("locked")))
+    ok, msg = installer.download_plugin(make_fake_cardinal(), "autooffline", "AO-KEY", SimpleNamespace(id=1, username="u"))
     assert ok is False
     assert "/restart" in msg
 
@@ -162,7 +162,7 @@ def test_validate_hub_source_accepts_built_bundle_containing_word_success(
     real_bundle_bytes = (REPO_ROOT / "W1bbexHub.py").read_bytes()
     assert b"success" in real_bundle_bytes
 
-    ok, err = core.validate_hub_source(real_bundle_bytes, "text/plain; charset=utf-8")
+    ok, err = installer.validate_hub_source(real_bundle_bytes, "text/plain; charset=utf-8")
     assert ok is True, err
 
     target_hub = isolated_hub / "plugins" / "W1bbexHub.py"
@@ -174,8 +174,8 @@ def test_validate_hub_source_accepts_built_bundle_containing_word_success(
         resp.content = real_bundle_bytes
         return resp
 
-    monkeypatch.setattr(core.requests, "get", fake_get)
-    upd_ok, upd_msg = core.download_and_update_hub(str(target_hub))
+    monkeypatch.setattr(installer.requests, "get", fake_get)
+    upd_ok, upd_msg = installer.download_and_update_hub(str(target_hub))
     assert upd_ok is True
     assert target_hub.read_bytes() == real_bundle_bytes
 
@@ -196,8 +196,8 @@ def test_download_and_update_hub_rejects_json_and_broken_python(
         resp.status_code = 200
         resp.headers = headers
         resp.content = body
-        monkeypatch.setattr(core.requests, "get", lambda *a, r=resp, **kw: r)
-        ok, _ = core.download_and_update_hub(str(target_hub))
+        monkeypatch.setattr(installer.requests, "get", lambda *a, r=resp, **kw: r)
+        ok, _ = installer.download_and_update_hub(str(target_hub))
         assert ok is False
         assert target_hub.read_text(encoding="utf-8") == "# original intact hub"
 
@@ -269,8 +269,8 @@ def test_download_free_py_plugin_archives_legacy_w1bbex_duplicates_only(
         resp.content = new_source
         return resp
 
-    monkeypatch.setattr(core.requests, "post", fake_post)
-    ok, msg = core.download_plugin(make_fake_cardinal(), "autosmm", None, SimpleNamespace(id=10, username="u"))
+    monkeypatch.setattr(installer.requests, "post", fake_post)
+    ok, msg = installer.download_plugin(make_fake_cardinal(), "autosmm", None, SimpleNamespace(id=10, username="u"))
     assert ok is True
     assert "AutoSMM_0.1.py" in msg
 
@@ -315,8 +315,8 @@ def test_download_free_py_plugin_archives_legacy_w1bbex_duplicates_only(
         resp.content = newer_source
         return resp
 
-    monkeypatch.setattr(core.requests, "post", fake_post_v2)
-    ok2, msg2 = core.download_plugin(make_fake_cardinal(), "autosmm", None, SimpleNamespace(id=10, username="u"))
+    monkeypatch.setattr(installer.requests, "post", fake_post_v2)
+    ok2, msg2 = installer.download_plugin(make_fake_cardinal(), "autosmm", None, SimpleNamespace(id=10, username="u"))
     assert ok2 is True
     assert "archive" not in msg2
     assert not canonical_py.exists()
@@ -427,8 +427,8 @@ def test_generated_loader_supports_future_annotations_dataclass_and_defaults(iso
         encoding="utf-8",
     )
 
-    loader_a = core.generate_loader("dc_plugin", "DataclassPlugin", "DataclassPlugin", "DC", "1.0", "Desc")
-    loader_b = core.generate_loader("dc_plugin", "DataclassPlugin", "DataclassPlugin", "DC", "1.0", "Desc")
+    loader_a = installer.generate_loader("dc_plugin", "DataclassPlugin", "DataclassPlugin", "DC", "1.0", "Desc")
+    loader_b = installer.generate_loader("dc_plugin", "DataclassPlugin", "DataclassPlugin", "DC", "1.0", "Desc")
 
     mods = []
     for idx, lpath in enumerate((loader_a, loader_b)):
@@ -464,14 +464,14 @@ def test_download_plugin_rejects_broken_py_and_sha256_mismatch(
         headers={"Content-Type": "text/plain", "X-Filename": "demo.py"},
         content=b"NAME = 'Tampered'\n",
     )
-    monkeypatch.setattr(core.requests, "post", lambda *a, **kw: bad_sha_resp)
-    ok_sha, msg_sha = core.download_plugin(make_fake_cardinal(), "demo", None, SimpleNamespace(id=1, username="u"))
+    monkeypatch.setattr(installer.requests, "post", lambda *a, **kw: bad_sha_resp)
+    ok_sha, msg_sha = installer.download_plugin(make_fake_cardinal(), "demo", None, SimpleNamespace(id=1, username="u"))
     assert ok_sha is False
     assert "SHA-256" in msg_sha
 
     runtime.PLUGINS_CACHE["items"][0].pop("sha256")
-    monkeypatch.setattr(core.requests, "post", lambda *a, **kw: bad_html)
-    ok_py, _ = core.download_plugin(make_fake_cardinal(), "demo", None, SimpleNamespace(id=1, username="u"))
+    monkeypatch.setattr(installer.requests, "post", lambda *a, **kw: bad_html)
+    ok_py, _ = installer.download_plugin(make_fake_cardinal(), "demo", None, SimpleNamespace(id=1, username="u"))
     assert ok_py is False
     assert not (isolated_hub / "plugins" / "Demo.py").exists()
 
@@ -505,8 +505,8 @@ def test_generated_loader_fallback_uuid_is_valid_rfc4122_v4(isolated_hub: Path) 
         encoding="utf-8",
     )
 
-    loader_a = Path(core.generate_loader("no_uuid", "NoUuidPlugin", "NoUuidPlugin", "NoUuid", "1.0", "desc"))
-    loader_b = Path(core.generate_loader("no_uuid", "NoUuidPlugin", "NoUuidPlugin", "NoUuid", "1.0", "desc"))
+    loader_a = Path(installer.generate_loader("no_uuid", "NoUuidPlugin", "NoUuidPlugin", "NoUuid", "1.0", "desc"))
+    loader_b = Path(installer.generate_loader("no_uuid", "NoUuidPlugin", "NoUuidPlugin", "NoUuid", "1.0", "desc"))
     content = loader_a.read_text(encoding="utf-8")
     assert "import uuid" not in content
 

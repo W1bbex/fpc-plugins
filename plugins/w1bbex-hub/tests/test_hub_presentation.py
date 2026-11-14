@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from conftest import make_fake_cardinal
-from src import handlers, runtime, storage, ui
+from src import handlers, runtime, storage, transport, ui
 from src.ui.icons import tg_icon
 from src.ui.kit import Btn, KeyboardBuilder, has_custom_button_icons, has_styled_buttons, strip_button_styles
 from test_hub_navigation import callback
@@ -35,7 +35,7 @@ def test_telegram_icon_and_color_fallbacks_are_independent(first_failure: str) -
             raise RuntimeError("Bad Request: custom emoji not allowed")
         return "ok"
 
-    assert handlers._call_tg_html(invoke, text, markup) == "ok"
+    assert transport._call_tg_html(invoke, text, markup) == "ok"
     final_body, final_keyboard = attempts[-1]
     assert "tg-emoji" not in final_body
     assert "<b>Hub</b>" in final_body

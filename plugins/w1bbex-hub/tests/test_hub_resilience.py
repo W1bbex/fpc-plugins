@@ -12,7 +12,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from conftest import make_fake_cardinal
-from src import core, handlers, navigation, runtime, storage, ui
+from src import core, handlers, hub_api, installer, navigation, runtime, storage, ui
 from src.ui.kit import Btn, compact_callback_data, resolve_callback_data
 
 
@@ -109,8 +109,8 @@ def test_install_route_runs_in_background_and_deduplicates_concurrent_clicks(
         release.wait(timeout=3.0)
         return False, "stopped"
 
-    monkeypatch.setattr(handlers, "get_plugins", lambda: [{"id": "autosmm", "name": "AutoSMM", "is_free": True, "latest_version": "1.0"}])
-    monkeypatch.setattr(handlers, "download_plugin", slow_download)
+    monkeypatch.setattr(hub_api, "get_plugins", lambda: [{"id": "autosmm", "name": "AutoSMM", "is_free": True, "latest_version": "1.0"}])
+    monkeypatch.setattr(installer, "download_plugin", slow_download)
 
     cb = _make_callback(data="hub:install:autosmm")
     install_route = next(fn for fn, pred in cardinal.telegram.cbq_routes if pred(cb))
@@ -137,8 +137,8 @@ def test_hub_command_ignores_group_chat_for_owner_id_and_set_key_accepts_mixed_c
     storage.save_data({"owner_tg_id": 100, "keys": {}, "installed": {}})
     cardinal = make_fake_cardinal(authorized_users={42})
     controller = handlers.HubController(cardinal)
-    monkeypatch.setattr(handlers, "get_main_menu_content", lambda *a, **kw: ("Hub", None))
-    monkeypatch.setattr(handlers, "get_plugins", lambda: [{"id": "AutoSMM", "name": "AutoSMM", "prefix": "AS-"}])
+    monkeypatch.setattr(navigation, "get_main_menu_content", lambda *a, **kw: ("Hub", None))
+    monkeypatch.setattr(hub_api, "get_plugins", lambda: [{"id": "AutoSMM", "name": "AutoSMM", "prefix": "AS-"}])
 
     group_msg = SimpleNamespace(
         text="/hub",
@@ -188,11 +188,11 @@ def test_download_plugin_rolls_back_written_files_on_failure(
         headers={"Content-Type": "text/plain"},
         content=b"NAME = 'Demo'\nVERSION = '1.0.0'\nUUID = '11111111-1111-1111-1111-111111111111'\nBIND_TO_PRE_INIT = []\n",
     )
-    monkeypatch.setattr(core.requests, "post", lambda *a, **kw: fake_resp)
-    monkeypatch.setattr(core, "generate_loader", lambda *a, **kw: (_ for _ in ()).throw(OSError("disk full")))
+    monkeypatch.setattr(installer.requests, "post", lambda *a, **kw: fake_resp)
+    monkeypatch.setattr(installer, "generate_loader", lambda *a, **kw: (_ for _ in ()).throw(OSError("disk full")))
 
     cardinal = make_fake_cardinal()
-    ok, msg = core.download_plugin(cardinal, "demo", None, SimpleNamespace(id=42, username="u"))
+    ok, msg = installer.download_plugin(cardinal, "demo", None, SimpleNamespace(id=42, username="u"))
     assert ok is False
     assert "disk full" in msg
 
@@ -208,7 +208,7 @@ def test_download_plugin_does_not_swallow_os_remove_error(
     old_file = stale_dir / "DemoPlugin_old.pyd"
     old_file.write_text("old", encoding="utf-8")
     monkeypatch.setattr(
-        core,
+        installer,
         "get_plugins",
         lambda: [{"id": "demo", "name": "Demo", "filename": "DemoPlugin_new.pyd", "version": "1.0.0", "latest_version": "1.0.0"}],
     )
@@ -220,11 +220,11 @@ def test_download_plugin_does_not_swallow_os_remove_error(
         },
         content=b"\x00binary-build",
     )
-    monkeypatch.setattr(core.requests, "post", lambda *a, **kw: fake_resp)
-    monkeypatch.setattr(core.os, "remove", lambda _p: (_ for _ in ()).throw(PermissionError("locked")))
+    monkeypatch.setattr(installer.requests, "post", lambda *a, **kw: fake_resp)
+    monkeypatch.setattr(installer.os, "remove", lambda _p: (_ for _ in ()).throw(PermissionError("locked")))
 
     cardinal = make_fake_cardinal()
-    ok, msg = core.download_plugin(cardinal, "demo", None, SimpleNamespace(id=42, username="u"))
+    ok, msg = installer.download_plugin(cardinal, "demo", None, SimpleNamespace(id=42, username="u"))
     assert ok is False
     assert "занят процессом" in msg
 
@@ -237,23 +237,23 @@ def test_validate_hub_source_and_sha256_protect_hub_self_update(
         "UUID = '00000000-0000-0000-0000-000000000000'\n"
         "BIND_TO_PRE_INIT = []\n"
     ).encode("utf-8")
-    ok, reason = core.validate_hub_source(bad_uuid_src)
+    ok, reason = installer.validate_hub_source(bad_uuid_src)
     assert ok is False
     assert "UUID" in reason
 
     good_src = (
-        f"VERSION = '9.9.9'\nUUID = {core.HUB_UUID!r}\nBIND_TO_PRE_INIT = []\n"
+        f"VERSION = '9.9.9'\nUUID = {installer.HUB_UUID!r}\nBIND_TO_PRE_INIT = []\n"
     ).encode("utf-8")
     fake_resp = SimpleNamespace(
         status_code=200,
         content=good_src,
         headers={"Content-Type": "text/plain", "X-File-SHA256": "0" * 64},
     )
-    monkeypatch.setattr(core.requests, "get", lambda *a, **kw: fake_resp)
+    monkeypatch.setattr(installer.requests, "get", lambda *a, **kw: fake_resp)
 
     target_hub = Path(runtime.PATHS.hub_file)
     original = target_hub.read_bytes()
-    ok_upd, msg_upd = core.download_and_update_hub()
+    ok_upd, msg_upd = installer.download_and_update_hub()
     assert ok_upd is False
     assert "SHA-256" in msg_upd
     assert target_hub.read_bytes() == original

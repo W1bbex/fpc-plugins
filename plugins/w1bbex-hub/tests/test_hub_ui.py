@@ -10,7 +10,7 @@ import pytest
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from conftest import make_fake_cardinal
-from src import core, handlers, storage, ui
+from src import core, handlers, hub_api, storage, transport, ui
 from src.ui.formatters import catalog_caption, format_command_lines
 from src.ui.kit import Btn, CardBuilder, KeyboardBuilder, StyledButton
 
@@ -54,7 +54,7 @@ def test_call_tg_html_strips_button_styles_and_retries_on_telegram_style_rejecti
             raise RuntimeError("A request to the Telegram API was unsuccessful. Bad Request: invalid button style")
         return f"ok:{text}"
 
-    result = handlers._call_tg_html(flaky_invoke, "<b>Hello</b>", reply_markup=styled_kb)
+    result = transport._call_tg_html(flaky_invoke, "<b>Hello</b>", reply_markup=styled_kb)
     assert result == "ok:<b>Hello</b>"
     assert len(attempts) == 2
     assert ui.has_styled_buttons(attempts[0]) is True
@@ -152,7 +152,7 @@ def test_delete_requires_two_step_confirmation_before_disk_removal(
         "uuid": "a6ccb3f1-3e7b-4984-9e4c-01d3ea7e0ad8",
         "description": "Free <SMM> plugin",
     }
-    monkeypatch.setattr(handlers, "get_plugins", lambda: [plugin_entry])
+    monkeypatch.setattr(hub_api, "get_plugins", lambda: [plugin_entry])
     from src import runtime
     runtime.PLUGINS_CACHE["items"] = [plugin_entry]
 

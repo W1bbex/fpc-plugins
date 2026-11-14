@@ -6,18 +6,49 @@ from typing import Any
 import threading
 import time
 
+from . import hub_api
 from .catalog import catalog_status
-from .core import get_sys_info, is_newer_version
+from .core import get_disk_hub_pending_version, is_newer_version
+from .lifecycle import wake_update_checker
 from .storage import load_data, update_data
 from .release_notes import fetch_release_notes
-from .runtime import VERSION, STOP_EVENT, UPDATE_WAKE_EVENT, logger
+from .runtime import VERSION, STOP_EVENT, logger
+from .transport import _is_authorized
 from .ui.outcomes import render_hub_release
 from .ui.kit import Btn, CardBuilder, KeyboardBuilder, esc
 from .ui.icons import tg_icon
 from .ui import (
-    render_environment, render_licenses, render_plugin_diagnostics,
+    render_environment, render_licenses, render_main_menu, render_plugin_diagnostics,
     render_plugin_info, render_plugins_menu, render_settings,
 )
+
+
+def get_main_menu_content(
+    cardinal: Any,
+    user_id: Any,
+    username: Any,
+    *,
+    cached_only: bool = False,
+    version: tuple[str, bool] | None = None,
+) -> tuple[str, Any]:
+    """Render main Hub screen from current plugin states and cached/live Hub version."""
+    tg_user = type("UserObj", (), {"id": user_id, "username": username})()
+    latest_version, has_update = (
+        version if version is not None else hub_api.fetch_hub_latest_version(cardinal, tg_user)
+    )
+    states, data = hub_api._build_plugin_states(cardinal, cached_only=cached_only)
+    keys = data.get("keys") if isinstance(data.get("keys"), dict) else {}
+    hub_pending_ver = get_disk_hub_pending_version()
+    return render_main_menu(
+        plugin_states=states,
+        sys_info=hub_api.get_sys_info(),
+        notify_updates=bool(data.get("notify_updates", True)),
+        hub_latest_version=latest_version,
+        has_hub_update=has_update and not bool(hub_pending_ver),
+        hub_pending_version=hub_pending_ver,
+        keys_count=len(keys),
+        catalog_status=catalog_status(),
+    )
 
 
 def _valid_interval(data: dict[str, Any]) -> int:
@@ -147,7 +178,6 @@ class HubNavigation:
         threading.Thread(target=refresh, name="hub-release-details", daemon=True).start()
 
     def _schedule_menu(self, chat: int, message: int, user: Any, draw: Any, catalog_requested: bool = False) -> None:
-        from . import handlers
         data = load_data()
         if not data.get("auto_check_updates", True) and not catalog_requested:
             return
@@ -155,9 +185,9 @@ class HubNavigation:
         catalog_ok = {"fresh": True}
         def refresh() -> tuple[str, bool]:
             auto_check = bool(load_data().get("auto_check_updates", True))
-            version = handlers.fetch_hub_latest_version(self.cardinal, user) if auto_check else self._menu_background.version
+            version = hub_api.fetch_hub_latest_version(self.cardinal, user) if auto_check else self._menu_background.version
             if auto_check or catalog_requested:
-                plugins = handlers.get_plugins()
+                plugins = hub_api.get_plugins()
                 status = catalog_status()
                 catalog_ok["fresh"] = bool(status.get("available")) or bool(plugins)
             return version
@@ -171,9 +201,8 @@ class HubNavigation:
         )
 
     def _main_content(self, user: Any) -> Any:
-        from . import handlers
-        return handlers.get_main_menu_content(self.cardinal, user.id, getattr(user, "username", None),
-                                              cached_only=True, version=self._menu_background.version)
+        return get_main_menu_content(self.cardinal, user.id, getattr(user, "username", None),
+                                     cached_only=True, version=self._menu_background.version)
 
     def plugins_menu(self, callback: Any, force_refresh: bool = False,
                      page: int = 0, view: str = "all", *, background: bool = False) -> Any:
@@ -258,17 +287,16 @@ class HubNavigation:
     def settings_menu(self, callback: Any) -> None:
         data = load_data()
         interval = _valid_interval(data)
-        text, markup = render_settings(bool(data.get("notify_updates", True)), get_sys_info(), bool(data.get("auto_check_updates", True)), interval)
+        text, markup = render_settings(bool(data.get("notify_updates", True)), hub_api.get_sys_info(), bool(data.get("auto_check_updates", True)), interval)
         self._edit_html(text, callback.message.chat.id, callback.message.id, reply_markup=markup)
 
     def toggle_auto_check(self, callback: Any) -> Any:
-        from . import handlers
         try:
             update_data(lambda data: data.__setitem__("auto_check_updates", not data.get("auto_check_updates", True)))
         except OSError:
             logger.exception("Failed saving automatic update check setting")
             return self._alert(callback, "Не удалось сохранить настройку")
-        handlers.wake_update_checker()
+        wake_update_checker()
         return self.settings_menu(callback)
 
     @staticmethod
@@ -292,13 +320,12 @@ class HubNavigation:
         self._edit_html(text, callback.message.chat.id, callback.message.id, reply_markup=markup)
 
     def _save_interval(self, minutes: int) -> None:
-        from . import handlers
         def save(data: dict[str, Any]) -> None:
             data["auto_check_updates"] = minutes != 0
             if minutes:
                 data["update_check_interval_minutes"] = minutes
         update_data(save)
-        handlers.wake_update_checker()
+        wake_update_checker()
 
     def set_interval_callback(self, callback: Any, raw: str | None) -> Any:
         if not raw or not raw.isascii() or not raw.isdigit() or len(raw) > 5:
@@ -336,8 +363,7 @@ class HubNavigation:
         self._safe_refresh_callback_screen(callback, self.check_interval_menu, _send_fresh)
 
     def _process_interval_input(self, message: Any, callback: Any, *, prompt_msg_id: Any = None) -> None:
-        from . import handlers
-        if not handlers._is_authorized(self.tg, getattr(message, "from_user", None)):
+        if not _is_authorized(self.tg, getattr(message, "from_user", None)):
             return
         chat_id = message.chat.id
         user_id = self._step_user_id(message)
@@ -442,5 +468,5 @@ class HubNavigation:
         threading.Thread(target=check, name="hub-manual-update-check", daemon=True).start()
 
     def environment_menu(self, callback: Any) -> None:
-        text, markup = render_environment(get_sys_info())
+        text, markup = render_environment(hub_api.get_sys_info())
         self._edit_html(text, callback.message.chat.id, callback.message.id, reply_markup=markup)

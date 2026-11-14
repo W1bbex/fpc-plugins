@@ -13,7 +13,7 @@ import pytest
 
 from conftest import REPO_ROOT, make_fake_cardinal
 import build as hub_build
-from src import core, handlers, runtime, storage
+from src import core, handlers, hub_api, installer, lifecycle, navigation, runtime, storage
 
 
 def test_main_menu_uses_semver_comparison_not_inequality(
@@ -22,10 +22,10 @@ def test_main_menu_uses_semver_comparison_not_inequality(
     resp = MagicMock()
     resp.status_code = 200
     resp.json.return_value = {"success": True, "latest_version": "0.0.9"}
-    monkeypatch.setattr(core.requests, "post", lambda *a, **kw: resp)
-    monkeypatch.setattr(handlers, "get_plugins", lambda: [])
+    monkeypatch.setattr(hub_api.requests, "post", lambda *a, **kw: resp)
+    monkeypatch.setattr(hub_api, "get_plugins", lambda: [])
 
-    text, kb = handlers.get_main_menu_content(make_fake_cardinal(), 100, "owner")
+    text, kb = navigation.get_main_menu_content(make_fake_cardinal(), 100, "owner")
     assert "W1bbex HUB" not in text
     callbacks = [btn.callback_data for row in kb.keyboard for btn in row]
     assert "hub:update_hub" not in callbacks
@@ -35,7 +35,7 @@ def test_process_key_input_escapes_html_and_retries_invalid_keys(
     isolated_hub: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(
-        handlers,
+        hub_api,
         "get_plugins",
         lambda: [{"id": "autooffline", "name": "Auto<Offline>", "prefix": "AO-"}],
     )
@@ -53,7 +53,7 @@ def test_process_key_input_escapes_html_and_retries_invalid_keys(
     assert not cardinal.telegram.bot.register_next_step_handler.called
 
     slash_msg = SimpleNamespace(chat=SimpleNamespace(id=99), from_user=SimpleNamespace(id=42, username="owner"), text="/hub")
-    monkeypatch.setattr(handlers, "fetch_hub_latest_version", lambda *a: (runtime.VERSION, False))
+    monkeypatch.setattr(hub_api, "fetch_hub_latest_version", lambda *a: (runtime.VERSION, False))
     controller._process_key_input(slash_msg, orig_cb)
     assert cardinal.telegram.get_state(99, 42) is None
     assert not cardinal.telegram.bot.clear_step_handler_by_chat_id.called
@@ -108,8 +108,8 @@ def test_update_checker_loop_sleeps_when_no_plugins_installed(
         return False
 
     monkeypatch.setattr(stop_event, "wait", fake_wait)
-    monkeypatch.setattr(handlers.UPDATE_WAKE_EVENT, "wait", fake_wait)
-    handlers._update_checker_loop(make_fake_cardinal(), stop_event)
+    monkeypatch.setattr(lifecycle.UPDATE_WAKE_EVENT, "wait", fake_wait)
+    lifecycle._update_checker_loop(make_fake_cardinal(), stop_event)
     assert wait_timeouts == [
         runtime.UPDATE_CHECK_INITIAL_DELAY_SECONDS,
         runtime.UPDATE_CHECK_INTERVAL_SECONDS,
@@ -120,7 +120,7 @@ def test_update_checker_loop_sleeps_when_no_plugins_installed(
 def test_run_update_check_cycle_preserves_concurrent_key_updates(
     isolated_hub: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(handlers, "notify_hub_update", lambda *args: 0)
+    monkeypatch.setattr(lifecycle, "notify_hub_update", lambda *args: 0)
     storage.save_data(
         {
             "keys": {"autooffline": "AO-1"},
@@ -130,7 +130,7 @@ def test_run_update_check_cycle_preserves_concurrent_key_updates(
         }
     )
     monkeypatch.setattr(
-        handlers,
+        hub_api,
         "get_plugins",
         lambda: [
             {
@@ -152,7 +152,7 @@ def test_run_update_check_cycle_preserves_concurrent_key_updates(
         return SimpleNamespace(chat=SimpleNamespace(id=chat_id), text=text)
 
     cardinal.telegram.bot.send_message.side_effect = send_and_simulate_concurrent_key
-    sent = handlers.run_update_check_cycle(cardinal)
+    sent = lifecycle.run_update_check_cycle(cardinal)
     assert sent == 1
 
     final_data = storage.load_data()
@@ -174,7 +174,7 @@ def test_built_w1bbex_hub_bundle_matches_cardinal_and_server_contracts(tmp_path:
     assert versions == [runtime.VERSION]
 
     # Passes client self-update AST validation
-    valid, err = core.validate_hub_source(raw, "text/plain")
+    valid, err = installer.validate_hub_source(raw, "text/plain")
     assert valid is True, err
 
     # Loads cleanly into a Cardinal plugin slot directory
@@ -218,7 +218,7 @@ def test_free_plugin_hides_trial_and_installs_without_license_key(
         "uuid": "a6ccb3f1-3e7b-4984-9e4c-01d3ea7e0ad8",
         "credits": "@w1bbex",
     }
-    monkeypatch.setattr(handlers, "get_plugins", lambda: [plugin_entry])
+    monkeypatch.setattr(hub_api, "get_plugins", lambda: [plugin_entry])
 
     from src import ui
 
@@ -238,7 +238,7 @@ def test_free_plugin_hides_trial_and_installs_without_license_key(
         storage.update_data(lambda d: d.setdefault("installed", {}).__setitem__(pid, {"name": "AutoSMM", "version": "1.0.1"}))
         return True, "Плагин AutoSMM (версия 1.0.1) успешно скачан и установлен."
 
-    monkeypatch.setattr(handlers, "download_plugin", fake_download)
+    monkeypatch.setattr(installer, "download_plugin", fake_download)
     cb = SimpleNamespace(
         id="cb-free",
         from_user=SimpleNamespace(id=42, username="owner"),
@@ -268,7 +268,7 @@ def test_delete_restart_post_init_and_open_plugin_full_roundtrip(
         "uuid": target_uuid,
         "credits": "@w1bbex",
     }
-    monkeypatch.setattr(handlers, "get_plugins", lambda: [plugin_entry])
+    monkeypatch.setattr(hub_api, "get_plugins", lambda: [plugin_entry])
 
     # Prepare installed plugin on disk + user storage data + license key
     bin_dir = isolated_hub / "plugins" / "w1bbex" / "AutoSMM"
@@ -335,14 +335,14 @@ def test_delete_restart_post_init_and_open_plugin_full_roundtrip(
 
     # Clicking restart triggers restart hook cleanly
     restarted: list[bool] = []
-    monkeypatch.setattr(handlers, "trigger_cardinal_restart", lambda: restarted.append(True))
+    monkeypatch.setattr(installer, "trigger_cardinal_restart", lambda: restarted.append(True))
     controller.restart_cardinal_handler(cb, "delete:autosmm")
     assert restarted == [True]
 
     # Simulated post-restart: Cardinal no longer has AutoSMM loaded
     cardinal_after_del = make_fake_cardinal(authorized_users={42})
     cardinal_after_del.plugins = {}
-    assert handlers.process_post_restart_notice(cardinal_after_del) is True
+    assert lifecycle.process_post_restart_notice(cardinal_after_del) is True
     post_del_text = cardinal_after_del.telegram.bot.send_message.call_args.args[1]
     assert "полностью удалён" in post_del_text
 
@@ -373,7 +373,7 @@ def test_delete_restart_post_init_and_open_plugin_full_roundtrip(
             settings_page=False,
         )
     }
-    assert handlers.process_post_restart_notice(cardinal_after_inst) is True
+    assert lifecycle.process_post_restart_notice(cardinal_after_inst) is True
     post_inst_text = cardinal_after_inst.telegram.bot.send_message.call_args.args[1]
     post_inst_kb = cardinal_after_inst.telegram.bot.send_message.call_args.kwargs["reply_markup"]
     post_cbs = [btn.callback_data for row in post_inst_kb.keyboard for btn in row]
@@ -404,7 +404,7 @@ def test_resources_menu_and_hub_update_restart_flow(
     # Hub self-update saves pending_restart and renders restart CTA
     hub_file = isolated_hub / "plugins" / "W1bbexHub.py"
     hub_file.write_text('VERSION = "9.9.9"\n', encoding="utf-8")
-    monkeypatch.setattr(handlers, "download_and_update_hub", lambda: (True, "OK"))
+    monkeypatch.setattr(installer, "download_and_update_hub", lambda: (True, "OK"))
     controller.hub_update_handler(cb)
     upd_markup = cardinal.telegram.bot.edit_message_text.call_args.kwargs["reply_markup"]
     upd_cbs = [btn.callback_data for row in upd_markup.keyboard for btn in row]
@@ -419,7 +419,7 @@ def test_hub_init_guards_missing_telegram_stop_hook_and_offline_catalog(
     assert handlers.init_cardinal(SimpleNamespace(telegram=None)) is None
 
     runtime.STOP_EVENT.clear()
-    handlers.stop_hub()
+    lifecycle.stop_hub()
     assert runtime.STOP_EVENT.is_set()
 
     built_path = hub_build.build(tmp_path / "W1bbexHub_check.py")
@@ -436,7 +436,7 @@ def test_hub_init_guards_missing_telegram_stop_hook_and_offline_catalog(
     # When catalog is unavailable and plugin is not free/known locally, report catalog outage instead of key error
     cardinal = make_fake_cardinal(authorized_users={42})
     controller = handlers.HubController(cardinal)
-    monkeypatch.setattr(handlers, "get_plugins", lambda: [])
+    monkeypatch.setattr(hub_api, "get_plugins", lambda: [])
     cb = SimpleNamespace(
         id="cb-offline",
         from_user=SimpleNamespace(id=42, username="owner"),
@@ -452,8 +452,8 @@ def test_post_restart_preserves_marker_on_send_failure_and_delivers_hub_main_men
 ) -> None:
     cardinal = make_fake_cardinal(authorized_users={42})
     controller = handlers.HubController(cardinal)
-    monkeypatch.setattr(handlers, "trigger_cardinal_restart", lambda: True)
-    monkeypatch.setattr(handlers, "get_plugins", lambda: [])
+    monkeypatch.setattr(installer, "trigger_cardinal_restart", lambda: True)
+    monkeypatch.setattr(hub_api, "get_plugins", lambda: [])
 
     cb = SimpleNamespace(
         id="cb-restart-hub",
@@ -471,7 +471,7 @@ def test_post_restart_preserves_marker_on_send_failure_and_delivers_hub_main_men
 
     # First delivery fails on both internal attempts -> marker must survive
     cardinal.telegram.bot.send_message.side_effect = RuntimeError("Temporary Telegram timeout")
-    assert handlers.process_post_restart_notice(cardinal, retry_delay=0.0) is False
+    assert lifecycle.process_post_restart_notice(cardinal, retry_delay=0.0) is False
     assert storage.peek_pending_restart(300) is not None
     cardinal.telegram.bot.delete_message.assert_called_with(777, 321)
 
@@ -485,7 +485,7 @@ def test_post_restart_preserves_marker_on_send_failure_and_delivers_hub_main_men
         }
     )
     cardinal.telegram.bot.send_message.side_effect = None
-    assert handlers.process_post_restart_notice(cardinal, retry_delay=0.0) is True
+    assert lifecycle.process_post_restart_notice(cardinal, retry_delay=0.0) is True
     assert storage.peek_pending_restart(300) is None
 
     delivered_text = cardinal.telegram.bot.send_message.call_args.args[1]
@@ -501,7 +501,7 @@ def test_pre_init_fallback_delivers_when_post_init_is_stalled_and_skips_when_nor
     isolated_hub: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cardinal = make_fake_cardinal(authorized_users={42})
-    monkeypatch.setattr(handlers, "get_plugins", lambda: [])
+    monkeypatch.setattr(hub_api, "get_plugins", lambda: [])
 
     # 1. If post_init_cardinal completes normally, fallback must exit without sending duplicates
     storage.save_pending_restart(
@@ -513,7 +513,7 @@ def test_pre_init_fallback_delivers_when_post_init_is_stalled_and_skips_when_nor
     post_ev.set()
     wake_ev.set()
     assert (
-        handlers._post_restart_fallback_watcher(
+        lifecycle._post_restart_fallback_watcher(
             cardinal,
             delay_seconds=0.05,
             post_init_event=post_ev,
@@ -529,7 +529,7 @@ def test_pre_init_fallback_delivers_when_post_init_is_stalled_and_skips_when_nor
     post_ev.clear()
     wake_ev.clear()
     assert (
-        handlers._post_restart_fallback_watcher(
+        lifecycle._post_restart_fallback_watcher(
             cardinal,
             delay_seconds=0.01,
             post_init_event=post_ev,
@@ -542,7 +542,7 @@ def test_pre_init_fallback_delivers_when_post_init_is_stalled_and_skips_when_nor
     assert storage.peek_pending_restart(300) is None
 
     # Delayed post_init arriving later must not re-send anything
-    assert handlers.process_post_restart_notice(cardinal, retry_delay=0.0) is False
+    assert lifecycle.process_post_restart_notice(cardinal, retry_delay=0.0) is False
     assert cardinal.telegram.bot.send_message.call_count == 1
 
     # 3. Concurrent entry while delivery is in flight is rejected without waiting on network lock
@@ -553,11 +553,11 @@ def test_pre_init_fallback_delivers_when_post_init_is_stalled_and_skips_when_nor
     orig_send = cardinal.telegram.bot.send_message.side_effect
 
     def slow_send(chat_id: int, text: str, **kw):
-        concurrent_results.append(handlers.process_post_restart_notice(cardinal, retry_delay=0.0))
+        concurrent_results.append(lifecycle.process_post_restart_notice(cardinal, retry_delay=0.0))
         return orig_send(chat_id, text, **kw)
 
     cardinal.telegram.bot.send_message.side_effect = slow_send
-    assert handlers.process_post_restart_notice(cardinal, retry_delay=0.0) is True
+    assert lifecycle.process_post_restart_notice(cardinal, retry_delay=0.0) is True
     assert concurrent_results == [False]
 
 
@@ -566,7 +566,7 @@ def test_step_states_use_cardinal_user_states_and_preserve_foreign_states(
 ) -> None:
     cardinal = make_fake_cardinal(authorized_users={42})
     controller = handlers.init_cardinal(cardinal)
-    monkeypatch.setattr(handlers, "get_main_menu_content", lambda *a, **kw: ("Hub", None))
+    monkeypatch.setattr(navigation, "get_main_menu_content", lambda *a, **kw: ("Hub", None))
     monkeypatch.setattr(controller, "_schedule_menu", lambda *args: None)
 
     cb = SimpleNamespace(
@@ -605,7 +605,7 @@ def test_wrap_cb_preserves_alerts_toasts_and_early_long_op_ack(
     isolated_hub: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     plugin_entry = {"id": "demo", "name": "Demo", "latest_version": "1.0", "is_free": False}
-    monkeypatch.setattr(handlers, "get_plugins", lambda: [plugin_entry])
+    monkeypatch.setattr(hub_api, "get_plugins", lambda: [plugin_entry])
     cardinal = make_fake_cardinal(authorized_users={42})
     controller = handlers.HubController(cardinal)
     monkeypatch.setattr(controller, "_schedule_menu", lambda *args: None)
@@ -650,7 +650,7 @@ def test_wrap_cb_preserves_alerts_toasts_and_early_long_op_ack(
 
     cardinal.telegram.bot.answer_callback_query.reset_mock()
     storage.save_data({"keys": {"demo": "DM-123"}})
-    monkeypatch.setattr(handlers, "download_plugin", MagicMock(side_effect=RuntimeError("download crash")))
+    monkeypatch.setattr(installer, "download_plugin", MagicMock(side_effect=RuntimeError("download crash")))
     early_cb = SimpleNamespace(
         id="cb-early",
         data="hub:install:demo",
@@ -667,8 +667,8 @@ def test_wrap_cb_preserves_alerts_toasts_and_early_long_op_ack(
 
 def test_run_update_check_cycle_guards_missing_telegram_or_bot(isolated_hub: Path) -> None:
     storage.save_data({"owner_tg_id": 777, "auto_check_updates": True, "notify_updates": True})
-    assert handlers.run_update_check_cycle(SimpleNamespace(telegram=None)) == 0
-    assert handlers.run_update_check_cycle(SimpleNamespace(telegram=SimpleNamespace(bot=None))) == 0
+    assert lifecycle.run_update_check_cycle(SimpleNamespace(telegram=None)) == 0
+    assert lifecycle.run_update_check_cycle(SimpleNamespace(telegram=SimpleNamespace(bot=None))) == 0
 
 
 def test_reload_restarts_update_loop_survives_oserror_and_cancels_timer(
@@ -682,7 +682,7 @@ def test_reload_restarts_update_loop_survives_oserror_and_cancels_timer(
     reloaded_ran = threading.Event()
     oserror_raised = threading.Event()
     raise_oserror = [True]
-    real_load = handlers.load_data
+    real_load = lifecycle.load_data
 
     def flaky_load():
         if raise_oserror[0]:
@@ -703,39 +703,39 @@ def test_reload_restarts_update_loop_survives_oserror_and_cancels_timer(
             reloaded_ran.set()
         return 0
 
-    monkeypatch.setattr(handlers, "UPDATE_CHECK_INITIAL_DELAY_SECONDS", 0.0)
-    monkeypatch.setattr(handlers, "run_update_check_cycle", fake_cycle)
-    monkeypatch.setattr(handlers, "load_data", flaky_load)
+    monkeypatch.setattr(lifecycle, "UPDATE_CHECK_INITIAL_DELAY_SECONDS", 0.0)
+    monkeypatch.setattr(lifecycle, "run_update_check_cycle", fake_cycle)
+    monkeypatch.setattr(lifecycle, "load_data", flaky_load)
 
     c1 = make_fake_cardinal(authorized_users={42})
     c1.tag = 1
     handlers.custom_init(c1)
     assert first_ran.wait(2)
     assert oserror_raised.wait(2)
-    handlers.wake_update_checker()
+    lifecycle.wake_update_checker()
     assert second_cycle_after_err.wait(2)
-    t1 = handlers._UPDATE_THREAD
+    t1 = lifecycle._UPDATE_THREAD
 
     storage.save_pending_restart({"action": "hub", "chat_id": 777, "target_version": runtime.VERSION})
-    handlers.post_init_cardinal(c1)
-    timer = handlers._POST_RESTART_TIMER
+    lifecycle.post_init_cardinal(c1)
+    timer = lifecycle._POST_RESTART_TIMER
     assert timer is not None
 
-    handlers.stop_hub()
+    lifecycle.stop_hub()
     assert getattr(timer, "finished", None) is not None and timer.finished.is_set()
-    assert handlers._POST_RESTART_TIMER is None
+    assert lifecycle._POST_RESTART_TIMER is None
 
     c2 = make_fake_cardinal(authorized_users={42})
     c2.tag = 2
     handlers.custom_init(c2)
     assert reloaded_ran.wait(2)
-    t2 = handlers._UPDATE_THREAD
+    t2 = lifecycle._UPDATE_THREAD
     assert t2 is not None and t2 is not t1
     if t1 is not None:
         t1.join(timeout=2)
         assert not t1.is_alive()
 
-    handlers.stop_hub()
+    lifecycle.stop_hub()
     if t2 is not None:
         t2.join(timeout=2)
     time.sleep(0.01)

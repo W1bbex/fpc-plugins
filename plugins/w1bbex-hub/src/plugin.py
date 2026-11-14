@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from .handlers import custom_init, init_cardinal, post_init_cardinal, stop_hub
+from .handlers import custom_init, init_cardinal
+from .lifecycle import post_init_cardinal, stop_hub
 from .runtime import (
     COMMANDS,
     CREDITS,

@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from conftest import make_fake_cardinal
-from src import handlers, navigation, runtime, storage
+from src import handlers, hub_api, lifecycle, navigation, runtime, storage
 from test_hub_navigation import callback, state
 
 
@@ -16,9 +16,9 @@ def test_auto_check_off_stops_timer_and_menu_checks(isolated_hub, monkeypatch):
     cardinal = make_fake_cardinal(authorized_users={42})
     version = MagicMock()
     catalog = MagicMock()
-    monkeypatch.setattr(handlers, "fetch_hub_latest_version", version)
-    monkeypatch.setattr(handlers, "get_plugins", catalog)
-    assert handlers.run_update_check_cycle(cardinal) == 0
+    monkeypatch.setattr(hub_api, "fetch_hub_latest_version", version)
+    monkeypatch.setattr(hub_api, "get_plugins", catalog)
+    assert lifecycle.run_update_check_cycle(cardinal) == 0
     controller = handlers.HubController(cardinal)
     controller._schedule_menu(777, 15, callback().from_user, lambda: None)
     version.assert_not_called()
@@ -28,10 +28,10 @@ def test_auto_check_off_stops_timer_and_menu_checks(isolated_hub, monkeypatch):
 def test_notification_setting_does_not_disable_automatic_checks(isolated_hub, monkeypatch):
     storage.save_data({"auto_check_updates": True, "notify_updates": False, "owner_tg_id": 42})
     version, catalog = MagicMock(return_value=(runtime.VERSION, False)), MagicMock(return_value=[])
-    monkeypatch.setattr(handlers, "fetch_hub_latest_version", version)
-    monkeypatch.setattr(handlers, "get_plugins", catalog)
+    monkeypatch.setattr(hub_api, "fetch_hub_latest_version", version)
+    monkeypatch.setattr(hub_api, "get_plugins", catalog)
     cardinal = make_fake_cardinal(authorized_users={42})
-    assert handlers.run_update_check_cycle(cardinal) == 0
+    assert lifecycle.run_update_check_cycle(cardinal) == 0
     version.assert_called_once()
     catalog.assert_called_once()
     cardinal.telegram.bot.send_message.assert_not_called()
@@ -78,9 +78,9 @@ def test_scheduler_uses_saved_interval(isolated_hub, monkeypatch):
     def wait(timeout):
         waits.append(timeout)
         stop.set()
-    monkeypatch.setattr(handlers.UPDATE_WAKE_EVENT, "wait", wait)
-    monkeypatch.setattr(handlers, "run_update_check_cycle", lambda cardinal: 0)
-    handlers._update_checker_loop(make_fake_cardinal(), stop)
+    monkeypatch.setattr(lifecycle.UPDATE_WAKE_EVENT, "wait", wait)
+    monkeypatch.setattr(lifecycle, "run_update_check_cycle", lambda cardinal: 0)
+    lifecycle._update_checker_loop(make_fake_cardinal(), stop)
     assert waits == [75 * 60]
 
 
@@ -123,7 +123,7 @@ def test_cold_catalog_loads_when_auto_check_off_and_failed_fetch_does_not_freeze
         loading[0] = False
         return [] if not available[0] else [{"id": "autosmm", "name": "AutoSMM"}]
 
-    monkeypatch.setattr(handlers, "get_plugins", fake_get_plugins)
+    monkeypatch.setattr(hub_api, "get_plugins", fake_get_plugins)
     monkeypatch.setattr(
         navigation,
         "catalog_status",

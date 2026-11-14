@@ -12,7 +12,7 @@ import pytest
 import requests
 
 from conftest import make_fake_cardinal
-from src import core, handlers, runtime, storage, ui
+from src import core, handlers, hub_api, navigation, runtime, storage, transport, ui
 from src.catalog import catalog_status
 from src.ui.icons import without_custom_emojis
 from src.ui.kit import Btn, KeyboardBuilder
@@ -34,7 +34,7 @@ def state(pid: str = "autosmm", **changes) -> dict:
 
 
 def test_matching_prefix_saves_key_without_claiming_activation(isolated_hub: Path, monkeypatch) -> None:
-    monkeypatch.setattr(handlers, "get_plugins", lambda: [{"id": "paid", "name": "Paid", "prefix": "AO-"}])
+    monkeypatch.setattr(hub_api, "get_plugins", lambda: [{"id": "paid", "name": "Paid", "prefix": "AO-"}])
     cardinal = make_fake_cardinal(authorized_users={42})
     message = SimpleNamespace(text="AO-THIS-IS-NOT-A-VALID-KEY", from_user=SimpleNamespace(id=42),
                               chat=SimpleNamespace(id=777))
@@ -55,7 +55,7 @@ def test_offline_refresh_preserves_local_plugin_and_reports_failure(isolated_hub
     storage.save_data({"keys": {}, "installed": {"autosmm": {
         "name": "AutoSMM", "version": "1.0", "stub_path": str(stub),
     }}})
-    monkeypatch.setattr(core.requests, "get", MagicMock(side_effect=requests.Timeout("offline")))
+    monkeypatch.setattr(hub_api.requests, "get", MagicMock(side_effect=requests.Timeout("offline")))
     cardinal = make_fake_cardinal(authorized_users={42})
     controller = handlers.HubController(cardinal)
     cb = callback()
@@ -74,8 +74,8 @@ def test_offline_refresh_preserves_local_plugin_and_reports_failure(isolated_hub
 
 def test_failed_refresh_labels_retained_catalog_as_stale(isolated_hub: Path, monkeypatch) -> None:
     runtime.PLUGINS_CACHE["items"] = [{"id": "demo", "name": "Demo"}]
-    monkeypatch.setattr(core.requests, "get", MagicMock(side_effect=requests.Timeout("offline")))
-    assert core.get_plugins(force_refresh=True)[0]["id"] == "demo"
+    monkeypatch.setattr(hub_api.requests, "get", MagicMock(side_effect=requests.Timeout("offline")))
+    assert hub_api.get_plugins(force_refresh=True)[0]["id"] == "demo"
     assert catalog_status()["stale"] is True
 
 
@@ -83,9 +83,9 @@ def test_successful_empty_catalog_is_distinct_from_failure_and_cached(isolated_h
     response = MagicMock()
     response.json.return_value = {"success": True, "plugins": []}
     request = MagicMock(return_value=response)
-    monkeypatch.setattr(core.requests, "get", request)
-    assert core.get_plugins() == []
-    assert core.get_plugins() == []
+    monkeypatch.setattr(hub_api.requests, "get", request)
+    assert hub_api.get_plugins() == []
+    assert hub_api.get_plugins() == []
     assert request.call_count == 1
     assert catalog_status()["available"] is True
     text, _ = ui.render_plugins_menu([], catalog_status=catalog_status())
@@ -97,7 +97,7 @@ def test_callback_is_acknowledged_before_network_work_and_only_once(isolated_hub
     cardinal = make_fake_cardinal(authorized_users={42})
     events = []
     cardinal.telegram.bot.answer_callback_query.side_effect = lambda *a, **kw: events.append("ack")
-    monkeypatch.setattr(handlers, "get_main_menu_content", lambda *a, **kw: (events.append("fetch") or ("Hub", None)))
+    monkeypatch.setattr(navigation, "get_main_menu_content", lambda *a, **kw: (events.append("fetch") or ("Hub", None)))
     controller = handlers.HubController(cardinal)
     monkeypatch.setattr(controller, "_schedule_menu", lambda *args: None)
     controller.wrap_cb(controller.main_menu)(callback())
@@ -172,7 +172,7 @@ def test_icon_payload_has_no_duplicate_prefix_and_falls_back_without_premium() -
         if "tg-emoji" in body:
             raise RuntimeError("Bad Request: custom emoji not allowed: Premium required")
         return "ok"
-    assert handlers._call_tg_html(invoke, text, markup) == "ok"
+    assert transport._call_tg_html(invoke, text, markup) == "ok"
     assert "Перезапускаю" in attempts[-1][0]
     assert "tg-emoji" not in attempts[-1][0]
     assert "icon_custom_emoji_id" not in attempts[-1][1].keyboard[0][0].to_dict()
@@ -223,7 +223,7 @@ def test_new_navigation_buttons_reach_registered_screens(isolated_hub: Path, mon
 def test_hub_command_escapes_key_input_immediately(isolated_hub: Path, monkeypatch) -> None:
     cardinal = make_fake_cardinal(authorized_users={42})
     controller = handlers.HubController(cardinal)
-    monkeypatch.setattr(handlers, "get_main_menu_content", lambda *a, **kw: ("Hub", None))
+    monkeypatch.setattr(navigation, "get_main_menu_content", lambda *a, **kw: ("Hub", None))
     monkeypatch.setattr(controller, "_schedule_menu", lambda *args: None)
     cb = callback()
     cardinal.telegram.set_state(777, 1, 42, controller.STATE_AWAIT_KEY, {"callback": cb})

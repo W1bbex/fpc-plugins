@@ -64,15 +64,15 @@ def test_catalog_and_installed_are_distinct_with_descriptive_buttons() -> None:
 def test_controller_opens_main_without_waiting_for_network(isolated_hub, monkeypatch) -> None:
     from types import SimpleNamespace
     from conftest import make_fake_cardinal
-    from src import handlers
+    from src import handlers, hub_api
     started, release, finished = threading.Event(), threading.Event(), threading.Event()
     def slow_version(*args):
         started.set()
         assert release.wait(3)
         finished.set()
         return ("9.9.9", True)
-    monkeypatch.setattr(handlers, "fetch_hub_latest_version", slow_version)
-    monkeypatch.setattr(handlers, "get_plugins", lambda: [])
+    monkeypatch.setattr(hub_api, "fetch_hub_latest_version", slow_version)
+    monkeypatch.setattr(hub_api, "get_plugins", lambda: [])
     cardinal = make_fake_cardinal(authorized_users={42})
     controller = handlers.HubController(cardinal)
     cb = SimpleNamespace(id="query", from_user=SimpleNamespace(id=42, username="user"),
