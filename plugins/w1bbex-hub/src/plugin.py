@@ -17,7 +17,7 @@ from .runtime import (
 BIND_TO_PRE_INIT = [custom_init]
 BIND_TO_POST_INIT = [post_init_cardinal]
 BIND_TO_NEW_MESSAGE = []
-BIND_TO_DELETE = [stop_hub]
+BIND_TO_DELETE = stop_hub
 
 __all__ = [
     "NAME",

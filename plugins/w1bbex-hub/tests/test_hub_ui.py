@@ -134,8 +134,7 @@ def test_plugins_menu_groups_statuses_and_styles_action_buttons() -> None:
     ]
 
     text, kb = ui.render_plugins_menu(states)
-    assert "Мои плагины (2)" in text
-    assert "Доступны в каталоге (1)" in text
+    assert "Плагинов: <b>1</b>" in text
     assert "━" not in text
 
     btn_by_cb = {
@@ -144,8 +143,11 @@ def test_plugins_menu_groups_statuses_and_styles_action_buttons() -> None:
         for btn in row
         if getattr(btn, "callback_data", None)
     }
-    assert getattr(btn_by_cb["hub:info:autochannel"], "style", None) == "primary"
-    assert getattr(btn_by_cb["hub:plugins_refresh"], "style", None) == "primary"
+    assert "AutoChannel" in btn_by_cb["hub:info:autochannel"].text
+    assert btn_by_cb["hub:main"].text == "Назад" and btn_by_cb["hub:main"].style == "danger"
+    assert not any(str(cb).startswith("hub:refresh:") for cb in btn_by_cb)
+    _, mine = ui.render_plugins_menu(states, view="mine")
+    assert {b.callback_data for row in mine.keyboard for b in row if str(b.callback_data).startswith("hub:info:")} == {"hub:info:autosmm", "hub:info:autooffline"}
 
 
 def test_delete_requires_two_step_confirmation_before_disk_removal(
@@ -160,6 +162,8 @@ def test_delete_requires_two_step_confirmation_before_disk_removal(
         "description": "Free <SMM> plugin",
     }
     monkeypatch.setattr(handlers, "get_plugins", lambda: [plugin_entry])
+    from src import runtime
+    runtime.PLUGINS_CACHE["items"] = [plugin_entry]
 
     stub = isolated_hub / "plugins" / "AutoSMM.py"
     stub.write_text("# stub\n", encoding="utf-8")
@@ -239,67 +243,31 @@ def test_toggle_notify_msg_rebuilds_styled_markup_cleanly(isolated_hub: Path) ->
     updated_kb = cardinal.telegram.bot.edit_message_reply_markup.call_args.kwargs["reply_markup"]
     updated_btns = {btn.callback_data: btn for row in updated_kb.keyboard for btn in row}
     assert getattr(updated_btns["hub:install:autosmm"], "style", None) == "success"
-    assert updated_btns["hub:toggle_notify_from_msg"].text == "Уведомления: ❌"
+    assert updated_btns["hub:toggle_notify_from_msg"].text == "Все уведомления: выкл"
     assert getattr(updated_btns["hub:toggle_notify_from_msg"], "style", None) == "danger"
 
 
-def test_main_menu_renders_requested_colors_compact_header_and_trimmed_restart_text() -> None:
-    plugin_states = [
-        {
-            "id": "autosmm",
-            "name": "AutoSMM",
-            "status_code": "active",
-            "loaded_version": "1.0.3",
-            "installed_version": "1.0.3",
-            "latest_version": "1.0.4",
-            "has_update": True,
-            "needs_restart": False,
-        }
-    ]
-    sys_info = {"os": "Linux (x86_64)", "python_version": "3.12.3"}
-
-    text_on, kb_on = ui.render_main_menu(
-        plugin_states=plugin_states,
-        sys_info=sys_info,
-        notify_updates=True,
-        hub_latest_version="0.4.1",
-        has_hub_update=False,
-        hub_pending_version=None,
-        keys_count=0,
-        notice_banner="✅ <b>W1bbex Hub обновлён до v0.4.1</b>",
+def test_main_menu_highlights_attention_and_shows_environment() -> None:
+    state = {"id": "autosmm", "name": "AutoSMM", "status_code": "active",
+             "loaded_version": "1.0.3", "installed_version": "1.0.3", "latest_version": "1.0.4",
+             "has_update": True, "needs_restart": False}
+    text, kb = ui.render_main_menu(
+        [state], {"os": "Linux", "python_version": "3.12"}, True, "0.5.0", False, None, 0,
+        notice_banner="<b>Hub обновлён</b>",
     )
-    assert "👨‍💻 <b>W1bbex Hub" in text_on
-    assert "✅ <b>W1bbex Hub обновлён до v0.4.1</b>" in text_on
-    assert "<blockquote>🖥 OS: Linux (x86_64)\n🐍 Python: 3.12.3</blockquote>" in text_on
-    assert "Сводка" not in text_on
-    assert "⬆️ Доступны обновления плагинов: <b>1</b>" in text_on
-
-    btns_on = {btn.callback_data: btn for row in kb_on.keyboard for btn in row}
-    assert btns_on["hub:plugins_menu"].text == "🧩 Каталог плагинов (1)"
-    assert getattr(btns_on["hub:plugins_menu"], "style", None) == "success"
-    assert getattr(btns_on["hub:activate_key"], "style", None) == "primary"
-    assert getattr(btns_on["hub:licenses"], "style", None) == "primary"
-    assert getattr(btns_on["hub:resources"], "style", None) == "primary"
-    assert btns_on["hub:toggle_notify"].text == "Уведомления: ✅"
-    assert getattr(btns_on["hub:toggle_notify"], "style", None) == "success"
-
-    _, kb_off = ui.render_main_menu(
-        plugin_states=[],
-        sys_info=sys_info,
-        notify_updates=False,
-        hub_latest_version="0.4.1",
-        has_hub_update=False,
-        hub_pending_version=None,
-        keys_count=0,
-    )
-    btns_off = {btn.callback_data: btn for row in kb_off.keyboard for btn in row}
-    assert btns_off["hub:toggle_notify"].text == "Уведомления: ❌"
-    assert getattr(btns_off["hub:toggle_notify"], "style", None) == "danger"
-
+    assert "<b>W1bbex Hub" in text and "<tg-emoji" in text
+    assert "<b>Hub обновлён</b>" in text
+    assert "Доступны обновления: <b>1</b>" in text
+    assert "Python: 3.12" in text and "ОС: Linux" in text
+    buttons = {b.callback_data: b for row in kb.keyboard for b in row}
+    assert buttons["hub:catalog:attention:0"].style == "primary"
+    assert "hub:settings" in buttons and "hub:licenses" in buttons
+    settings_text, settings_kb = ui.render_settings(False, {})
+    assert any(b.text == "Уведомления выключены" and b.style == "danger"
+               for row in settings_kb.keyboard for b in row if b.callback_data == "hub:toggle_notify")
     restart_text = ui.render_restart_in_progress()
-    assert "Перезагружаю FunPay Cardinal" in restart_text
+    assert "Перезапускаю FunPay Cardinal" in restart_text
     assert "3–10 секунд" not in restart_text
-    assert "верну меню Hub" not in restart_text
 
 
 def test_plugin_info_sanitizes_rich_html_descriptions_without_nested_quotes(isolated_hub: Path) -> None:

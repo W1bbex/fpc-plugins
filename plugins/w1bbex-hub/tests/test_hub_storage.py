@@ -110,3 +110,27 @@ def test_corrupt_json_creates_single_backup_and_rejects_outside_deletions(isolat
     Path(runtime.PATHS.pending_delete_file).write_text(json.dumps([str(outside_dir)]), encoding="utf-8")
     storage.process_pending_deletions()
     assert secret_file.is_file()
+
+
+def test_load_data_propagates_oserror_without_wiping_or_renaming_config(
+    isolated_hub: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import builtins
+
+    original = {"keys": {"autosmm": "SMM-123"}, "installed": {"autosmm": "1.0"}}
+    storage.save_data(original)
+    data_path = Path(runtime.PATHS.data_file)
+    real_open = builtins.open
+
+    def locked_open(file, *args, **kwargs):
+        if Path(file) == data_path:
+            raise PermissionError("temporarily locked")
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", locked_open)
+    with pytest.raises(PermissionError, match="temporarily locked"):
+        storage.load_data()
+
+    monkeypatch.undo()
+    assert list(Path(runtime.PATHS.hub_folder).glob("config.json.corrupt.*")) == []
+    assert storage.load_data() == original

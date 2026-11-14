@@ -491,3 +491,40 @@ def test_is_newer_version_prerelease_fallback_without_packaging(monkeypatch: pyt
     assert core.is_newer_version("1.0.0a1", "1.0.0") is False
     assert core.is_newer_version("1.0.1", "1.0.0") is True
     assert core.is_newer_version("0.3.0", "0.3.0") is False
+
+
+def test_generated_loader_fallback_uuid_is_valid_rfc4122_v4(isolated_hub: Path) -> None:
+    import importlib.util
+    import sys
+    import uuid
+
+    plugin_dir = isolated_hub / "plugins" / "w1bbex" / "NoUuidPlugin"
+    plugin_dir.mkdir(parents=True, exist_ok=True)
+    (plugin_dir / "no_uuid.py").write_text(
+        "NAME = 'NoUuid'\nVERSION = '1.0'\nDESCRIPTION = 'desc'\nCREDITS = '@w1bbex'\nDELETE_TO_PLUGIN = False\n",
+        encoding="utf-8",
+    )
+
+    loader_a = Path(core.generate_loader("no_uuid", "NoUuidPlugin", "NoUuidPlugin", "NoUuid", "1.0", "desc"))
+    loader_b = Path(core.generate_loader("no_uuid", "NoUuidPlugin", "NoUuidPlugin", "NoUuid", "1.0", "desc"))
+    content = loader_a.read_text(encoding="utf-8")
+    assert "import uuid" not in content
+
+    mods = []
+    for idx, lpath in enumerate((loader_a, loader_b)):
+        mod_name = f"test_loader_uuid4_{idx}"
+        try:
+            spec = importlib.util.spec_from_file_location(mod_name, lpath)
+            assert spec is not None and spec.loader is not None
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            mods.append(mod)
+        finally:
+            sys.modules.pop(mod_name, None)
+            sys.modules.pop("NoUuidPlugin", None)
+
+    parsed = uuid.UUID(mods[0].UUID, version=4)
+    assert str(parsed) == mods[0].UUID
+    assert parsed.version == 4
+    assert parsed.variant == uuid.RFC_4122
+    assert mods[0].UUID == mods[1].UUID

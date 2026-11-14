@@ -6,7 +6,7 @@
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-FunPay%20Cardinal-2AABEE?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/w1bbexplugins)
-[![Hub](https://img.shields.io/badge/W1bbex%20Hub-v0.4.2-22C55E?style=for-the-badge)](./plugins/w1bbex-hub/README.md)
+[![Hub](https://img.shields.io/badge/W1bbex%20Hub-v0.5.8-22C55E?style=for-the-badge)](./plugins/w1bbex-hub/README.md)
 [![AutoSMM](https://img.shields.io/badge/AutoSMM-v1.0-F59E0B?style=for-the-badge)](./plugins/autosmm/README.md)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)](./LICENSE)
 
@@ -20,7 +20,7 @@
 
 | Плагин | Версия | Команды | Доступ | Назначение |
 | :--- | :---: | :--- | :---: | :--- |
-| **[W1bbex Hub](./plugins/w1bbex-hub/README.md)** | `0.4.2` | `/hub` | Бесплатный | Менеджер каталога, лицензий, установки и автообновления плагинов |
+| **[W1bbex Hub](./plugins/w1bbex-hub/README.md)** | `0.5.8` | `/hub` | Бесплатный | Менеджер каталога, лицензий, установки и автообновления плагинов |
 | **[AutoSMM](./plugins/autosmm/README.md)** | `1.0` | `/autosmm`, `/chatid` | Бесплатный | Автоматическая обработка и трекинг SMM-заказов через PerfectPanel / Peakerr API |
 
 ---
@@ -32,19 +32,19 @@
 1. Скачайте установочный файл [**W1bbexHub.py**](./W1bbexHub.py?raw=1) из корня репозитория.
 2. Поместите `W1bbexHub.py` в папку `plugins/` вашего FunPay Cardinal.
 3. Перезапустите Cardinal (`/restart`).
-4. Отправьте `/hub` в управляющем Telegram-боте и нажмите **`🧩 Каталог плагинов`**.
+4. Отправьте `/hub` в управляющем Telegram-боте и нажмите **«Каталог плагинов»**.
 5. Выберите нужный плагин (например, **AutoSMM**), нажмите **«Установить»** и выполните `/restart`.
 
 > [!TIP]
-> Платные плагины поддерживаются через **`🔑 Активировать ключ`** в `/hub`, а бесплатные ставятся в один клик без ключа.
+> Платные плагины поддерживаются через **«Добавить ключ»** в `/hub`, а бесплатные ставятся в один клик без ключа.
 
 ---
 
 ## ✨ Возможности
 
-### 👨‍💻 W1bbex Hub (`v0.4.2`)
+### 👨‍💻 W1bbex Hub (`v0.5.8`)
 - **Каталог прямо в Telegram** — установка, переустановка, обновление и удаление плагинов без SSH и FTP.
-- **Уведомления об обновлениях** — фоновая проверка каждые 30 минут с переключателем **`Уведомления: ✅ / ❌`**.
+- **Уведомления об обновлениях Hub и плагинов** — фоновая проверка самого Hub и плагинов каждые 30 минут с переключателем **«Уведомления включены / выключены»**.
 - **Безопасная установка** — проверка SHA-256 и синтаксиса `.py`, автоматическая архивация legacy-дублей и генерация loader-файлов.
 - **Самообновление Hub** — загрузка новой версии в `W1bbexHub.py` и баннер-подтверждение после перезапуска Cardinal.
 
@@ -60,7 +60,7 @@
 
 ```text
 fpc-plugins/
-├── W1bbexHub.py                  # Готовый однофайловый бандл W1bbex Hub (v0.4.2)
+├── W1bbexHub.py                  # Готовый однофайловый бандл W1bbex Hub (v0.5.8)
 ├── LICENSE                       # Лицензия MIT
 ├── README.md                     # Общая документация репозитория
 └── plugins/

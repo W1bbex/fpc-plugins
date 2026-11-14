@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import copy
 import html
 from html.parser import HTMLParser
 from typing import Any, Iterable, Literal, Optional, Sequence
 
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+from .icons import clean_button_text, icon_id
 
 ButtonStyle = Literal["primary", "success", "danger"]
 VALID_BUTTON_STYLES: frozenset[str] = frozenset({"primary", "success", "danger"})
@@ -53,6 +56,7 @@ _TG_ALLOWED_HTML_TAGS: frozenset[str] = frozenset(
         "pre",
         "blockquote",
         "tg-spoiler",
+        "tg-emoji",
         "a",
     }
 )
@@ -97,6 +101,16 @@ class _TelegramHTMLSanitizer(HTMLParser):
             expandable = any(k.lower() == "expandable" for k, _ in attrs)
             self._out.append("<blockquote expandable>" if expandable else "<blockquote>")
             self._stack.append(("blockquote", True))
+            return
+
+        if lower == "tg-emoji":
+            emoji_id = next((v for k, v in attrs if k.lower() == "emoji-id" and isinstance(v, str)), "")
+            if len(attrs) == 1 and emoji_id.isascii() and emoji_id.isdigit() and len(emoji_id) <= 32:
+                self._out.append(f'<tg-emoji emoji-id="{emoji_id}">')
+                self._stack.append((lower, True))
+            else:
+                self._out.append(esc(raw_tag))
+                self._stack.append((lower, False))
             return
 
         if lower == "a":
@@ -175,16 +189,20 @@ class StyledButton(InlineKeyboardButton):
         callback_data: Optional[str] = None,
         url: Optional[str] = None,
         style: Optional[ButtonStyle] = None,
+        icon_custom_emoji_id: Optional[str] = None,
         **kwargs: Any,
     ) -> None:
         normalized_style = style if style in VALID_BUTTON_STYLES else None
         super().__init__(text=text, callback_data=callback_data, url=url, **kwargs)
         self.style: Optional[str] = normalized_style
+        self.icon_custom_emoji_id = icon_custom_emoji_id
 
     def to_dict(self) -> dict[str, Any]:
         payload = super().to_dict()
         if self.style:
             payload["style"] = self.style
+        if self.icon_custom_emoji_id:
+            payload["icon_custom_emoji_id"] = self.icon_custom_emoji_id
         return payload
 
 
@@ -196,15 +214,17 @@ class Btn:
     callback_data: Optional[str] = None
     url: Optional[str] = None
     style: Optional[ButtonStyle] = None
+    icon: Optional[str] = None
 
     def to_button(self) -> InlineKeyboardButton:
         """Materialize a pyTelegramBotAPI InlineKeyboardButton preserving `style` when set."""
-        if self.style in VALID_BUTTON_STYLES:
+        if self.style in VALID_BUTTON_STYLES or self.icon:
             return StyledButton(
-                text=self.text,
+                text=clean_button_text(self.text),
                 callback_data=self.callback_data,
                 url=self.url,
                 style=self.style,
+                icon_custom_emoji_id=icon_id(self.icon),
             )
         return InlineKeyboardButton(
             text=self.text,
@@ -282,27 +302,34 @@ def has_styled_buttons(markup: Any) -> bool:
 
 
 def strip_button_styles(markup: InlineKeyboardMarkup) -> InlineKeyboardMarkup:
-    """Return an equivalent InlineKeyboardMarkup with `style` attributes stripped for legacy fallback."""
+    """Remove unsupported colors while preserving icons and button actions."""
+    return _strip_button_fields(markup, ("style",))
+
+
+def strip_button_icons(markup: InlineKeyboardMarkup) -> InlineKeyboardMarkup:
+    """Remove custom emoji without losing semantic button colors."""
+    return _strip_button_fields(markup, ("icon_custom_emoji_id",))
+
+
+def _strip_button_fields(markup: InlineKeyboardMarkup, fields: tuple[str, ...]) -> InlineKeyboardMarkup:
     stripped = InlineKeyboardMarkup()
     for row in getattr(markup, "keyboard", []) or []:
-        plain_row = [
-            InlineKeyboardButton(
-                text=btn.text,
-                url=getattr(btn, "url", None),
-                callback_data=getattr(btn, "callback_data", None),
-                web_app=getattr(btn, "web_app", None),
-                switch_inline_query=getattr(btn, "switch_inline_query", None),
-                switch_inline_query_current_chat=getattr(btn, "switch_inline_query_current_chat", None),
-                switch_inline_query_chosen_chat=getattr(btn, "switch_inline_query_chosen_chat", None),
-                callback_game=getattr(btn, "callback_game", None),
-                pay=getattr(btn, "pay", None),
-                login_url=getattr(btn, "login_url", None),
-            )
-            for btn in row
-        ]
+        plain_row = []
+        for button in row:
+            cloned = copy.copy(button)
+            for field in fields:
+                setattr(cloned, field, None)
+            plain_row.append(cloned)
         if plain_row:
             stripped.row(*plain_row)
     return stripped
+
+
+def has_custom_button_icons(markup: Any) -> bool:
+    return any(
+        bool(getattr(button, "icon_custom_emoji_id", None))
+        for row in getattr(markup, "keyboard", []) or [] for button in row
+    )
 
 
 def render_tree_lines(items: Sequence[str], indent: str = " ") -> list[str]:
@@ -319,10 +346,12 @@ def render_tree_lines(items: Sequence[str], indent: str = " ") -> list[str]:
 class CardBuilder:
     """Structured Telegram HTML message builder following clean tree hierarchy."""
 
-    def __init__(self, icon: str, heading: str, version_badge: Optional[str] = None) -> None:
+    def __init__(self, icon: str, heading: str, version_badge: Optional[str] = None, header_suffix: Optional[str] = None) -> None:
         header = f"{icon} <b>{esc(heading)}</b>" if icon else f"<b>{esc(heading)}</b>"
         if version_badge:
             header = f"{header} <code>{esc(version_badge)}</code>"
+        if header_suffix:
+            header = f"{header} · {header_suffix}"
         self._blocks: list[str] = [header]
 
     def quote(self, html_body: str, expandable: bool = False) -> CardBuilder:

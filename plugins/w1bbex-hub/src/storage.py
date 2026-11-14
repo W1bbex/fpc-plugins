@@ -137,7 +137,17 @@ def load_data() -> dict[str, Any]:
             if isinstance(loaded, dict):
                 return loaded
             logger.error("Hub config at %s has non-dict root; backing up", data_file)
-        except (OSError, ValueError):
+        except FileNotFoundError:
+            default_data = {"keys": {}}
+            try:
+                atomic_write_json(data_file, default_data)
+            except OSError:
+                logger.warning("Could not initialize config at %s", data_file, exc_info=True)
+            return default_data
+        except OSError:
+            logger.exception("Failed reading Hub config at %s", data_file)
+            raise
+        except ValueError:
             logger.exception("Failed reading Hub config at %s", data_file)
 
         corrupt_backup = f"{data_file}.corrupt.{int(time.time())}"

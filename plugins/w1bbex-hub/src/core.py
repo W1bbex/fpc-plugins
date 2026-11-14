@@ -19,17 +19,15 @@ from typing import Any, Callable, Optional
 
 import requests
 
+from .catalog import fetch_catalog
+
 from .runtime import (
     API_BASE,
-    CACHE_LOCK,
-    CACHE_RETRY_COOLDOWN_SECONDS,
-    CACHE_TTL_SECONDS,
     CREDITS,
     LOADER_HEADER,
     NO_PROXY,
     PATHS,
     PLUGIN_FS_LOCK,
-    PLUGINS_CACHE,
     SUPPORTED_PLUGIN_EXTENSIONS,
     UUID as HUB_UUID,
     VERSION,
@@ -118,32 +116,8 @@ def is_newer_version(latest: str, current: str) -> bool:
 
 
 def get_plugins(force_refresh: bool = False) -> list[dict[str, Any]]:
-    """Fetch plugin metadata with TTL cache, never holding CACHE_LOCK during HTTP I/O."""
-    now = time.time()
-    with CACHE_LOCK:
-        items = PLUGINS_CACHE["items"]
-        if not force_refresh:
-            if items and (now - float(PLUGINS_CACHE["fetched_at"]) < CACHE_TTL_SECONDS):
-                return [dict(item) for item in items]
-            if now - float(PLUGINS_CACHE["last_attempt_at"]) < CACHE_RETRY_COOLDOWN_SECONDS:
-                return [dict(item) for item in items]
-        PLUGINS_CACHE["last_attempt_at"] = now
-
-    fetched: Optional[list[dict[str, Any]]] = None
-    try:
-        resp = requests.get(f"{API_BASE}/plugins", timeout=5, proxies=NO_PROXY)
-        if resp.status_code == 200:
-            payload = safe_json(resp)
-            if payload and payload.get("success") and isinstance(payload.get("plugins"), list):
-                fetched = payload["plugins"]
-    except requests.RequestException as exc:
-        logger.error("Failed to fetch plugins: %s", exc)
-
-    with CACHE_LOCK:
-        if fetched is not None:
-            PLUGINS_CACHE["items"] = fetched
-            PLUGINS_CACHE["fetched_at"] = time.time()
-        return [dict(item) for item in PLUGINS_CACHE["items"]]
+    """Fetch catalog metadata through the shared status-aware cache."""
+    return fetch_catalog(force_refresh=force_refresh)
 
 
 def get_sys_info() -> dict[str, str]:
@@ -423,12 +397,17 @@ def generate_loader(
     safe_label = sanitize_segment(plugin_label, "plugin")
     safe_folder = sanitize_segment(folder_name, "plugin_build")
     loader_path = os.path.join(PATHS.plugins_dir, f"{safe_label}.py")
+    fallback_uuid = str(
+        uuid.UUID(
+            bytes=hashlib.sha256(f"w1bbex:{plugin_name}".encode("utf-8")).digest()[:16],
+            version=4,
+        )
+    )
     loader_code = (
         f"{LOADER_HEADER}\n"
         "import os\n"
         "import sys\n"
-        "import importlib.util\n"
-        "import uuid\n\n"
+        "import importlib.util\n\n"
         f"base_dir = os.path.join(os.path.dirname(__file__), 'w1bbex', {repr(safe_folder)})\n"
         "pyd_path = None\n"
         "if os.path.exists(base_dir):\n"
@@ -456,7 +435,7 @@ def generate_loader(
         f"VERSION = {repr(api_version)}\n"
         f"DESCRIPTION = {repr(api_desc)}\n"
         f"CREDITS = getattr(module, 'CREDITS', {repr(CREDITS)})\n"
-        f"_FALLBACK_UUID = str(uuid.uuid5(uuid.NAMESPACE_URL, {repr(f'w1bbex:{plugin_name}')}))\n"
+        f"_FALLBACK_UUID = {repr(fallback_uuid)}\n"
         "UUID = getattr(module, 'UUID', _FALLBACK_UUID)\n"
         "SETTINGS_PAGE = getattr(module, 'SETTINGS_PAGE', False)\n"
         "BIND_TO_DELETE = getattr(module, 'BIND_TO_DELETE', None)\n"
@@ -586,7 +565,9 @@ def download_plugin(
             update_data(
                 lambda d: d.setdefault("installed", {}).__setitem__(
                     plugin_name,
-                    {"name": plugin_label, "version": version, "stub_path": loader_path, "bin_dir": plugin_dir},
+                    {"name": plugin_label, "version": version, "stub_path": loader_path, "bin_dir": plugin_dir,
+                     "catalog": {k: (plugin_info or {}).get(k) for k in
+                                 ("description", "uuid", "credits", "is_free", "prefix")}},
                 )
             )
     except PermissionError:
@@ -804,7 +785,6 @@ def inspect_plugin_state(
     key_val = str(keys_map.get(pid) or "")
     has_key = bool(key_val)
     masked_key = f"{key_val[:6]}…{key_val[-4:]}" if len(key_val) > 12 else key_val
-    has_update = bool(installed_entry is not None and is_newer_version(latest_version, installed_version or "0"))
 
     needs_restart = False
     restart_action = "general"
@@ -842,6 +822,14 @@ def inspect_plugin_state(
         else:
             status_code = "not_installed"
 
+    manual_versions = {item["version"] for item in manual_files if item.get("version")}
+    matching_paths = {_normalize_plugin_path(item["path"]) for item in manual_files}
+    matched_loaded = bool(loaded_version and (str(loaded_uuid or "").lower() == str(plugin_info.get("uuid") or "").lower()
+                          or loaded_path in matching_paths))
+    manual_version = loaded_version if matched_loaded else (next(iter(manual_versions)) if len(manual_versions) == 1 else None)
+    current_version = installed_version if installed_entry is not None else manual_version if status_code == "manual" else None
+    has_update = bool(current_version and plugin_info.get("catalog_known", True) and is_newer_version(latest_version, current_version))
+
     return {
         "id": pid,
         "name": name,
@@ -864,10 +852,12 @@ def inspect_plugin_state(
         "commands": commands,
         "settings_page": settings_page,
         "manual_files": manual_files,
+        "manual_version": manual_version,
         "storage_dir_exists": storage_dir_exists,
         "has_key": has_key,
         "masked_key": masked_key,
         "has_update": has_update,
+        "catalog_known": plugin_info.get("catalog_known", True),
     }
 
 

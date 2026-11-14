@@ -11,7 +11,8 @@ import threading
 from typing import Any, Optional
 
 NAME = "W1bbex Hub"
-VERSION = "0.4.2"
+VERSION = "0.5.8"
+RELEASE_NOTES = "• В настройках можно выбрать частоту автопроверки, задать интервал в минутах или отключить её.\n• Hub и установленные плагины можно проверить вручную, даже если уведомления выключены."
 DESCRIPTION = "Официальный менеджер и загрузчик плагинов от W1bbex."
 CREDITS = "@W1bbex"
 PLUGIN_ID = "w1bbex_hub"
@@ -27,7 +28,7 @@ GITHUB_URL = "https://github.com/W1bbex"
 SUPPORT_URL = "https://t.me/w1bbex"
 RESTART_NOTICE_TTL_SECONDS = 1800.0
 SUPPORTED_PLUGIN_EXTENSIONS = (".py", ".pyd", ".so")
-CACHE_TTL_SECONDS = 600.0
+CACHE_TTL_SECONDS = 180.0
 CACHE_RETRY_COOLDOWN_SECONDS = 30.0
 UPDATE_CHECK_INTERVAL_SECONDS = 1800.0
 UPDATE_CHECK_INITIAL_DELAY_SECONDS = 10.0
@@ -38,12 +39,15 @@ CACHE_LOCK = threading.RLock()
 DATA_LOCK = threading.RLock()
 LOG_LOCK = threading.Lock()
 STOP_EVENT = threading.Event()
+UPDATE_WAKE_EVENT = threading.Event()
 CB_ANSWERED = object()
 
 PLUGINS_CACHE: dict[str, Any] = {
     "items": [],
     "fetched_at": 0.0,
     "last_attempt_at": 0.0,
+    "checked_at": 0.0,
+    "error": False,
 }
 
 logger = logging.getLogger("FPC.W1bbexHub")

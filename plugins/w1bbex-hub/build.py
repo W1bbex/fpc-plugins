@@ -46,7 +46,7 @@ def _read_runtime_metadata(src_dir: Path) -> dict[str, object]:
     """Read top-level Cardinal metadata constants from src/runtime.py via AST."""
     runtime_src = (src_dir / "runtime.py").read_text(encoding="utf-8")
     tree = ast.parse(runtime_src, filename=str(src_dir / "runtime.py"))
-    want = {"NAME", "VERSION", "DESCRIPTION", "CREDITS", "PLUGIN_ID", "SETTINGS_PAGE", "UUID", "COMMANDS"}
+    want = {"NAME", "VERSION", "RELEASE_NOTES", "DESCRIPTION", "CREDITS", "PLUGIN_ID", "SETTINGS_PAGE", "UUID", "COMMANDS"}
     meta: dict[str, object] = {}
     for node in tree.body:
         if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
@@ -73,6 +73,7 @@ def _render_bundle(sources: dict[str, str], meta: dict[str, object]) -> str:
         "import sys\n\n"
         f"NAME = {meta['NAME']!r}\n"
         f"VERSION = {meta['VERSION']!r}\n"
+        f"RELEASE_NOTES = {meta['RELEASE_NOTES']!r}\n"
         f"DESCRIPTION = {meta['DESCRIPTION']!r}\n"
         f"CREDITS = {meta['CREDITS']!r}\n"
         f"PLUGIN_ID = {meta['PLUGIN_ID']!r}\n"

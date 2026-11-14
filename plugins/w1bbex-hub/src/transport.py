@@ -1,0 +1,77 @@
+"""Telegram HTML transport with graceful styling and custom emoji fallbacks."""
+
+from __future__ import annotations
+
+import html
+from typing import Any, Callable
+
+from .runtime import CB_ANSWERED
+from .ui.icons import without_custom_emojis
+from .ui.kit import has_custom_button_icons, has_styled_buttons, strip_button_icons, strip_button_styles
+
+
+def _call_tg_html(invoke: Callable[[str, Any], Any], text: str, reply_markup: Any = None,
+                  ignore_not_modified: bool = False) -> Any:
+    """Retry only known Telegram presentation failures, preserving readable content."""
+    for _ in range(4):
+        try:
+            return invoke(text, reply_markup)
+        except Exception as exc:
+            reason = str(exc).lower()
+            if ignore_not_modified and "message is not modified" in reason:
+                return None
+            if any(word in reason for word in ("custom emoji", "custom_emoji", "premium", "emoticon", "document_invalid")):
+                plain_text = without_custom_emojis(text)
+                if plain_text != text or has_custom_button_icons(reply_markup):
+                    text = plain_text
+                    if reply_markup is not None:
+                        reply_markup = strip_button_icons(reply_markup)
+                    continue
+            if "style" in reason and has_styled_buttons(reply_markup):
+                reply_markup = strip_button_styles(reply_markup)
+                continue
+            if "can't parse entities" in reason and "<" in text:
+                plain_text = without_custom_emojis(text)
+                text = plain_text if plain_text != text else html.escape(text)
+                continue
+            raise
+    raise RuntimeError("Telegram rejected message presentation after compatibility retries")
+
+
+class TelegramTransport:
+    """Reusable message methods; Cardinal lifecycle and routing remain in handlers."""
+
+    def _ack(self, callback: Any, text: str | None = None) -> None:
+        if callback.id not in self._acked_callbacks:
+            self.bot.answer_callback_query(callback.id, text, show_alert=False)
+            self._acked_callbacks.add(callback.id)
+
+    def _alert(self, callback: Any, text: str, show_alert: bool = True) -> Any:
+        if callback.id in self._acked_callbacks:
+            if show_alert and getattr(callback, "message", None):
+                self._send_html(callback.message.chat.id, html.escape(text))
+        else:
+            self.bot.answer_callback_query(callback.id, text, show_alert=show_alert)
+            self._acked_callbacks.add(callback.id)
+        return CB_ANSWERED
+
+    def _send_html(self, chat_id: int, text: str, **kw: Any) -> Any:
+        markup = kw.pop("reply_markup", None)
+        return _call_tg_html(
+            lambda t, rm: self.bot.send_message(chat_id, t, parse_mode="HTML", **kw, reply_markup=rm),
+            text, markup,
+        )
+
+    def _edit_html(self, text: str, chat_id: int, message_id: int, **kw: Any) -> Any:
+        markup = kw.pop("reply_markup", None)
+        return _call_tg_html(
+            lambda t, rm: self.bot.edit_message_text(t, chat_id, message_id, parse_mode="HTML", **kw, reply_markup=rm),
+            text, markup, ignore_not_modified=True,
+        )
+
+    def _reply_html(self, message: Any, text: str, **kw: Any) -> Any:
+        markup = kw.pop("reply_markup", None)
+        return _call_tg_html(
+            lambda t, rm: self.bot.reply_to(message, t, parse_mode="HTML", **kw, reply_markup=rm),
+            text, markup,
+        )

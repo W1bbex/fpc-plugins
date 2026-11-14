@@ -1,131 +1,94 @@
-"""Pure formatting helpers for W1bbex Hub status badges, tree lines, and button captions."""
+"""Plain, consistent status captions, safe summaries, and masked license keys."""
 
 from __future__ import annotations
 
+from html import unescape
+from html.parser import HTMLParser
 from typing import Any, Optional
 
 from .kit import code, esc
 
 STATUS_BADGES: dict[str, tuple[str, str]] = {
-    "active": ("✅", "Активен и работает"),
-    "disabled": ("⏸", "Отключён в Cardinal"),
-    "restart_install": ("🔄", "Ждёт перезапуск · установка"),
-    "restart_update": ("🔄", "Ждёт перезапуск · обновление"),
-    "restart_delete": ("🔄", "Ждёт перезапуск · удаление"),
-    "broken_files": ("⚠️", "Файлы повреждены"),
-    "installed": ("📦", "Установлен на диск"),
-    "manual": ("🔧", "Установлен вручную"),
-    "not_installed": ("☁️", "Не установлен"),
+    "active": ("", "Работает"),
+    "disabled": ("", "Отключён в Cardinal"),
+    "restart_install": ("", "Установлен · нужен перезапуск"),
+    "restart_update": ("", "Обновлён · нужен перезапуск"),
+    "restart_delete": ("", "Удалён с диска · нужен перезапуск"),
+    "broken_files": ("", "Не найден загрузчик"),
+    "installed": ("", "Установлен на диск"),
+    "manual": ("", "Установлен вручную"),
+    "not_installed": ("", "Не установлен"),
 }
 
-SHORT_STATUS_LABELS: dict[str, str] = {
-    "active": "активен",
-    "disabled": "отключён",
-    "restart_install": "ждёт рестарт",
-    "restart_update": "ждёт рестарт",
-    "restart_delete": "ждёт рестарт",
-    "broken_files": "ошибка файлов",
-    "installed": "на диске",
-    "manual": "вручную",
-}
+
+class _PlainDescription(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)
+
+    def handle_starttag(self, tag: str, attrs: Any) -> None:
+        self.parts.append(" ")
+
+    def handle_endtag(self, tag: str) -> None:
+        self.parts.append(" ")
+
+
+def description_preview(raw: Any, limit: int = 100) -> str:
+    parser = _PlainDescription()
+    parser.feed(str(raw or ""))
+    text = " ".join(unescape("".join(parser.parts)).split()) or "Описание пока не добавлено"
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+
+def mask_key(key: Any) -> str:
+    value = str(key or "")
+    return f"{value[:4]}…{value[-4:]}" if len(value) > 10 else "•" * max(4, len(value))
 
 
 def format_command_lines(commands: list[tuple[str, str]]) -> list[str]:
-    """Build clean individual HTML lines for a plugin's command list."""
-    if not commands:
-        return []
-    lines: list[str] = []
+    lines = []
     for cmd, desc in commands[:5]:
-        normalized = cmd.strip().lstrip("/")
-        if not normalized:
-            continue
-        clean_desc = " ".join(desc.split())
-        if clean_desc:
-            lines.append(f"/{esc(normalized)} — <i>{esc(clean_desc)}</i>")
-        else:
-            lines.append(f"/{esc(normalized)}")
+        name = cmd.strip().lstrip("/")
+        if name:
+            label = " ".join(desc.split())
+            lines.append(f"/{esc(name)} — <i>{esc(label)}</i>" if label else f"/{esc(name)}")
     if len(commands) > 5:
         lines.append(f"<i>и ещё {len(commands) - 5}…</i>")
     return lines
 
 
 def format_primary_command(commands: list[tuple[str, str]]) -> Optional[str]:
-    """Return primary slash command preview (e.g. '/autosmm') without noisy auxiliary duplicates."""
-    if not commands:
-        return None
-    cmd = commands[0][0].strip().lstrip("/")
+    cmd = commands[0][0].strip().lstrip("/") if commands else ""
     return f"/{cmd}" if cmd else None
 
 
 def resolve_display_version(state: dict[str, Any]) -> str:
-    """Pick the most informative current version string for display."""
-    return str(
-        state.get("loaded_version")
-        or state.get("installed_version")
-        or state.get("latest_version")
-        or "1.0"
-    )
+    return str(state.get("loaded_version") or state.get("installed_version") or state.get("latest_version") or "?").lstrip("v")
+
+
+def catalog_caption(state: dict[str, Any]) -> str:
+    if state.get("has_update") and not state.get("needs_restart"):
+        return f"Обновление {state.get('latest_version') or ''}"
+    if state.get("status_code") == "not_installed":
+        return "Бесплатный" if state.get("is_free") else "Ключ сохранён" if state.get("has_key") else "Нужен ключ"
+    return STATUS_BADGES.get(str(state.get("status_code")), ("", "Неизвестный статус"))[1]
 
 
 def format_catalog_line(state: dict[str, Any]) -> str:
-    """Render one crisp tree line for a plugin inside the catalog overview."""
-    status = str(state.get("status_code") or "not_installed")
-    name_html = f"<b>{esc(state.get('name') or state.get('id'))}</b>"
-    latest = str(state.get("latest_version") or "1.0")
-    primary_cmd = format_primary_command(state.get("commands") or [])
-    cmd_part = f" · {esc(primary_cmd)}" if primary_cmd else ""
-
-    if status == "not_installed":
-        if state.get("is_free"):
-            icon, access = "🆓", "бесплатный"
-        elif state.get("has_key"):
-            icon, access = "🔑", "ключ сохранён"
-        else:
-            icon, access = "📦", "по ключу"
-        return f"{icon} {name_html} · {code(latest)} — {access}"
-
-    if state.get("has_update") and not state.get("needs_restart"):
-        curr = str(state.get("installed_version") or state.get("loaded_version") or "?")
-        return f"⬆️ {name_html} · {code(f'{curr} → {latest}')} — есть обновление{cmd_part}"
-
-    icon, _ = STATUS_BADGES.get(status, ("🔹", ""))
-    short_label = SHORT_STATUS_LABELS.get(status, status)
-    curr_ver = resolve_display_version(state)
-    return f"{icon} {name_html} · {code(curr_ver)} — {short_label}{cmd_part}"
+    command = format_primary_command(state.get("commands") or [])
+    return f"<b>{esc(state.get('name') or state.get('id'))}</b> · {esc(catalog_caption(state))}" + (f" · {esc(command)}" if command else "")
 
 
 def format_catalog_button(state: dict[str, Any]) -> tuple[str, Optional[str]]:
-    """Return concise inline button text and semantic Bot API style for a catalog item."""
-    name = str(state.get("name") or state.get("id") or "")
-    status = str(state.get("status_code") or "not_installed")
-    latest = str(state.get("latest_version") or "1.0")
-    curr = resolve_display_version(state)
-
-    if state.get("needs_restart"):
-        return f"🔄 {name} · рестарт", "success"
-    if state.get("has_update"):
-        return f"⬆️ {name} · {latest}", "success"
-    if status == "broken_files":
-        return f"⚠️ {name} · ошибка", "danger"
-    if status == "active":
-        return f"✅ {name} · {curr}", None
-    if status == "disabled":
-        return f"⏸ {name} · выкл", None
-    if status == "manual":
-        return f"🔧 {name} · {curr}", None
-    if status == "installed":
-        return f"📦 {name} · {curr}", None
-    if state.get("has_key"):
-        return f"🔑 {name} · готов", "primary"
-    if state.get("is_free"):
-        return f"🆓 {name} · {latest}", None
-    return f"📦 {name} · {latest}", None
+    return f"{state.get('name') or state.get('id')} · {catalog_caption(state)}", None
 
 
 def license_summary_text(state: dict[str, Any]) -> str:
-    """Render concise HTML license status for a plugin detail card."""
     if state.get("is_free"):
-        return "🆓 Бесплатный плагин"
+        return "Бесплатный плагин"
     if state.get("has_key"):
-        return f"🔑 Ключ: {code(state.get('masked_key') or '')}"
-    return "🔒 Требуется лицензионный ключ"
+        return "Ключ сохранён · проверяется при установке"
+    return "Для установки нужен лицензионный ключ"

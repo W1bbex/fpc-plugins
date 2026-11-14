@@ -29,6 +29,8 @@ def isolated_hub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     runtime.PLUGINS_CACHE["items"] = []
     runtime.PLUGINS_CACHE["fetched_at"] = 0.0
     runtime.PLUGINS_CACHE["last_attempt_at"] = 0.0
+    runtime.PLUGINS_CACHE["checked_at"] = 0.0
+    runtime.PLUGINS_CACHE["error"] = False
     runtime.STOP_EVENT.clear()
 
     yield cardinal_root
@@ -36,6 +38,11 @@ def isolated_hub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     runtime.PLUGINS_CACHE["items"] = []
     runtime.PLUGINS_CACHE["fetched_at"] = 0.0
     runtime.PLUGINS_CACHE["last_attempt_at"] = 0.0
+    runtime.PLUGINS_CACHE["checked_at"] = 0.0
+    runtime.PLUGINS_CACHE["error"] = False
+    loaded_handlers = sys.modules.get("src.handlers")
+    if loaded_handlers is not None and hasattr(loaded_handlers, "stop_hub"):
+        loaded_handlers.stop_hub()
     runtime.STOP_EVENT.set()
 
 
@@ -51,6 +58,32 @@ def make_fake_cardinal(fp_id=12345, fp_username="seller_test", authorized_users=
 
     cbq_routes: list[tuple] = []
     msg_routes: list[tuple] = []
+    user_states: dict[int, dict[int, dict]] = {}
+
+    def set_state(chat_id: int, message_id: int, user_id: int, state: str, data: dict | None = None) -> None:
+        user_states.setdefault(chat_id, {})[user_id] = {
+            "state": state,
+            "mid": message_id,
+            "data": data or {},
+        }
+
+    def get_state(chat_id: int, user_id: int) -> dict | None:
+        return user_states.get(chat_id, {}).get(user_id)
+
+    def clear_state(chat_id: int, user_id: int, del_msg: bool = False) -> None:
+        chat_states = user_states.get(chat_id)
+        if not chat_states or user_id not in chat_states:
+            return
+        mid = chat_states[user_id].get("mid")
+        del chat_states[user_id]
+        if not chat_states:
+            del user_states[chat_id]
+        if del_msg and mid is not None:
+            bot.delete_message(chat_id, mid)
+
+    def check_state(chat_id: int, user_id: int, state: str) -> bool:
+        entry = get_state(chat_id, user_id)
+        return bool(entry and entry.get("state") == state)
 
     tg = SimpleNamespace(
         bot=bot,
@@ -59,6 +92,11 @@ def make_fake_cardinal(fp_id=12345, fp_username="seller_test", authorized_users=
         msg_handler=lambda handler, **kw: msg_routes.append((handler, kw)),
         cbq_routes=cbq_routes,
         msg_routes=msg_routes,
+        user_states=user_states,
+        set_state=set_state,
+        get_state=get_state,
+        clear_state=clear_state,
+        check_state=check_state,
     )
 
     account = None

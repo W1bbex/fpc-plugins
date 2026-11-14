@@ -49,17 +49,24 @@ def test_process_key_input_escapes_html_and_retries_invalid_keys(
 
     bad_msg = SimpleNamespace(chat=SimpleNamespace(id=99), from_user=SimpleNamespace(id=42), text="WRONG-<key>")
     controller._process_key_input(bad_msg, orig_cb)
-    assert cardinal.telegram.bot.register_next_step_handler.called
+    assert cardinal.telegram.check_state(99, 42, controller.STATE_AWAIT_KEY)
+    assert not cardinal.telegram.bot.register_next_step_handler.called
 
-    slash_msg = SimpleNamespace(chat=SimpleNamespace(id=99), from_user=SimpleNamespace(id=42), text="/hub")
+    slash_msg = SimpleNamespace(chat=SimpleNamespace(id=99), from_user=SimpleNamespace(id=42, username="owner"), text="/hub")
+    monkeypatch.setattr(handlers, "fetch_hub_latest_version", lambda *a: (runtime.VERSION, False))
     controller._process_key_input(slash_msg, orig_cb)
-    assert cardinal.telegram.bot.clear_step_handler_by_chat_id.called
+    assert cardinal.telegram.get_state(99, 42) is None
+    assert not cardinal.telegram.bot.clear_step_handler_by_chat_id.called
 
+    controller.activate_key_handler(orig_cb)
+    assert cardinal.telegram.check_state(99, 42, controller.STATE_AWAIT_KEY)
     valid_msg = SimpleNamespace(chat=SimpleNamespace(id=99), from_user=SimpleNamespace(id=42), text="AO-123<&>test")
     controller._process_key_input(valid_msg, orig_cb)
+    assert cardinal.telegram.get_state(99, 42) is None
     assert storage.load_data()["keys"]["autooffline"] == "AO-123<&>test"
     _, sent_text = cardinal.telegram.bot.reply_to.call_args.args
-    assert "&lt;&amp;&gt;" in sent_text
+    assert valid_msg.text not in sent_text
+    assert "Ключ сохранён" in sent_text
     assert "Auto&lt;Offline&gt;" in sent_text
 
 
@@ -101,6 +108,7 @@ def test_update_checker_loop_sleeps_when_no_plugins_installed(
         return False
 
     monkeypatch.setattr(stop_event, "wait", fake_wait)
+    monkeypatch.setattr(handlers.UPDATE_WAKE_EVENT, "wait", fake_wait)
     handlers._update_checker_loop(make_fake_cardinal(), stop_event)
     assert wait_timeouts == [
         runtime.UPDATE_CHECK_INITIAL_DELAY_SECONDS,
@@ -112,6 +120,7 @@ def test_update_checker_loop_sleeps_when_no_plugins_installed(
 def test_run_update_check_cycle_preserves_concurrent_key_updates(
     isolated_hub: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(handlers, "notify_hub_update", lambda *args: 0)
     storage.save_data(
         {
             "keys": {"autooffline": "AO-1"},
@@ -187,8 +196,9 @@ def test_built_w1bbex_hub_bundle_matches_cardinal_and_server_contracts(tmp_path:
 
     fake_cardinal = make_fake_cardinal(authorized_users={1})
     controller = mod.init_cardinal(fake_cardinal)
-    assert len(fake_cardinal.telegram.cbq_routes) == 19
-    assert len(fake_cardinal.telegram.msg_routes) == 2
+    assert len(fake_cardinal.telegram.cbq_routes) == 34
+    assert len(fake_cardinal.telegram.msg_routes) == 3
+    assert callable(mod.BIND_TO_DELETE)
     assert controller is not None
     assert (cardinal_root / "storage" / "w1bbex" / "Hub" / "logs" / "w1bbex_hub.log").exists()
 
@@ -417,7 +427,11 @@ def test_hub_init_guards_missing_telegram_stop_hook_and_offline_catalog(
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    assert len(mod.BIND_TO_DELETE) == 1
+    assert callable(mod.BIND_TO_DELETE)
+    stop_ev = mod.BIND_TO_DELETE.__globals__["STOP_EVENT"]
+    stop_ev.clear()
+    mod.BIND_TO_DELETE(SimpleNamespace())
+    assert stop_ev.is_set()
 
     # When catalog is unavailable and plugin is not free/known locally, report catalog outage instead of key error
     cardinal = make_fake_cardinal(authorized_users={42})
@@ -479,7 +493,8 @@ def test_post_restart_preserves_marker_on_send_failure_and_delivers_hub_main_men
     delivered_btns = {btn.callback_data: btn for row in delivered_kb.keyboard for btn in row}
     assert f"W1bbex Hub обновлён до v{runtime.VERSION}" in delivered_text
     assert getattr(delivered_btns["hub:plugins_menu"], "style", None) == "success"
-    assert getattr(delivered_btns["hub:activate_key"], "style", None) == "primary"
+    assert "hub:licenses" in delivered_btns
+    assert "hub:settings" in delivered_btns
 
 
 def test_pre_init_fallback_delivers_when_post_init_is_stalled_and_skips_when_normal(
@@ -544,3 +559,183 @@ def test_pre_init_fallback_delivers_when_post_init_is_stalled_and_skips_when_nor
     cardinal.telegram.bot.send_message.side_effect = slow_send
     assert handlers.process_post_restart_notice(cardinal, retry_delay=0.0) is True
     assert concurrent_results == [False]
+
+
+def test_step_states_use_cardinal_user_states_and_preserve_foreign_states(
+    isolated_hub: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cardinal = make_fake_cardinal(authorized_users={42})
+    controller = handlers.init_cardinal(cardinal)
+    monkeypatch.setattr(handlers, "get_main_menu_content", lambda *a, **kw: ("Hub", None))
+    monkeypatch.setattr(controller, "_schedule_menu", lambda *args: None)
+
+    cb = SimpleNamespace(
+        id="cb-step",
+        data="hub:activate_key",
+        from_user=SimpleNamespace(id=42, username="owner"),
+        message=SimpleNamespace(chat=SimpleNamespace(id=-500), id=10, message_id=10),
+    )
+    controller.activate_key_handler(cb)
+    assert cardinal.telegram.check_state(-500, 42, controller.STATE_AWAIT_KEY)
+
+    stranger_msg = SimpleNamespace(
+        chat=SimpleNamespace(id=-500),
+        from_user=SimpleNamespace(id=999, username="intruder"),
+        text="отмена",
+    )
+    assert controller._is_hub_step_message(stranger_msg) is False
+    controller._handle_step_message(stranger_msg)
+    assert cardinal.telegram.check_state(-500, 42, controller.STATE_AWAIT_KEY)
+
+    cardinal.telegram.set_state(-500, 11, 42, "cardinal:ban_reason", {"target": "user"})
+    controller.wrap_cb(controller.main_menu)(cb)
+    assert cardinal.telegram.check_state(-500, 42, "cardinal:ban_reason")
+    assert controller._is_hub_step_message(
+        SimpleNamespace(chat=SimpleNamespace(id=-500), from_user=SimpleNamespace(id=42), text="anything")
+    ) is False
+
+    owner_msg = SimpleNamespace(chat=SimpleNamespace(id=-500), from_user=SimpleNamespace(id=42), text="/hub")
+    controller.hub_command(owner_msg)
+    assert cardinal.telegram.check_state(-500, 42, "cardinal:ban_reason")
+    controller.set_key_command(SimpleNamespace(chat=SimpleNamespace(id=-500), from_user=SimpleNamespace(id=42), text="!hub_key"))
+    assert cardinal.telegram.check_state(-500, 42, "cardinal:ban_reason")
+
+
+def test_wrap_cb_preserves_alerts_toasts_and_early_long_op_ack(
+    isolated_hub: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plugin_entry = {"id": "demo", "name": "Demo", "latest_version": "1.0", "is_free": False}
+    monkeypatch.setattr(handlers, "get_plugins", lambda: [plugin_entry])
+    cardinal = make_fake_cardinal(authorized_users={42})
+    controller = handlers.HubController(cardinal)
+    monkeypatch.setattr(controller, "_schedule_menu", lambda *args: None)
+
+    toast_cb = SimpleNamespace(
+        id="cb-toast",
+        data="hub:toast",
+        from_user=SimpleNamespace(id=42, username="owner"),
+        message=SimpleNamespace(chat=SimpleNamespace(id=777), id=10, message_id=10),
+    )
+    controller.wrap_cb(lambda c: controller._alert(c, "Готово", show_alert=False))(toast_cb)
+    cardinal.telegram.bot.answer_callback_query.assert_called_once_with(
+        "cb-toast", "Готово", show_alert=False
+    )
+    cardinal.telegram.bot.send_message.assert_not_called()
+
+    cardinal.telegram.bot.answer_callback_query.reset_mock()
+    remind_cb = SimpleNamespace(
+        id="cb-remind",
+        data="hub:remind:demo:1.0",
+        from_user=SimpleNamespace(id=42, username="owner"),
+        message=SimpleNamespace(chat=SimpleNamespace(id=777), id=10, message_id=10),
+    )
+    controller.wrap_cb(lambda c: controller.remind_handler(c, "demo:1.0"))(remind_cb)
+    cardinal.telegram.bot.answer_callback_query.assert_called_once_with(
+        "cb-remind", "Напоминание отложено на 24 часа", show_alert=True
+    )
+    cardinal.telegram.bot.send_message.assert_not_called()
+
+    cardinal.telegram.bot.answer_callback_query.reset_mock()
+    invalid_cb = SimpleNamespace(
+        id="cb-alert",
+        data="hub:install:",
+        from_user=SimpleNamespace(id=42, username="owner"),
+        message=SimpleNamespace(chat=SimpleNamespace(id=777), id=10, message_id=10),
+    )
+    controller.wrap_cb(lambda c: controller.install_plugin(c, None))(invalid_cb)
+    cardinal.telegram.bot.answer_callback_query.assert_called_once_with(
+        "cb-alert", "Некорректный идентификатор плагина", show_alert=True
+    )
+    cardinal.telegram.bot.send_message.assert_not_called()
+
+    cardinal.telegram.bot.answer_callback_query.reset_mock()
+    storage.save_data({"keys": {"demo": "DM-123"}})
+    monkeypatch.setattr(handlers, "download_plugin", MagicMock(side_effect=RuntimeError("download crash")))
+    early_cb = SimpleNamespace(
+        id="cb-early",
+        data="hub:install:demo",
+        from_user=SimpleNamespace(id=42, username="owner"),
+        message=SimpleNamespace(chat=SimpleNamespace(id=777), id=10, message_id=10),
+    )
+    controller.wrap_cb(lambda c: controller.install_plugin(c, "demo"))(early_cb)
+    cardinal.telegram.bot.answer_callback_query.assert_called_once_with(
+        "cb-early", "Устанавливаю Demo", show_alert=False
+    )
+    assert cardinal.telegram.bot.send_message.call_count == 1
+    assert not controller._acked_callbacks
+
+
+def test_run_update_check_cycle_guards_missing_telegram_or_bot(isolated_hub: Path) -> None:
+    storage.save_data({"owner_tg_id": 777, "auto_check_updates": True, "notify_updates": True})
+    assert handlers.run_update_check_cycle(SimpleNamespace(telegram=None)) == 0
+    assert handlers.run_update_check_cycle(SimpleNamespace(telegram=SimpleNamespace(bot=None))) == 0
+
+
+def test_reload_restarts_update_loop_survives_oserror_and_cancels_timer(
+    isolated_hub: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import time
+
+    seen_cardinals: list[int] = []
+    first_ran = threading.Event()
+    second_cycle_after_err = threading.Event()
+    reloaded_ran = threading.Event()
+    oserror_raised = threading.Event()
+    raise_oserror = [True]
+    real_load = handlers.load_data
+
+    def flaky_load():
+        if raise_oserror[0]:
+            raise_oserror[0] = False
+            oserror_raised.set()
+            raise PermissionError("temporary lock")
+        return real_load()
+
+    def fake_cycle(cardinal):
+        cid = cardinal.tag
+        seen_cardinals.append(cid)
+        if cid == 1:
+            if not first_ran.is_set():
+                first_ran.set()
+            else:
+                second_cycle_after_err.set()
+        elif cid == 2:
+            reloaded_ran.set()
+        return 0
+
+    monkeypatch.setattr(handlers, "UPDATE_CHECK_INITIAL_DELAY_SECONDS", 0.0)
+    monkeypatch.setattr(handlers, "run_update_check_cycle", fake_cycle)
+    monkeypatch.setattr(handlers, "load_data", flaky_load)
+
+    c1 = make_fake_cardinal(authorized_users={42})
+    c1.tag = 1
+    handlers.custom_init(c1)
+    assert first_ran.wait(2)
+    assert oserror_raised.wait(2)
+    handlers.wake_update_checker()
+    assert second_cycle_after_err.wait(2)
+    t1 = handlers._UPDATE_THREAD
+
+    storage.save_pending_restart({"action": "hub", "chat_id": 777, "target_version": runtime.VERSION})
+    handlers.post_init_cardinal(c1)
+    timer = handlers._POST_RESTART_TIMER
+    assert timer is not None
+
+    handlers.stop_hub()
+    assert getattr(timer, "finished", None) is not None and timer.finished.is_set()
+    assert handlers._POST_RESTART_TIMER is None
+
+    c2 = make_fake_cardinal(authorized_users={42})
+    c2.tag = 2
+    handlers.custom_init(c2)
+    assert reloaded_ran.wait(2)
+    t2 = handlers._UPDATE_THREAD
+    assert t2 is not None and t2 is not t1
+    if t1 is not None:
+        t1.join(timeout=2)
+        assert not t1.is_alive()
+
+    handlers.stop_hub()
+    if t2 is not None:
+        t2.join(timeout=2)
+    time.sleep(0.01)
