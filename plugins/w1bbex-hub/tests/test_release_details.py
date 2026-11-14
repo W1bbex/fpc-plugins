@@ -9,6 +9,14 @@ from conftest import make_fake_cardinal
 from src import handlers, navigation, release_notes, runtime
 from src.ui.outcomes import render_hub_release
 from test_hub_navigation import callback
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def reset_release_cache():
+    release_notes.clear_release_notes_cache()
+    yield
+    release_notes.clear_release_notes_cache()
 
 
 def test_release_metadata_comes_from_downloaded_artifact(monkeypatch):
@@ -26,8 +34,27 @@ def test_release_metadata_comes_from_downloaded_artifact(monkeypatch):
 def test_release_metadata_network_failure_is_explicit(monkeypatch):
     monkeypatch.setattr(release_notes.requests, "get", MagicMock(side_effect=requests.Timeout()))
     assert release_notes.fetch_release_notes() == (None, None)
-    text, _ = render_hub_release("0.5.7", None, None)
+    text, keyboard = render_hub_release("0.5.7", None, None)
     assert "неизвестна" in text and "Описание изменений пока недоступно" in text
+    assert keyboard.keyboard[0][0].callback_data == "hub:update_hub"
+
+
+def test_release_notes_caching_avoids_repeated_network_calls(monkeypatch):
+    call_count = 0
+    def fake_get(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        resp = MagicMock()
+        resp.__enter__.return_value = resp
+        resp.iter_content.return_value = iter([b"VERSION = '0.7.0'\nRELEASE_NOTES = 'Cached changelog'\n"])
+        return resp
+
+    monkeypatch.setattr(release_notes.requests, "get", fake_get)
+    ver1, notes1 = release_notes.fetch_release_notes()
+    ver2, notes2 = release_notes.fetch_release_notes()
+    assert ver1 == ver2 == "0.7.0"
+    assert notes1 == notes2 == "Cached changelog"
+    assert call_count == 1  # Second call served from in-memory cache
 
 
 def test_release_screen_loads_in_background_and_does_not_download(isolated_hub, monkeypatch):

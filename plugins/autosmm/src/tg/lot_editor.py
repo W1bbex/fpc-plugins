@@ -106,8 +106,8 @@ def _show_lot_card(
         f"ID услуги: <code>{h(fallback_id)}</code>",
     ]).strip()
 
-    kb_ = InlineKeyboardMarkup(row_width=1)
-    kb_.add(
+    has_fallback = (ld_.get("fallback_service_number") is not None) or (ld_.get("fallback_service_id") is not None)
+    buttons = [
         InlineKeyboardButton("Изменить название", callback_data=_encode_callback_value("asmm:change_name_", lot_key)),
         InlineKeyboardButton("Изменить ID услуги", callback_data=_encode_callback_value("asmm:change_id_", lot_key)),
         InlineKeyboardButton("Изменить количество", callback_data=_encode_callback_value("asmm:change_quantity_", lot_key)),
@@ -115,9 +115,17 @@ def _show_lot_card(
         InlineKeyboardButton(f"🔗 Формат ссылки: {cur_fmt_label}", callback_data=_encode_callback_value("asmm:cycle_link_fmt_", lot_key)),
         InlineKeyboardButton("Изменить номер резервной панели", callback_data=_encode_callback_value("asmm:change_fallback_snum_", lot_key)),
         InlineKeyboardButton("Изменить ID резервной услуги", callback_data=_encode_callback_value("asmm:change_fallback_id_", lot_key)),
+    ]
+    if has_fallback:
+        buttons.append(InlineKeyboardButton("❌ Сбросить резервную панель", callback_data=_encode_callback_value("asmm:clear_fallback_", lot_key)))
+    buttons.extend([
         InlineKeyboardButton("❌ Удалить лот", callback_data=_encode_callback_value("asmm:delete_one_lot_", lot_key)),
         InlineKeyboardButton(back_label, callback_data=back_callback),
-    )
+    ])
+
+    kb_ = InlineKeyboardMarkup(row_width=1)
+    for btn in buttons:
+        kb_.add(btn)
 
     if message_id is not None:
         _safe_edit_message_text(txt_, chat_id, message_id, parse_mode="HTML", reply_markup=kb_)
@@ -334,7 +342,25 @@ def process_service_num_change(message: types.Message, lot_key: str) -> None:
 
 
 def process_fallback_snum_change(message: types.Message, lot_key: str) -> None:
-    new_snum = _parse_int_or_repeat(message, "❌ Ошибка: введите номер резервной панели положительным числом.", min_value=1)
+    raw_text = str(getattr(message, "text", None) or "").strip().lower()
+    if raw_text in ("0", "-", "отключить", "сброс", "нет", "none", "off", "откл", "отмена"):
+        with CONFIG_LOCK:
+            cfg = load_config()
+            lot_map = cfg.get("lot_mapping", {})
+            if lot_key in lot_map:
+                target_lot = lot_map[lot_key]
+                target_lot["fallback_service_number"] = None
+                target_lot["fallback_service_id"] = None
+                cfg["lot_mapping"] = lot_map
+                reindex_lots(cfg)
+        _finish_lot_edit(message, lot_key, f"✅ Резервная панель для {h(lot_key)} отключена.")
+        return
+
+    new_snum = _parse_int_or_repeat(
+        message,
+        "❌ Ошибка: введите номер резервной панели (положительное число) или 0 / «отключить» для сброса.",
+        min_value=1,
+    )
     if new_snum is not None:
         _apply_lot_field_update(
             message, lot_key, "fallback_service_number", new_snum,
@@ -343,7 +369,24 @@ def process_fallback_snum_change(message: types.Message, lot_key: str) -> None:
 
 
 def process_fallback_id_change(message: types.Message, lot_key: str) -> None:
-    new_id = _parse_int_or_repeat(message, "❌ Ошибка: ID резервной услуги должен быть положительным числом.", min_value=1)
+    raw_text = str(getattr(message, "text", None) or "").strip().lower()
+    if raw_text in ("0", "-", "отключить", "сброс", "нет", "none", "off", "откл", "отмена"):
+        with CONFIG_LOCK:
+            cfg = load_config()
+            lot_map = cfg.get("lot_mapping", {})
+            if lot_key in lot_map:
+                target_lot = lot_map[lot_key]
+                target_lot["fallback_service_id"] = None
+                cfg["lot_mapping"] = lot_map
+                reindex_lots(cfg)
+        _finish_lot_edit(message, lot_key, f"✅ ID резервной услуги для {h(lot_key)} сброшен.")
+        return
+
+    new_id = _parse_int_or_repeat(
+        message,
+        "❌ Ошибка: введите ID резервной услуги (положительное число) или 0 / «отключить» для сброса.",
+        min_value=1,
+    )
     if new_id is not None:
         _apply_lot_field_update(message, lot_key, "fallback_service_id", new_id, f"✅ ID резервной услуги для {h(lot_key)} изменён на {h(new_id)}.")
 
@@ -451,6 +494,30 @@ def change_fallback_id_prompt(call: types.CallbackQuery) -> None:
         "Введите ID резервной услуги для",
         process_fallback_id_change,
     )
+
+
+def clear_fallback_callback(call: types.CallbackQuery) -> None:
+    chat_id, message_id, _ = _extract_call_ids(call)
+    if chat_id is None:
+        _safe_answer_callback(call)
+        return
+    lot_key = _decode_prefixed_lot_key(call, "asmm:clear_fallback_")
+    if not lot_key:
+        _dispatch_navigation_callback(call, "asmm:lot_settings")
+        return
+
+    with CONFIG_LOCK:
+        cfg = load_config()
+        lot_map = cfg.get("lot_mapping", {})
+        if lot_key in lot_map:
+            target_lot = lot_map[lot_key]
+            target_lot["fallback_service_number"] = None
+            target_lot["fallback_service_id"] = None
+            cfg["lot_mapping"] = lot_map
+            reindex_lots(cfg)
+
+    _safe_answer_callback(call, "Резервная панель сброшена")
+    _show_lot_card(chat_id, lot_key, message_id)
 
 
 def add_new_lot(call: types.CallbackQuery) -> None:

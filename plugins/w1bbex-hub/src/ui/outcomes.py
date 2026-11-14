@@ -114,7 +114,10 @@ def render_hub_release(current: str, latest: Optional[str], notes: Optional[str]
     card.quote(esc(("Загружаем описание…" if loading else (notes or "Описание изменений пока недоступно"))[:2500]))
     kb = KeyboardBuilder()
     if not loading:
-        kb.row(Btn("Обновить Hub", "hub:download_hub", style="success", icon="download"))
+        if latest:
+            kb.row(Btn("Обновить Hub", "hub:download_hub", style="success", icon="download"))
+        else:
+            kb.row(Btn("Повторить проверку", "hub:update_hub", style="primary", icon="refresh"))
     kb.row(Btn("Назад", "hub:main", style="danger", icon="back"))
     return card.build(), kb.build()
 

@@ -1128,6 +1128,111 @@ class AutoSmmRegressionsTests(unittest.TestCase):
         self.assertEqual(stats["day_total"], 100.0)  # Excludes refunded 50.0
         self.assertEqual(stats["day_chistota"], 40.0)
 
+    def test_lot_editor_clearing_fallback_panel_via_prompt_and_button(self):
+        from src.tg import lot_editor as tg_lot_editor
+        cfg = {
+            "lot_mapping": {
+                "lot_1": {
+                    "name": "Test Lot",
+                    "service_number": 1,
+                    "service_id": 10,
+                    "fallback_service_number": 2,
+                    "fallback_service_id": 20,
+                }
+            },
+            "services": {"1": {}, "2": {}},
+        }
+        sent_messages = []
+        fake_bot = SimpleNamespace(
+            send_message=lambda cid, txt, **kw: sent_messages.append((cid, txt, kw.get("reply_markup"))),
+            edit_message_text=lambda txt, cid, mid, **kw: sent_messages.append((cid, txt, kw.get("reply_markup"))),
+            answer_callback_query=lambda *a, **kw: True,
+            clear_step_handler_by_chat_id=lambda cid: None,
+        )
+        orig_bot = rt.bot
+        try:
+            rt.bot = fake_bot
+            with (
+                mock.patch.object(tg_lot_editor, "load_config", return_value=cfg),
+                mock.patch.object(tg_lot_editor, "save_config"),
+            ):
+                # 1. Test clearing via prompt entering "0" for fallback_snum
+                msg0 = SimpleNamespace(chat=SimpleNamespace(id=10), from_user=SimpleNamespace(id=42), text="0")
+                tg_lot_editor.process_fallback_snum_change(msg0, "lot_1")
+                self.assertIsNone(cfg["lot_mapping"]["lot_1"]["fallback_service_number"])
+                self.assertIsNone(cfg["lot_mapping"]["lot_1"]["fallback_service_id"])
+
+                # Restore fallback values
+                cfg["lot_mapping"]["lot_1"]["fallback_service_number"] = 2
+                cfg["lot_mapping"]["lot_1"]["fallback_service_id"] = 20
+
+                # 2. Test clearing via prompt entering "отключить" for fallback_id
+                msg_off = SimpleNamespace(chat=SimpleNamespace(id=10), from_user=SimpleNamespace(id=42), text="отключить")
+                tg_lot_editor.process_fallback_id_change(msg_off, "lot_1")
+                self.assertIsNone(cfg["lot_mapping"]["lot_1"]["fallback_service_id"])
+
+                # Restore fallback values
+                cfg["lot_mapping"]["lot_1"]["fallback_service_number"] = 2
+                cfg["lot_mapping"]["lot_1"]["fallback_service_id"] = 20
+
+                # 3. Test clearing via callback button asmm:clear_fallback_
+                call = SimpleNamespace(
+                    data="asmm:clear_fallback_lot_1",
+                    message=SimpleNamespace(chat=SimpleNamespace(id=10), message_id=123),
+                    from_user=SimpleNamespace(id=42),
+                    id="cb_123",
+                )
+                tg_lot_editor.clear_fallback_callback(call)
+                self.assertIsNone(cfg["lot_mapping"]["lot_1"]["fallback_service_number"])
+                self.assertIsNone(cfg["lot_mapping"]["lot_1"]["fallback_service_id"])
+        finally:
+            rt.bot = orig_bot
+
+    def test_lot_card_displays_clear_fallback_button_only_when_configured(self):
+        from src.tg import lot_editor as tg_lot_editor
+        cfg = {
+            "lot_mapping": {
+                "lot_1": {
+                    "name": "Test Lot",
+                    "service_number": 1,
+                    "service_id": 10,
+                    "fallback_service_number": 2,
+                    "fallback_service_id": 20,
+                },
+                "lot_2": {
+                    "name": "No Fallback Lot",
+                    "service_number": 1,
+                    "service_id": 10,
+                    "fallback_service_number": None,
+                    "fallback_service_id": None,
+                },
+            },
+            "services": {"1": {}, "2": {}},
+        }
+        sent = []
+        fake_bot = SimpleNamespace(
+            send_message=lambda cid, txt, **kw: sent.append(kw.get("reply_markup")),
+            edit_message_text=lambda txt, cid, mid, **kw: sent.append(kw.get("reply_markup")),
+            clear_step_handler_by_chat_id=lambda cid: None,
+        )
+        orig_bot = rt.bot
+        try:
+            rt.bot = fake_bot
+            with mock.patch.object(tg_lot_editor, "load_config", return_value=cfg):
+                # lot_1 with fallback -> clear fallback button present
+                tg_lot_editor._show_lot_card(10, "lot_1", message_id=100)
+                kb1 = sent[-1]
+                has_clear_btn1 = any("asmm:clear_fallback_" in getattr(btn, "callback_data", "") for row in kb1.keyboard for btn in row)
+                self.assertTrue(has_clear_btn1)
+
+                # lot_2 without fallback -> clear fallback button absent
+                tg_lot_editor._show_lot_card(10, "lot_2", message_id=101)
+                kb2 = sent[-1]
+                has_clear_btn2 = any("asmm:clear_fallback_" in getattr(btn, "callback_data", "") for row in kb2.keyboard for btn in row)
+                self.assertFalse(has_clear_btn2)
+        finally:
+            rt.bot = orig_bot
+
 
 if __name__ == "__main__":
     unittest.main()

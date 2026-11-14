@@ -6,7 +6,7 @@
 
 [![Version](https://img.shields.io/badge/Version-1.0-F59E0B?style=for-the-badge)](./AutoSMM.py)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/tests-178%20passed-22C55E?style=for-the-badge)](#%EF%B8%8F-%D1%81%D0%B1%D0%BE%D1%80%D0%BA%D0%B0-%D0%B8-%D1%82%D0%B5%D1%81%D1%82%D1%8B)
+[![Tests](https://img.shields.io/badge/tests-180%20passed-22C55E?style=for-the-badge)](#%EF%B8%8F-%D1%81%D0%B1%D0%BE%D1%80%D0%BA%D0%B0-%D0%B8-%D1%82%D0%B5%D1%81%D1%82%D1%8B)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)](./LICENSE)
 
 </div>

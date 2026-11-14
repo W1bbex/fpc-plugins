@@ -161,12 +161,14 @@ class HubNavigation:
             background.serial += 1
             serial = background.serial
             background.views[(chat, message)] = serial
-        text, keyboard = render_hub_release(VERSION, None, None, loading=True)
+            cached_ver, _ = background.version if background.version else (None, False)
+        text, keyboard = render_hub_release(VERSION, cached_ver if cached_ver else None, None, loading=True)
         self._edit_html(text, chat, message, reply_markup=keyboard)
 
         def refresh() -> None:
             latest, notes = fetch_release_notes()
-            body, markup = render_hub_release(VERSION, latest, notes)
+            resolved_latest = latest or cached_ver
+            body, markup = render_hub_release(VERSION, resolved_latest, notes)
             with background.lock:
                 should_edit = not STOP_EVENT.is_set() and background.views.get((chat, message)) == serial
             if should_edit:

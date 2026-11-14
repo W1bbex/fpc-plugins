@@ -55,6 +55,7 @@ from .tg.lot_editor import (
     change_name,
     change_quantity,
     change_snum,
+    clear_fallback_callback,
     cycle_link_fmt_callback,
     lot_input_back_callback,
 )
@@ -237,6 +238,7 @@ _EXACT_CALLBACK_ROUTES: List[Tuple[str, Callable[[types.CallbackQuery], Any]]] =
 ]
 
 _PREFIX_CALLBACK_ROUTES: List[Tuple[str, Callable[[types.CallbackQuery], Any]]] = [
+    ("asmm:clear_fallback_", clear_fallback_callback),
     ("asmm:change_fallback_snum_", change_fallback_snum_prompt),
     ("asmm:change_fallback_id_", change_fallback_id_prompt),
     ("asmm:delete_website_", remove_website_prompt),
