@@ -84,13 +84,16 @@ def normalize_chat_id(value: Any) -> Any:
 
 
 def safe_float(value: Any, default: float = 0.0) -> float:
-    """Parse a float safely with fallback default."""
+    """Parse a float safely with fallback default, supporting comma decimals."""
     if value is None or isinstance(value, bool):
         return default
     try:
         return float(value)
     except (ValueError, TypeError):
-        return default
+        try:
+            return float(str(value).replace(",", ".").strip())
+        except (ValueError, TypeError):
+            return default
 
 
 def optional_float(value: Any) -> Optional[float]:

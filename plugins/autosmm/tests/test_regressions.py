@@ -896,6 +896,125 @@ class AutoSmmRegressionsTests(unittest.TestCase):
         self.assertFalse(ok_backup)
         self.assertIn("api_url", backup_msg)
 
+    def test_resolve_event_shard_key_unifies_order_and_message_events_for_same_buyer(self):
+        fake_mods = _build_fake_funpay_modules()
+        with mock.patch.dict(sys.modules, fake_mods):
+            orig_events_mod = sys.modules.get("src.core.funpay_events")
+            sys.modules.pop("src.core.funpay_events", None)
+            try:
+                mod = importlib.import_module("src.core.funpay_events")
+                order_evt = fake_mods["FunPayAPI.updater.events"].NewOrderEvent()
+                order_evt.order = SimpleNamespace(id="12345", buyer_username="alex_smith", chat_id=None)
+                msg_evt = fake_mods["FunPayAPI.updater.events"].NewMessageEvent()
+                msg_evt.message = SimpleNamespace(author="alex_smith", author_id=77, chat_id=999)
+
+                key_order = mod._resolve_event_shard_key(order_evt)
+                key_msg = mod._resolve_event_shard_key(msg_evt)
+                self.assertEqual(key_order, "user:alex_smith")
+                self.assertEqual(key_msg, "user:alex_smith")
+            finally:
+                sys.modules.pop("src.core.funpay_events", None)
+                if orig_events_mod is not None:
+                    sys.modules["src.core.funpay_events"] = orig_events_mod
+
+    def test_currency_cache_rates_parses_comma_floats_without_value_error(self):
+        from src.services import currency
+
+        with mock.patch.object(currency, "_load_persisted_fx_cache", return_value={"fetched_at": 1000.0, "rates": {"USD": "92,45", "EUR": 100.5}}):
+            rates, is_fresh = currency._get_cached_rates(now_ts=1050.0, ttl_seconds=3600)
+            self.assertTrue(is_fresh)
+            self.assertEqual(rates["USD"], 92.45)
+            self.assertEqual(rates["EUR"], 100.5)
+            self.assertEqual(rates["RUB"], 1.0)
+
+    def test_buyer_orders_sorts_float_created_at_and_order_price_without_value_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "autosmm.db"
+            with mock.patch.object(rt, "DB_PATH", str(db_path)):
+                db.init_db(str(db_path))
+                ok = buyer_flow._upsert_buyer_flow_order_record(
+                    chat_id=123,
+                    buyer_id=456,
+                    buyer_username="buyer1",
+                    order_id_funpay="FP-TEST-1",
+                    lot_title="Followers",
+                    order_price="150,50",
+                    order_amount=1,
+                    service_id=10,
+                    real_amount=100,
+                    service_number=1,
+                )
+                self.assertTrue(ok)
+                record = db_orders.get_order("FP-TEST-1")
+                self.assertEqual(record["summa"], 150.50)
+
+                record2 = dict(record)
+                record2["order_id"] = "FP-TEST-2"
+                record2["created_at"] = "2000000000.5"
+                db_orders.upsert_order_dict(record2)
+
+                orders_list = buyer_flow._get_buyer_orders(456, 123)
+                self.assertEqual(len(orders_list), 2)
+                self.assertEqual(orders_list[0]["order_id"], "FP-TEST-2")
+
+    def test_panel_status_without_currency_defaults_to_order_or_panel_currency(self):
+        from src.core import panel_errors
+
+        entry = {"status": "Completed", "charge": "25.00"}
+        parsed = panel_errors._build_status_result_from_entry(entry)
+        self.assertTrue(parsed["ok"])
+        self.assertIsNone(parsed["currency"])
+        self.assertEqual(parsed["charge"], "25.00")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "autosmm.db"
+            with mock.patch.object(rt, "DB_PATH", str(db_path)):
+                db.init_db(str(db_path))
+                db_orders.upsert_order_dict({
+                    "order_id": "ORD-RUB-1",
+                    "summa": 50.0,
+                    "currency": "RUB",
+                    "service_number": 1,
+                    "status": "pending",
+                })
+                rec = db_orders.get_order("ORD-RUB-1")
+                fake_cardinal = SimpleNamespace(account=None, send_message=mock.MagicMock())
+                orders._apply_status_result(fake_cardinal, rec, parsed)
+                updated = db_orders.get_order("ORD-RUB-1")
+                self.assertEqual(updated["currency"], "RUB")
+                self.assertEqual(updated["spent"], 25.0)
+                self.assertEqual(updated["chistota"], 25.0)
+
+    def test_buyer_flow_unpauses_paused_order_when_link_is_received(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "autosmm.db"
+            with mock.patch.object(rt, "DB_PATH", str(db_path)):
+                db.init_db(str(db_path))
+                db_orders.upsert_order_dict({
+                    "order_id": "ORD-PAUSED-1",
+                    "buyer_id": 999,
+                    "chat_id": 888,
+                    "buyer_flow_state": buyer_flow.BUYER_STATE_LINK_PAUSED,
+                    "service_number": 1,
+                    "service_id": 10,
+                    "quantity": 100,
+                    "summa": 50.0,
+                    "lot_title": "Telegram Followers",
+                    "status": "pending",
+                })
+                fake_cardinal = SimpleNamespace(account=None, send_message=mock.MagicMock())
+                with mock.patch.object(buyer_flow, "is_valid_buyer_target", return_value=(True, "valid")):
+                    handled = buyer_flow._handle_buyer_flow_message(
+                        fake_cardinal,
+                        "https://t.me/test_channel",
+                        999,
+                        888,
+                    )
+                    self.assertTrue(handled)
+                updated = db_orders.get_order("ORD-PAUSED-1")
+                self.assertEqual(updated["buyer_flow_state"], buyer_flow.BUYER_STATE_WAITING_CONFIRM)
+                self.assertEqual(updated["saved_link"], "https://t.me/test_channel")
+
 
 if __name__ == "__main__":
     unittest.main()

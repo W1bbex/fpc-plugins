@@ -149,7 +149,11 @@ def _fetch_start_notification_charge(
             return None, None, None, None, None
 
         charge = safe_float(status_data.get("charge"), 0.0)
-        currency = normalize_currency_code(status_data.get("currency", "USD"))
+        raw_currency = status_data.get("currency")
+        if raw_currency not in (None, ""):
+            currency = normalize_currency_code(raw_currency)
+        else:
+            currency = normalize_currency_code(order_record.get("currency", "RUB"))
         fx_info = compute_order_profit_rub(lot_price, charge, currency)
         try:
             update_order_charge_and_net(

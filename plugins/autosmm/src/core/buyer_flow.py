@@ -15,6 +15,8 @@ from .. import runtime as rt
 from ..models import (
     is_order_refundedish as _is_order_refundedish,
     normalize_funpay_status as _normalize_funpay_status,
+    safe_float,
+    safe_int,
 )
 from ..services.notifications import _send_admin_order_alert
 from ..storage import db_orders
@@ -119,7 +121,7 @@ def _upsert_buyer_flow_order_record(
             ):
                 return False
 
-        created_at = int(base.get("created_at") or time.time())
+        created_at = int(safe_float(base.get("created_at"), time.time()))
         resolved_lot_key = lot_key if lot_key not in (None, "") else base.get("lot_key")
         resolved_funpay_status = (
             "refunded"
@@ -146,9 +148,9 @@ def _upsert_buyer_flow_order_record(
             "funpay_status": resolved_funpay_status,
             "buyer_flow_state": state,
             "saved_link": effective_saved_link,
-            "spent": float(base.get("spent", 0.0) or 0.0),
-            "summa": float(order_price if order_price not in (None, "") else base.get("summa", 0) or 0),
-            "chistota": float(base.get("chistota", 0.0) or 0.0),
+            "spent": safe_float(base.get("spent", 0.0), 0.0),
+            "summa": safe_float(order_price if order_price not in (None, "") else base.get("summa", 0.0), 0.0),
+            "chistota": safe_float(base.get("chistota", 0.0), 0.0),
             "currency": str(base.get("currency", "RUB") or "RUB"),
             "created_at": created_at,
             "date": base.get("date") or base.get("date_str") or now_str_val,
@@ -268,7 +270,7 @@ def _get_buyer_orders(buyer_id: Any, chat_id: Any) -> List[Dict]:
         order_record for order_record in load_orders_data()
         if isinstance(order_record, dict) and _buyer_owns_order(order_record, buyer_id, chat_id)
     ]
-    result.sort(key=lambda item: int(item.get("created_at") or 0), reverse=True)
+    result.sort(key=lambda item: safe_float(item.get("created_at"), 0.0), reverse=True)
     return result
 
 
@@ -661,7 +663,18 @@ def _handle_buyer_flow_message(c: "Cardinal", msg_text: str, buyer_id: Any, chat
                 if _has_panel_order(latest_order) or _get_buyer_flow_state(latest_order) in (BUYER_STATE_PANEL_CREATED, BUYER_STATE_FAILED):
                     _send_buyer_message(c, chat_id, BUYER_PANEL_CREATED_BLOCK_TEXT)
                     return True
-        return False
+                if _get_buyer_flow_state(latest_order) == BUYER_STATE_LINK_PAUSED:
+                    order_id = str(latest_order.get("order_id"))
+                    with rt.CONTEXT_LOCK:
+                        cached = rt.waiting_for_link.get(order_id)
+                        ctx = dict(cached) if isinstance(cached, dict) else None
+                    if ctx is None:
+                        ctx = _build_waiting_context_from_order(latest_order) or {}
+                    _transition_waiting_state(ctx, order_id, buyer_id, chat_id, BUYER_STATE_WAITING_LINK, select_order=True)
+                    latest_order["buyer_flow_state"] = BUYER_STATE_WAITING_LINK
+                    candidates = [latest_order]
+        if not candidates:
+            return False
 
     order_record = _choose_waiting_candidate(buyer_id, chat_id, candidates)
     if not order_record:

@@ -448,7 +448,7 @@ def _build_status_result_from_entry(entry: Any) -> Dict:
                 "ok": True,
                 "status": _normalize_runtime_status(status_value),
                 "charge": entry.get("charge", "0"),
-                "currency": entry.get("currency", "USD"),
+                "currency": entry.get("currency"),
                 "remains": entry.get("remains"),
                 "start_count": entry.get("start_count"),
                 "raw": entry,
@@ -461,7 +461,7 @@ def _build_status_result_from_entry(entry: Any) -> Dict:
                 "ok": True,
                 "status": norm_status,
                 "charge": "0",
-                "currency": "USD",
+                "currency": None,
                 "raw": entry,
             }
 

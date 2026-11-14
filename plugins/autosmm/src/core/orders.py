@@ -15,7 +15,7 @@ from ..models import (
     safe_float as _safe_float,
 )
 from ..services import analytics
-from ..services.currency import compute_order_profit_rub
+from ..services.currency import compute_order_profit_rub, normalize_currency_code
 from ..services.notifications import (
     _send_completion_notification_if_needed,
     _send_manual_check_alert_once,
@@ -41,6 +41,7 @@ from .panel_api import (
     _fetch_batch_order_status,
     _fetch_single_order_status,
 )
+from .panel_balances import get_cached_service_balance
 from .panel_errors import _build_status_result_from_entry
 
 STATUS_BATCH_SIZE = 50
@@ -105,7 +106,13 @@ def _apply_status_result(
 
     mapped_status = str(result.get("status", "unknown") or "unknown").lower()
     charge = _safe_float(result.get("charge"), 0.0)
-    currency = str(result.get("currency", "USD") or "USD")
+    raw_res_cur = result.get("currency")
+    if raw_res_cur not in (None, ""):
+        currency = normalize_currency_code(raw_res_cur)
+    else:
+        srv_num = _safe_int(order_record.get("service_number")) or 1
+        srv_balance = get_cached_service_balance(srv_num)
+        currency = normalize_currency_code(order_record.get("currency") or srv_balance.get("currency") or "RUB")
     lot_summa = _safe_float(latest_initial.get("summa"), _safe_float(order_record.get("summa"), 0.0))
 
     fx_info: Optional[Dict[str, Any]] = None

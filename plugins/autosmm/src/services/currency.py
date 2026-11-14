@@ -176,7 +176,7 @@ def _get_cached_rates(*, now_ts: float, ttl_seconds: int) -> Tuple[Dict[str, flo
     disk_ts = safe_float(disk_entry.get("fetched_at"), 0.0)
     raw_disk_rates = disk_entry.get("rates") if isinstance(disk_entry.get("rates"), dict) else {}
     disk_rates = {
-        normalize_currency_code(k): float(v)
+        normalize_currency_code(k): parsed
         for k, v in raw_disk_rates.items()
         if (parsed := optional_float(v)) is not None and parsed > 0
     }

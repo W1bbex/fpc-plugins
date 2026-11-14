@@ -502,19 +502,31 @@ def _is_supported_event(e: Any) -> bool:
 
 def _resolve_event_shard_key(e: Any) -> str:
     if isinstance(e, NewMessageEvent):
-        chat_id = getattr(getattr(e, "message", None), "chat_id", None)
+        msg = getattr(e, "message", None)
+        author = str(getattr(msg, "author", "") or "").strip().lower()
+        author_id = getattr(msg, "author_id", None)
+        if author and author_id != 0 and author != "funpay":
+            return f"user:{author}"
+        chat_id = getattr(msg, "chat_id", None)
         if chat_id is not None:
             return f"chat:{chat_id}"
         return "default"
     if isinstance(e, NewOrderEvent):
         order_obj = getattr(e, "order", None)
+        buyer_username = str(getattr(order_obj, "buyer_username", "") or getattr(order_obj, "buyer_name", "") or "").strip().lower()
+        if buyer_username:
+            return f"user:{buyer_username}"
         raw_chat_id = getattr(order_obj, "chat_id", None)
         if isinstance(raw_chat_id, int):
             return f"chat:{raw_chat_id}"
         order_id = str(getattr(order_obj, "id", "") or "").strip().lstrip("#")
         return f"order:{order_id}" if order_id else "default"
     if OrderStatusChangedEvent is not None and isinstance(e, OrderStatusChangedEvent):
-        order_id = str(getattr(getattr(e, "order", None), "id", "") or "").strip().lstrip("#")
+        order_obj = getattr(e, "order", None)
+        buyer_username = str(getattr(order_obj, "buyer_username", "") or getattr(order_obj, "buyer_name", "") or "").strip().lower()
+        if buyer_username:
+            return f"user:{buyer_username}"
+        order_id = str(getattr(order_obj, "id", "") or "").strip().lstrip("#")
         return f"order:{order_id}" if order_id else "default"
     return "default"
 
