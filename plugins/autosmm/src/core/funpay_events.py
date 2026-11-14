@@ -130,7 +130,8 @@ def _handle_buyer_check_command(
             c.send_message(msg_chat_id, "Заказ ещё не запущен. Отправьте ссылку для запуска.")
         return True
 
-    service_number = _safe_int(found.get("service_number")) or 1
+    parsed_service_number = _safe_int(found.get("service_number"))
+    service_number = parsed_service_number if (parsed_service_number is not None and parsed_service_number > 0) else 1
     result = _fetch_single_order_status(service_number, panel_order_id)
     order_id_funpay = str(found.get("order_id") or found.get("order_id_funpay") or "")
     if result.get("ok"):

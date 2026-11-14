@@ -123,7 +123,7 @@ def _links_extract_buyer_target(text_value: Any, *, allowed_domains) -> Optional
         if lower_cand.startswith('http://') or lower_cand.startswith('https://'):
             cand = 'https://' + cand.split('://', 1)[1]
         return cand
-    for allowed_domain in _provided_links(allowed_domains):
+    for allowed_domain in allowed_domains():
         domain = _normalize_allowed_domain(allowed_domain)
         if not domain:
             continue
@@ -164,17 +164,13 @@ def _links_is_valid_link(link: str, *, allowed_domains) -> Tuple[bool, str]:
         hostname = hostname[4:]
     if not hostname or not _is_plausible_allowed_domain(hostname):
         return (False, '❌ Не удалось определить домен ссылки.')
-    for allowed_domain in _provided_links(allowed_domains):
+    for allowed_domain in allowed_domains():
         domain = _normalize_allowed_domain(allowed_domain)
         if not domain:
             continue
         if hostname == domain or hostname.endswith('.' + domain):
             return (True, f'✅ Ссылка корректна ({domain}).')
     return (False, INVALID_LINK_DOMAIN_TEXT)
-
-
-def _provided_links(allowed_domains):
-    return allowed_domains()
 
 
 def _links_extract_http_link(text_value: Any, *, allowed_domains) -> Optional[str]:

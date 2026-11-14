@@ -17,11 +17,6 @@ _ANALYTICS_PERIOD_MAP = {
 }
 _ANALYTICS_VALID_UI_PERIODS = ("day", "week", "month", "all")
 
-CB_STATS_24H = "asmm:stats_24h"
-CB_STATS_7D = "asmm:stats_7d"
-CB_STATS_30D = "asmm:stats_30d"
-CB_STATS_ALL = "asmm:stats_all"
-
 
 def build_analytics_keyboard(period: str = "24h", mode: str = "main") -> InlineKeyboardMarkup:
     """Build InlineKeyboardMarkup for the analytics screen."""
@@ -60,18 +55,6 @@ def build_analytics_keyboard(period: str = "24h", mode: str = "main") -> InlineK
         InlineKeyboardButton("◀️ Назад", callback_data="asmm:return_to_settings"),
     )
     return kb
-
-
-def parse_period_from_callback(callback_data: str) -> str:
-    """Map legacy callback_data tokens to normalized analytics period keys."""
-    cd = str(callback_data or "").strip()
-    if cd == CB_STATS_7D:
-        return "7d"
-    if cd == CB_STATS_30D:
-        return "30d"
-    if cd == CB_STATS_ALL:
-        return "all"
-    return "24h"
 
 
 def _parse_analytics_period(call: types.CallbackQuery, prefix: str) -> str:

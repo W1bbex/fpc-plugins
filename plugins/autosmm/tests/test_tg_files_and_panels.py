@@ -207,11 +207,13 @@ class TgFilesAndPanelsTests(unittest.TestCase):
         self.assertIn("asmm:seller_notifications_settings", common._NAVIGATION_TARGETS)
         self.assertIn("asmm:files_menu", common._NAVIGATION_TARGETS)
 
-    def test_settings_builds_analytics_keyboard_and_parses_legacy_callbacks(self):
-        self.assertEqual(tg_analytics.parse_period_from_callback(tg_analytics.CB_STATS_7D), "7d")
-        self.assertEqual(tg_analytics.parse_period_from_callback(tg_analytics.CB_STATS_30D), "30d")
-        self.assertEqual(tg_analytics.parse_period_from_callback(tg_analytics.CB_STATS_ALL), "all")
-        self.assertEqual(tg_analytics.parse_period_from_callback("unknown"), "24h")
+    def test_settings_builds_analytics_keyboard_and_parses_period_callbacks(self):
+        from types import SimpleNamespace
+
+        self.assertEqual(tg_analytics._parse_analytics_period(SimpleNamespace(data="asmm:analytics_period_week"), "asmm:analytics_period_"), "week")
+        self.assertEqual(tg_analytics._parse_analytics_period(SimpleNamespace(data="asmm:analytics_period_month"), "asmm:analytics_period_"), "month")
+        self.assertEqual(tg_analytics._parse_analytics_period(SimpleNamespace(data="asmm:analytics_period_all"), "asmm:analytics_period_"), "all")
+        self.assertEqual(tg_analytics._parse_analytics_period(SimpleNamespace(data="unknown"), "asmm:analytics_period_"), "day")
         kb = tg_analytics.build_analytics_keyboard("7d", "more")
         self.assertIsNotNone(kb)
         callbacks = [btn.callback_data for row in kb.keyboard for btn in row]
@@ -854,7 +856,13 @@ class TgUiHardeningTests(unittest.TestCase):
                 ),
             ) as post_mock,
         ):
-            combined_text = tg_panels._get_total_panel_balance_text(cfg)
+            _updated, combined_text = tg_panels.core_panel_balances.refresh_panel_balances_sync(
+                cfg,
+                timeout=6,
+                force=False,
+                max_age_seconds=tg_panels.PANEL_BALANCE_CACHE_TTL_SECONDS,
+                api_json_fn=tg_panels._panel_api_json,
+            )
             self.assertEqual(post_mock.call_count, 1)
             self.assertIn("частично недоступно", combined_text)
 
@@ -864,7 +872,13 @@ class TgUiHardeningTests(unittest.TestCase):
             self.assertAlmostEqual(payload_real["balance_value"], 123.45)
 
             tg_panels._invalidate_balance_cache()
-            single_text = tg_panels._get_total_panel_balance_text({"services": {"2": cfg["services"]["2"]}})
+            _updated, single_text = tg_panels.core_panel_balances.refresh_panel_balances_sync(
+                {"services": {"2": cfg["services"]["2"]}},
+                timeout=6,
+                force=False,
+                max_age_seconds=tg_panels.PANEL_BALANCE_CACHE_TTL_SECONDS,
+                api_json_fn=tg_panels._panel_api_json,
+            )
             self.assertEqual(post_mock.call_count, 3)
             self.assertIn("123.45", single_text)
 
@@ -1029,6 +1043,15 @@ class TgUiHardeningTests(unittest.TestCase):
                     tg_panels.process_add_service(SimpleNamespace(chat=SimpleNamespace(id=10), from_user=SimpleNamespace(id=42), text="2"))
                     self.assertIn("2", storage.load_config()["services"])
                     tg_panels.process_delete_service(SimpleNamespace(chat=SimpleNamespace(id=10), from_user=SimpleNamespace(id=42), text="2"))
+                    self.assertIn("2", storage.load_config()["services"])
+                    tg_panels.confirm_delete_service_callback(
+                        SimpleNamespace(
+                            id="cbdel2",
+                            data="asmm:confirm_delete_service_2",
+                            message=SimpleNamespace(chat=SimpleNamespace(id=10), message_id=50),
+                            from_user=SimpleNamespace(id=42),
+                        )
+                    )
                     self.assertNotIn("2", storage.load_config()["services"])
 
                     # 5. add_website & _delete_allowed_website_and_refresh serialize config write under lock and do TG I/O outside lock.

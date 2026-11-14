@@ -652,7 +652,7 @@ class StorageResilienceTests(unittest.TestCase):
         finally:
             rt.DB_PATH = orig_db
 
-    def test_save_order_info_and_log_preserve_fields_and_return_bool_on_error(self):
+    def test_save_orders_log_preserves_fields_and_returns_bool_on_error(self):
         import sqlite3
         import tempfile
         from pathlib import Path
@@ -676,7 +676,9 @@ class StorageResilienceTests(unittest.TestCase):
                     1,
                     funpay_status="paid",
                 )
-                ok = storage.save_order_info("FP-KEEP-1", 150.0, "Updated Lot", 145.0)
+                ok = storage.save_orders_log(
+                    [{"order_id": "FP-KEEP-1", "summa": 150.0, "service_name": "Updated Lot", "chistota": 145.0}]
+                )
                 self.assertTrue(ok)
                 row = db_orders.get_order("FP-KEEP-1")
                 self.assertAlmostEqual(row["chistota"], 145.0)
@@ -690,7 +692,6 @@ class StorageResilienceTests(unittest.TestCase):
                         db_orders, "upsert_order_dict", side_effect=sqlite3.OperationalError("locked")
                     ),
                 ):
-                    self.assertIs(storage.save_order_info("FP-KEEP-1", 150.0, "Lot", 145.0), False)
                     self.assertIs(storage.save_orders_log([{"order_id": "FP-KEEP-1", "status": "x"}]), False)
         finally:
             rt.DB_PATH = orig_db
@@ -812,3 +813,18 @@ class StorageResilienceTests(unittest.TestCase):
                 self.assertFalse(db._is_db_schema_cached(rt.DB_PATH))
         finally:
             rt.DB_PATH = orig_db
+
+    def test_read_log_export_bytes_missing_file_raises_filenotfound(self):
+        import tempfile
+        from pathlib import Path
+        from src import runtime as rt
+        from src.storage import storage
+
+        orig_log = rt.LOG_PATH
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                rt.LOG_PATH = str(Path(tmp) / "missing.log")
+                with self.assertRaises(FileNotFoundError):
+                    storage.read_log_export_bytes()
+        finally:
+            rt.LOG_PATH = orig_log

@@ -455,8 +455,10 @@ def _analytics_update_order_charge_and_net(
     write_log: Any = None,
 ) -> None:
     """Update `spent`, `spent_rub`, `currency`, and `chistota` for an order atomically."""
-    if isinstance(currency, (int, float)) and net_profit is None:
+    if isinstance(currency, (int, float)) and not isinstance(currency, bool) and net_profit is None:
         net_profit = float(currency)
+        currency = "USD"
+    if not isinstance(currency, str):
         currency = "USD"
     spent_f = safe_float(spent, 0.0)
     currency_str = normalize_currency_code(currency or "USD")

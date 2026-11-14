@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     from cardinal import Cardinal
 
 from .. import runtime as rt
-from ..models import is_order_refundedish as _is_order_refundedish, normalize_chat_id as _normalize_chat_id
+from ..models import is_order_refundedish as _is_order_refundedish, normalize_chat_id as _normalize_chat_id, safe_int as _safe_int
 from ..services.notifications import (
     _send_admin_order_alert,
     _send_transport_error_after_add_alert,
@@ -460,14 +460,18 @@ def _get_fallback_block_spec(
             "повторная резервная панель запрещена, заказ не создан автоматически",
             False,
         )
-    if not fallback_service_id or not fallback_service_number:
+    fb_service_id = _safe_int(fallback_service_id)
+    fb_service_number = _safe_int(fallback_service_number)
+    if (fb_service_id is None or fb_service_id <= 0) or (
+        fb_service_number is None or fb_service_number <= 0
+    ):
         return (
             "fallback_not_configured",
             f"Резервная панель не настроена. Primary ошибка: {primary_error} | {primary_detail}",
             "резервная панель не настроена, заказ не создан автоматически",
             False,
         )
-    if int(fallback_service_number) == int(service_number):
+    if fb_service_number == int(service_number):
         if primary_error == "user_inactive":
             return (
                 "same_panel_auth_failed",

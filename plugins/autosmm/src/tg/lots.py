@@ -401,7 +401,7 @@ def generate_lots_keyboard(page: int = 0) -> InlineKeyboardMarkup:
     if nav_buttons:
         kb_.row(*nav_buttons)
 
-    kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="asmm:return_to_settings"))
+    kb_.add(InlineKeyboardButton("◀️ Назад", callback_data="asmm:lot_settings"))
     return kb_
 
 

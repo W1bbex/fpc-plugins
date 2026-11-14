@@ -17,7 +17,8 @@ from ..core.panel_api import (
     _normalize_api_key,
     _panel_api_json,
 )
-from ..storage.storage import CONFIG_LOCK, load_config, rename_panel_service, save_config
+from ..models import safe_int
+from ..storage.storage import CONFIG_LOCK, load_config, rename_panel_service, save_config, sort_service_items
 from .common import (
     _clear_navigation_states,
     _clear_step_handler,
@@ -42,17 +43,6 @@ _extract_service_domain = core_panel_balances.extract_service_domain
 _is_placeholder_api_url = core_panel_balances.is_placeholder_api_url
 _invalidate_balance_cache = core_panel_balances.invalidate_panel_balance_cache
 _format_currency_for_main_menu = core_panel_balances.format_currency_symbol
-
-
-def _sort_service_items(services: Dict) -> List[Tuple[str, Dict]]:
-    def _service_sort_key(item: Tuple[str, Dict]) -> Tuple[int, str]:
-        key = str(item[0] or "")
-        try:
-            return (0, f"{int(key):09d}")
-        except Exception:
-            return (1, key)
-
-    return sorted((services or {}).items(), key=_service_sort_key)
 
 
 def _domain_to_service_name(domain: str) -> str:
@@ -116,23 +106,12 @@ def _get_service_balance_payload(service_number: int, service_cfg: Optional[Dict
     )
 
 
-def _get_total_panel_balance_text(cfg: Dict) -> str:
-    _updated, balance_text = core_panel_balances.refresh_panel_balances_sync(
-        cfg,
-        timeout=6,
-        force=False,
-        max_age_seconds=PANEL_BALANCE_CACHE_TTL_SECONDS,
-        api_json_fn=_panel_api_json,
-    )
-    return balance_text
-
-
 def render_api_menu(cfg: Dict, *, use_cache_only: bool = True) -> Tuple[str, InlineKeyboardMarkup]:
     services = cfg.get("services", {}) or {}
     service_rows: List[Tuple[str, Dict, Dict[str, Any], str]] = []
     cached_by_key: Dict[str, Dict[str, Any]] = {}
 
-    for srv_num, srv_data in _sort_service_items(services):
+    for srv_num, srv_data in sort_service_items(services):
         try:
             srv_int = int(srv_num)
         except Exception:
@@ -595,7 +574,7 @@ def process_add_service(message: types.Message) -> None:
                 "api_url": "https://example.com/api/v2",
                 "api_key": "YOUR_API_KEY",
             }
-            cfg["services"] = {k: v for k, v in _sort_service_items(services)}
+            cfg["services"] = {k: v for k, v in sort_service_items(services)}
             save_config(cfg)
     if duplicate:
         _repeat_ui_input_flow(message.chat.id, f"❌ Сервис #{srv_num} уже существует.")
@@ -605,14 +584,78 @@ def process_add_service(message: types.Message) -> None:
     _open_api_service_card(message.chat.id, srv_num)
 
 
+def _find_lots_bound_to_service(cfg: Dict[str, Any], srv_num: int) -> List[Tuple[str, str, str]]:
+    """Return lots referencing `srv_num` via primary `service_number` or `fallback_service_number`."""
+    lot_map = cfg.get("lot_mapping", {}) or {}
+    bound: List[Tuple[str, str, str]] = []
+    for lot_key, lot_data in lot_map.items():
+        if not isinstance(lot_data, dict):
+            continue
+        raw_primary = lot_data.get("service_number", 1)
+        primary_num = 1 if raw_primary is None else safe_int(raw_primary)
+        fallback_num = safe_int(lot_data.get("fallback_service_number"))
+        uses_primary = primary_num == srv_num
+        uses_fallback = fallback_num is not None and fallback_num > 0 and fallback_num == srv_num
+        if not (uses_primary or uses_fallback):
+            continue
+        if uses_primary and uses_fallback:
+            role_label = "основная и резервная"
+        elif uses_primary:
+            role_label = "основная"
+        else:
+            role_label = "резервная"
+        lot_name = str(lot_data.get("name") or lot_key).strip() or str(lot_key)
+        bound.append((str(lot_key), lot_name, role_label))
+    return bound
+
+
+def _build_delete_service_confirmation_text(
+    srv_num: int,
+    service_cfg: Dict[str, Any],
+    bound_lots: List[Tuple[str, str, str]],
+) -> str:
+    display_name = build_service_display_name(srv_num, service_cfg.get("api_url"), service_cfg.get("name"))
+    lines = [
+        f"⚠️ <b>Удалить панель #{srv_num}?</b>",
+        "",
+        f"Панель: <b>{h(display_name)}</b>",
+        "",
+    ]
+    if bound_lots:
+        lines.append(f"К этому номеру привязаны такие лоты (<b>{len(bound_lots)} шт.</b>):")
+        quote_lines: List[str] = []
+        max_total_chars = 3600
+        used_chars = len("\n".join(lines)) + 160
+        for idx, (lot_key, lot_name, role_label) in enumerate(bound_lots):
+            short_name = lot_name if len(lot_name) <= 90 else lot_name[:87] + "..."
+            entry = f"• <code>{h(lot_key)}</code> — {h(short_name)} (<i>{h(role_label)}</i>)"
+            remaining = len(bound_lots) - idx - 1
+            tail_reserve = len(f"\n… и ещё {remaining} шт.") if remaining > 0 else 0
+            if quote_lines and used_chars + len(entry) + 1 + tail_reserve > max_total_chars:
+                quote_lines.append(f"… и ещё {len(bound_lots) - idx} шт.")
+                break
+            quote_lines.append(entry)
+            used_chars += len(entry) + 1
+        lines.append("<blockquote expandable>" + "\n".join(quote_lines) + "</blockquote>")
+        lines.extend(["", "После удаления эти лоты останутся без рабочей привязки."])
+    else:
+        lines.append("К этому номеру не привязано ни одного лота.")
+    lines.extend(["", "Вы уверены, что хотите удалить панель?"])
+    return "\n".join(lines)[:4096]
+
+
 def process_delete_service(message: types.Message) -> None:
     try:
         srv_num = int(str(getattr(message, "text", None) or "").strip())
+        if srv_num <= 0:
+            raise ValueError
     except ValueError:
-        _repeat_ui_input_flow(message.chat.id, "❌ Ошибка: Номер сервиса должен быть числом.")
+        _repeat_ui_input_flow(message.chat.id, "❌ Ошибка: Номер сервиса должен быть положительным числом.")
         return
 
     missing = False
+    service_cfg: Dict[str, Any] = {}
+    bound_lots: List[Tuple[str, str, str]] = []
     with CONFIG_LOCK:
         cfg = load_config()
         services = cfg.get("services", {}) or {}
@@ -620,15 +663,57 @@ def process_delete_service(message: types.Message) -> None:
         if service_key not in services:
             missing = True
         else:
-            del services[service_key]
-            cfg["services"] = {k: v for k, v in _sort_service_items(services)}
-            save_config(cfg)
+            service_cfg = dict(services.get(service_key) or {})
+            bound_lots = _find_lots_bound_to_service(cfg, srv_num)
     if missing:
         _repeat_ui_input_flow(message.chat.id, f"❌ Сервис #{srv_num} не существует.")
         return
-    _invalidate_balance_cache()
+
+    _clear_step_handler(message.chat.id)
     _clear_ui_input_state(message.chat.id)
-    _open_api_menu(message.chat.id)
+    confirm_text = _build_delete_service_confirmation_text(srv_num, service_cfg, bound_lots)
+    confirm_kb = _inline_kb(
+        ("✅ Да, удалить", f"asmm:confirm_delete_service_{srv_num}"),
+        ("◀️ Отмена", "asmm:api_settings"),
+    )
+    rt.bot.send_message(message.chat.id, confirm_text, parse_mode="HTML", reply_markup=confirm_kb)
+
+
+def confirm_delete_service_callback(call: types.CallbackQuery) -> None:
+    chat_id, message_id, _ = _extract_call_ids(call)
+    if chat_id is None:
+        _safe_answer_callback(call)
+        return
+    data = str(getattr(call, "data", "") or "")
+    raw_srv = data.split("asmm:confirm_delete_service_", 1)[1] if "asmm:confirm_delete_service_" in data else ""
+    try:
+        srv_num = int(raw_srv)
+        if srv_num <= 0:
+            raise ValueError
+    except ValueError:
+        _safe_answer_callback(call)
+        api_settings_menu(call)
+        return
+
+    removed = False
+    with CONFIG_LOCK:
+        cfg = load_config()
+        services = cfg.get("services", {}) or {}
+        service_key = str(srv_num)
+        if service_key in services:
+            del services[service_key]
+            cfg["services"] = {k: v for k, v in sort_service_items(services)}
+            save_config(cfg)
+            removed = True
+
+    if removed:
+        _invalidate_balance_cache()
+        _safe_answer_callback(call, f"Панель #{srv_num} удалена")
+    else:
+        _safe_answer_callback(call, f"Панель #{srv_num} не найдена")
+    _clear_step_handler(chat_id)
+    _clear_navigation_states(chat_id)
+    _open_api_menu(chat_id, message_id=message_id)
 
 
 def _nav_api_service(call: types.CallbackQuery, target: str) -> None:

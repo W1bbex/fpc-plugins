@@ -529,7 +529,3 @@ def _edit_html_screen(
         reply_markup=kb,
         **({"disable_web_page_preview": True} if disable_preview else {}),
     )
-
-
-def header_no_action_callback(call: types.CallbackQuery) -> None:
-    _safe_answer_callback(call)

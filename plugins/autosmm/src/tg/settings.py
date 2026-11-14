@@ -376,9 +376,8 @@ def manage_websites(call: types.CallbackQuery) -> None:
         "Здесь настраиваются сайты, ссылки с которых покупатели могут отправлять после оплаты."
     )
     kb_ = _inline_kb(
-        ("📋 Показать список", "asmm:show_allowed_websites_list"),
+        ("📋 Список и удаление", "asmm:show_allowed_websites_list"),
         ("➕ Добавить сайт", "asmm:add_website"),
-        ("🗑 Удалить сайт", "asmm:show_allowed_websites_list"),
         ("🔄 Сбросить список", "asmm:reset_valid_links_prompt"),
         ("◀️ Назад", "asmm:misc_settings"),
     )

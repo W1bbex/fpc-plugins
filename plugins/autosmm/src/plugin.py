@@ -32,7 +32,6 @@ from .tg.analytics import (
 from .tg.common import (
     STATE_RESTORE_BACKUP,
     h,
-    header_no_action_callback,
     ui_input_back_callback,
     ui_input_cancel_callback,
 )
@@ -75,6 +74,7 @@ from .tg.panels import (
     api_service_callback,
     api_settings_callback,
     check_balance,
+    confirm_delete_service_callback,
     delete_service,
     edit_apiname,
     edit_apinum,
@@ -203,7 +203,6 @@ _EXACT_CALLBACK_ROUTES: List[Tuple[str, Callable[[types.CallbackQuery], Any]]] =
     ("asmm:return_to_settings", return_to_settings),
     ("asmm:api_settings", api_settings_callback),
     ("asmm:refresh_api_balances", refresh_api_balances_callback),
-    ("asmm:header_no_action", header_no_action_callback),
     ("asmm:add_new_lot", add_new_lot),
     ("asmm:edit_messages", edit_messages_menu),
     ("asmm:edit_msg_payment", edit_msg_payment),
@@ -255,6 +254,7 @@ _PREFIX_CALLBACK_ROUTES: List[Tuple[str, Callable[[types.CallbackQuery], Any]]] 
     ("asmm:delete_one_lot_", delete_one_lot_callback),
     ("asmm:confirm_delete_one_lot_", confirm_delete_one_lot_callback),
     ("asmm:api_service_", api_service_callback),
+    ("asmm:confirm_delete_service_", confirm_delete_service_callback),
     ("asmm:edit_apiurl_", edit_apiurl),
     ("asmm:edit_apikey_", edit_apikey),
     ("asmm:edit_apiname_", edit_apiname),

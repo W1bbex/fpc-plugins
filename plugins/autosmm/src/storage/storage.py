@@ -565,6 +565,11 @@ def _service_sort_key(item: Tuple[str, Any]) -> Tuple[int, str]:
         return (1, key)
 
 
+def sort_service_items(services: Optional[Dict[str, Any]]) -> List[Tuple[str, Any]]:
+    """Return service entries ordered deterministically by numeric panel ID then string key."""
+    return sorted((services or {}).items(), key=_service_sort_key)
+
+
 def rename_panel_service(
     old_service_idx: int,
     new_service_idx: int,
@@ -631,52 +636,6 @@ def claim_panel_refund_cancel(
 def delete_orders_data() -> int:
     """Delete all stored orders from SQLite while keeping config and kv_state."""
     return db_orders.delete_all_orders()
-
-
-def save_order_info(
-    order_id: Any,
-    order_summa: float,
-    service_name: str,
-    order_chistota: float,
-) -> bool:
-    """Persist billing metadata and timestamp for an order in SQLite."""
-    target_id = str(order_id or "").strip()
-    if not target_id:
-        return False
-    try:
-        date_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with ORDERS_LOCK:
-            existing = db_orders.get_order(target_id)
-            if existing is not None:
-                ok = db_orders.update_order_fields(
-                    target_id,
-                    date=date_str,
-                    summa=float(order_summa),
-                    service_name=service_name,
-                    chistota=float(order_chistota),
-                )
-            else:
-                ok = (
-                    db_orders.upsert_order_dict(
-                        {
-                            "order_id": target_id,
-                            "date": date_str,
-                            "summa": float(order_summa),
-                            "service_name": service_name,
-                            "chistota": float(order_chistota),
-                            "completed_notification_sent": False,
-                            "status": "unknown",
-                            "funpay_status": None,
-                        }
-                    )
-                    is not None
-                )
-        if ok:
-            logger.info(f"Данные заказа #{target_id} успешно сохранены")
-        return ok
-    except (sqlite3.Error, OSError, ValueError, TypeError) as exc:
-        logger.error(f"Общая ошибка при сохранении информации о заказе #{target_id}: {exc}")
-        return False
 
 
 def load_orders_log() -> List[Dict[str, Any]]:
@@ -793,10 +752,13 @@ def read_log_export_bytes() -> Tuple[str, bytes, float]:
     """Snapshot the active plugin log file safely via a temporary copy and return `(filename, content, size_kb)`."""
     import tempfile
 
-    filename = os.path.basename(rt.LOG_PATH) or "auto_smm.log"
+    log_path = str(rt.LOG_PATH or "").strip()
+    if not log_path or not os.path.exists(log_path):
+        raise FileNotFoundError(log_path or "auto_smm.log")
+    filename = os.path.basename(log_path) or "auto_smm.log"
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_export = os.path.join(tmp_dir, filename)
-        shutil.copy2(rt.LOG_PATH, tmp_export)
+        shutil.copy2(log_path, tmp_export)
         with open(tmp_export, "rb") as log_file:
             data = log_file.read()
     return filename, data, round(len(data) / 1024, 1)

@@ -634,7 +634,7 @@ def _extract_batch_status_entries(payload: Any, order_ids: List[int]) -> Dict[st
 
 
 def _extract_service_credentials(config: Any, service_number: Any) -> Tuple[Optional[str], str, Optional[str]]:
-    cfg = _provided_config(config)
+    cfg = config
     services = cfg.get("services") if isinstance(cfg, dict) else None
     service_cfg = services.get(str(service_number)) if isinstance(services, dict) else None
     if not isinstance(service_cfg, dict):
@@ -650,7 +650,7 @@ def _extract_service_credentials(config: Any, service_number: Any) -> Tuple[Opti
     return api_url, api_key, None
 
 
-def _panel_send_order(c: Cardinal, service_number: int, service_id: int, link: str, quantity: int, api_timeout: int=20, *, config) -> Tuple[bool, int | None, Dict]:
+def _panel_send_order(_c: Any, service_number: int, service_id: int, link: str, quantity: int, api_timeout: int=20, *, config) -> Tuple[bool, int | None, Dict]:
     """
     Отправляет заказ в выбранный SMM-сервис.
 
@@ -754,10 +754,6 @@ def _panel_batch_status(service_number: int, order_ids: List[int], timeout: int=
         safe_ex = _sanitize_secret_text(ex, api_key)
         logger.error(f'BATCH STATUS UNKNOWN ERROR: service=#{service_number}, orders={orders_param}, error={safe_ex}')
         return {'ok': False, 'error': 'unknown', 'detail': safe_ex}
-
-
-def _provided_config(config):
-    return config
 
 
 def send_order_to_service(c, service_number: int, service_id: int, link: str, quantity: int, api_timeout: int = 20):

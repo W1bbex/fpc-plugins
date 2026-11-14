@@ -137,9 +137,9 @@ def _upsert_buyer_flow_order_record(
             "service_id": service_id,
             "quantity": int(real_amount or 0),
             "total_quantity": int(real_amount or 0),
-            "done_quantity": int(base.get("done_quantity") or 0) if _has_panel_order(base) else 0,
-            "left_quantity": int(base.get("left_quantity") or 0) if _has_panel_order(base) else int(real_amount or 0),
-            "progress_percent": int(base.get("progress_percent") or 0) if _has_panel_order(base) else 0,
+            "done_quantity": 0,
+            "left_quantity": int(real_amount or 0),
+            "progress_percent": 0,
             "order_amount": order_amount,
             "order_price": order_price,
             "service_number": service_number,
@@ -147,7 +147,7 @@ def _upsert_buyer_flow_order_record(
             "buyer_flow_state": state,
             "saved_link": effective_saved_link,
             "spent": float(base.get("spent", 0.0) or 0.0),
-            "summa": float(order_price or base.get("summa", 0) or 0),
+            "summa": float(order_price if order_price not in (None, "") else base.get("summa", 0) or 0),
             "chistota": float(base.get("chistota", 0.0) or 0.0),
             "currency": str(base.get("currency", "RUB") or "RUB"),
             "created_at": created_at,
@@ -155,17 +155,11 @@ def _upsert_buyer_flow_order_record(
             "last_prompt_ts": now_str_val,
             "updated_at": now_str_val,
             "completed_notification_sent": bool(base.get("completed_notification_sent", False)),
+            "id_zakaz": base.get("id_zakaz"),
+            "panel_order_id": base.get("panel_order_id"),
+            "status": base.get("status") or "pending",
+            "customer_url": effective_saved_link or base.get("customer_url") or "",
         }
-        if not _has_panel_order(base):
-            record_update["id_zakaz"] = base.get("id_zakaz")
-            record_update["panel_order_id"] = base.get("panel_order_id")
-            record_update["status"] = base.get("status") or "pending"
-            record_update["customer_url"] = effective_saved_link or base.get("customer_url") or ""
-        else:
-            record_update["id_zakaz"] = base.get("id_zakaz")
-            record_update["panel_order_id"] = base.get("panel_order_id")
-            record_update["status"] = base.get("status", "pending")
-            record_update["customer_url"] = base.get("customer_url", effective_saved_link or "")
         merged = dict(base)
         merged.update(record_update)
         if resolved_lot_key not in (None, ""):
@@ -660,9 +654,11 @@ def _handle_buyer_flow_message(c: "Cardinal", msg_text: str, buyer_id: Any, chat
             recent_orders = _get_buyer_orders(buyer_id, chat_id)
             if recent_orders:
                 latest_order = recent_orders[0]
+                if _get_buyer_flow_state(latest_order) == BUYER_STATE_COMPLETED:
+                    return False
                 if _apply_refund_gate(c, latest_order, notify_chat_id=chat_id, force_check=True):
                     return True
-                if _has_panel_order(latest_order) or _get_buyer_flow_state(latest_order) in (BUYER_STATE_PANEL_CREATED, BUYER_STATE_COMPLETED, BUYER_STATE_FAILED):
+                if _has_panel_order(latest_order) or _get_buyer_flow_state(latest_order) in (BUYER_STATE_PANEL_CREATED, BUYER_STATE_FAILED):
                     _send_buyer_message(c, chat_id, BUYER_PANEL_CREATED_BLOCK_TEXT)
                     return True
         return False
