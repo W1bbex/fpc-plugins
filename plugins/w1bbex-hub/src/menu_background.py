@@ -35,11 +35,12 @@ class MenuBackground:
                 if oldest != key:
                     self.views.pop(oldest, None)
                     self.watchers.pop(oldest, None)
+            if self.running:
+                self.watchers[key] = (self.serial, redraw)
+                return
             if time.monotonic() - self.checked < ttl and self.checked:
                 return
             self.watchers[key] = (self.serial, redraw)
-            if self.running:
-                return
             self.running = True
 
         def worker() -> None:

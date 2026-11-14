@@ -242,7 +242,7 @@ class HubNavigation:
             body, keyboard = render_plugins_menu(current, page, view, catalog_status())
             if body != text or keyboard.to_json() != markup.to_json():
                 self._edit_html(body, callback.message.chat.id, callback.message.id, reply_markup=keyboard)
-        if not load_data().get("auto_check_updates", True) and (view == "all" or catalog_status().get("loading")):
+        if view == "all" or catalog_status().get("loading") or not catalog_status().get("available", True):
             self._schedule_menu(callback.message.chat.id, callback.message.id, callback.from_user, redraw, catalog_requested=True)
         else:
             self._schedule_menu(callback.message.chat.id, callback.message.id, callback.from_user, redraw)

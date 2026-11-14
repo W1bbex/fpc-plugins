@@ -52,17 +52,34 @@ class TelegramTransport:
     """Reusable message methods; Cardinal lifecycle and routing remain in handlers."""
 
     def _ack(self, callback: Any, text: str | None = None) -> None:
-        if callback.id not in self._acked_callbacks:
-            self.bot.answer_callback_query(callback.id, text, show_alert=False)
-            self._acked_callbacks.add(callback.id)
+        cb_id = getattr(callback, "id", None)
+        if getattr(callback, "_hub_acked", False) or (cb_id is not None and cb_id in self._acked_callbacks):
+            return
+        trimmed = text[:200] if text else None
+        self.bot.answer_callback_query(callback.id, trimmed, show_alert=False)
+        setattr(callback, "_hub_acked", True)
+        if cb_id is not None:
+            self._acked_callbacks.add(cb_id)
 
     def _alert(self, callback: Any, text: str, show_alert: bool = True) -> Any:
-        if callback.id in self._acked_callbacks:
+        cb_id = getattr(callback, "id", None)
+        is_acked = getattr(callback, "_hub_acked", False) or (cb_id is not None and cb_id in self._acked_callbacks)
+        trimmed = (text or "")[:200]
+        if is_acked:
             if show_alert and getattr(callback, "message", None):
                 self._send_html(callback.message.chat.id, html.escape(text))
-        else:
-            self.bot.answer_callback_query(callback.id, text, show_alert=show_alert)
-            self._acked_callbacks.add(callback.id)
+            return CB_ANSWERED
+        try:
+            self.bot.answer_callback_query(callback.id, trimmed, show_alert=show_alert)
+            setattr(callback, "_hub_acked", True)
+            if cb_id is not None:
+                self._acked_callbacks.add(cb_id)
+        except Exception:
+            if show_alert and getattr(callback, "message", None):
+                try:
+                    self._send_html(callback.message.chat.id, html.escape(text))
+                except Exception:
+                    logger.debug("Fallback alert send_html failed", exc_info=True)
         return CB_ANSWERED
 
     def _send_html(self, chat_id: int, text: str, **kw: Any) -> Any:

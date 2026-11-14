@@ -112,10 +112,14 @@ class HubActions:
             self._clear_hub_state(chat_id, user_id)
             self._delete_prompt_message(chat_id, prompt_msg_id)
             self.bot.send_message(chat_id, "Действие отменено.")
+            def _send_fresh() -> None:
+                text, kb = self._main_content(message.from_user)
+                self._send_html(chat_id, text, reply_markup=kb)
+
             self._safe_refresh_callback_screen(
                 orig_callback,
                 self.main_menu,
-                lambda: self._send_html(chat_id, *self._main_content(message.from_user)),
+                _send_fresh,
             )
             return
         if not key:

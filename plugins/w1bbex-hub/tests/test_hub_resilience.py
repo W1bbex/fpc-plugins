@@ -289,3 +289,74 @@ def test_valid_interval_guards_bad_stored_values() -> None:
     assert navigation._valid_interval({"update_check_interval_minutes": True}) == 30
     assert navigation._valid_interval({"update_check_interval_minutes": 1}) == 30
     assert navigation._valid_interval({"update_check_interval_minutes": 60}) == 60
+
+
+def test_step_message_cancel_key_refreshes_menu_with_correct_kwargs_and_no_typeerror(
+    isolated_hub: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cardinal = make_fake_cardinal(authorized_users={42})
+    controller = handlers.HubController(cardinal)
+    cb = _make_callback(data="hub:activate_key")
+
+    cardinal.telegram.bot.edit_message_text.side_effect = RuntimeError("message to edit not found")
+    cancel_msg = SimpleNamespace(
+        text="отмена",
+        from_user=SimpleNamespace(id=42, username="owner"),
+        chat=SimpleNamespace(id=777),
+        id=902,
+        message_id=902,
+    )
+    controller._process_key_input(cancel_msg, cb, prompt_msg_id=102)
+    assert cardinal.telegram.bot.send_message.call_count >= 2
+
+
+def test_trial_confirm_error_in_thread_survives_acked_query_and_sends_html_alert(
+    isolated_hub: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cardinal = make_fake_cardinal(authorized_users={42})
+    controller = handlers.HubController(cardinal)
+    cb = _make_callback(data="hub:trial_confirm:demo")
+
+    monkeypatch.setattr(hub_api, "get_plugins", lambda: [{"id": "demo", "name": "Demo", "is_free": False}])
+    monkeypatch.setattr(hub_api, "request_trial_key", lambda *a, **kw: (False, "Лимит пробных периодов исчерпан"))
+
+    done = threading.Event()
+    orig_alert = controller._alert
+
+    def tracked_alert(*args, **kwargs):
+        res = orig_alert(*args, **kwargs)
+        done.set()
+        return res
+
+    monkeypatch.setattr(controller, "_alert", tracked_alert)
+
+    wrapped = controller.wrap_cb(lambda c: controller.trial_confirm(c, "demo", background=True))
+    wrapped(cb)
+
+    assert done.wait(timeout=3)
+    assert cardinal.telegram.bot.send_message.call_count >= 1
+    sent_text = cardinal.telegram.bot.send_message.call_args[0][1]
+    assert "Лимит пробных периодов исчерпан" in sent_text
+
+
+def test_menu_background_registers_watcher_during_inflight_worker(isolated_hub: Path) -> None:
+    from src.menu_background import MenuBackground
+
+    bg = MenuBackground()
+    worker_started = threading.Event()
+    worker_release = threading.Event()
+    draw_called = threading.Event()
+
+    def slow_refresh() -> tuple[str, bool]:
+        worker_started.set()
+        assert worker_release.wait(timeout=3)
+        return ("1.0", True)
+
+    bg.schedule(1, 1, slow_refresh, lambda: None, ttl=180)
+    assert worker_started.wait(timeout=1)
+
+    bg.checked = time.monotonic()  # simulate checked is recent
+    bg.schedule(1, 2, slow_refresh, draw_called.set, ttl=180)
+
+    worker_release.set()
+    assert draw_called.wait(timeout=3)
