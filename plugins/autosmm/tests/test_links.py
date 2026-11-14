@@ -39,3 +39,12 @@ class LinksNormalizationTests(unittest.TestCase):
         self.assertTrue(ok_target)
         self.assertEqual(models.normalize_allowed_domain("https://[::bad"), "")
 
+    def test_backslash_urls_and_unplausible_hosts_are_rejected(self):
+        allowed = lambda: ["t.me", "t.me..evil", "localhost"]
+        ok_backslash, _msg = links._links_is_valid_link("https://t.me\\@evil.example/ch", allowed_domains=allowed)
+        self.assertFalse(ok_backslash)
+        ok_localhost, _msg_local = links._links_is_valid_link("https://localhost/ch", allowed_domains=allowed)
+        self.assertFalse(ok_localhost)
+        ok_dots, _msg_dots = links._links_is_valid_link("https://t.me..evil/ch", allowed_domains=allowed)
+        self.assertFalse(ok_dots)
+

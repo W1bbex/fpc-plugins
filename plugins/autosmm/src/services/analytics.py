@@ -264,20 +264,20 @@ def _analytics_get_period_analytics(period: str = "24h", *, load_merged: Callabl
         refunded_like = funpay_status in ("refunded", "partially_refunded")
 
         order_summa = safe_float(o.get("summa"), 0.0)
-        revenue += order_summa
         order_spent_rub, fx_ok = _resolve_order_spent_rub(o, fx_cache=fx_cache, config_loader=_cfg_loader)
+        if refunded_like:
+            refunded += 1
+            if (panel_status in ("completed", "partial") or safe_float(o.get("spent"), 0.0) > 0) and fx_ok and order_spent_rub is not None:
+                losses += order_spent_rub
+            continue
+
+        revenue += order_summa
         if fx_ok and order_spent_rub is not None:
             spent += order_spent_rub
             order_net_profit = round(order_summa - order_spent_rub, 2)
         else:
             unconverted_fx += 1
             order_net_profit = None
-
-        if refunded_like:
-            refunded += 1
-            if (panel_status in ("completed", "partial") or safe_float(o.get("spent"), 0.0) > 0) and fx_ok and order_spent_rub is not None:
-                losses += order_spent_rub
-            continue
         if panel_status == "partial":
             partial += 1
             continue
@@ -535,14 +535,20 @@ def _analytics_view_key(chat_id: Any, message_id: Any) -> Tuple[int, int]:
 
 def _set_analytics_view_mode(chat_id: Any, message_id: Any, mode: str) -> None:
     normalized = "more" if str(mode or "").strip().lower() == "more" else "main"
-    rt.ANALYTICS_VIEW_MODES[_analytics_view_key(chat_id, message_id)] = {
-        "mode": normalized,
-        "created_ts": time.time(),
-    }
+    key = _analytics_view_key(chat_id, message_id)
+    with rt.CONTEXT_LOCK:
+        rt.ANALYTICS_VIEW_MODES[key] = {
+            "mode": normalized,
+            "created_ts": time.time(),
+        }
 
 
 def _get_analytics_view_mode(chat_id: Any, message_id: Any) -> str:
-    entry = rt.ANALYTICS_VIEW_MODES.get(_analytics_view_key(chat_id, message_id))
+    key = _analytics_view_key(chat_id, message_id)
+    with rt.CONTEXT_LOCK:
+        entry = rt.ANALYTICS_VIEW_MODES.get(key)
+        if isinstance(entry, dict):
+            entry = dict(entry)
     if isinstance(entry, dict):
         return "more" if str(entry.get("mode") or "").strip().lower() == "more" else "main"
     if isinstance(entry, str) and entry.strip():

@@ -479,3 +479,42 @@ class OrdersConcurrencyAndAlertsTests(unittest.TestCase):
                 self.assertFalse(ok)
         finally:
             rt.DB_PATH = orig_db
+
+    def test_timeout_and_rate_limited_are_soft_status_and_batch_transport_errors(self):
+        from src.storage import db
+
+        self.assertIn("timeout", orders._SOFT_STATUS_ERRORS)
+        self.assertIn("rate_limited", orders._SOFT_STATUS_ERRORS)
+        self.assertTrue(orders._is_batch_transport_error("timeout"))
+        self.assertTrue(orders._is_batch_transport_error("rate_limited"))
+
+        orig_db = rt.DB_PATH
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                rt.DB_PATH = str(Path(tmp) / "autosmm.db")
+                db.init_db(rt.DB_PATH)
+                storage.upsert_order_data(
+                    77,
+                    "FP-SOFT-ERR",
+                    5501,
+                    "pending",
+                    100.0,
+                    "https://t.me/test",
+                    100,
+                    1,
+                )
+                row = storage.get_order_data("FP-SOFT-ERR")
+                for err_code in ("timeout", "rate_limited"):
+                    with mock.patch.object(
+                        orders,
+                        "_fetch_single_order_status",
+                        return_value={"ok": False, "error": err_code, "detail": f"transient {err_code}"},
+                    ):
+                        orders._sync_single_order_status(mock.MagicMock(), row)
+                    after = storage.get_order_data("FP-SOFT-ERR")
+                    self.assertEqual(after["status"], "pending")
+                    self.assertEqual(after["status_last_error"], err_code)
+                    row = after
+        finally:
+            rt.DB_PATH = orig_db
+

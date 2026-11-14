@@ -194,7 +194,7 @@ def _format_order_started_text(
     reason: Optional[str],
     action_text: Optional[str],
     lot_price: float,
-    charge: float,
+    charge: Optional[float],
     currency: str,
     real_amount: int,
     order_url: str,
@@ -202,8 +202,8 @@ def _format_order_started_text(
     net_profit: Optional[float] = None,
 ) -> str:
     norm_cur = normalize_currency_code(currency)
-    resolved_spent_rub = spent_rub
-    if resolved_spent_rub is None:
+    resolved_spent_rub = spent_rub if charge is not None else None
+    if charge is not None and resolved_spent_rub is None:
         if norm_cur == "RUB":
             resolved_spent_rub = round(float(charge or 0.0), 4)
         else:
@@ -226,13 +226,17 @@ def _format_order_started_text(
     if reason or action_text:
         parts.append("")
     parts.append(f"💰 FunPay: {_format_alert_money(lot_price)} ₽")
-    if norm_cur == "RUB" or resolved_spent_rub is None:
+    if charge is None:
+        parts.append("💸 Сайт: стоимость уточняется")
+    elif norm_cur == "RUB" or resolved_spent_rub is None:
         parts.append(f"💸 Сайт: {_format_alert_money(charge)} {norm_cur}")
     else:
         parts.append(f"💸 Сайт: {_format_alert_money(charge)} {norm_cur} (~{_format_alert_money(resolved_spent_rub)} ₽)")
 
     if computed_profit is not None:
         parts.append(f"📈 Профит: {_format_alert_money(computed_profit)} ₽")
+    elif charge is None:
+        parts.append("📈 Профит: уточняется")
     else:
         parts.append(f"📈 Профит: недоступен (валюта панели: {norm_cur})")
     parts.extend(["", f"📦 Итоговое количество: {real_amount}", f"🔗 {order_url}"])
@@ -271,9 +275,15 @@ def send_order_started_notification(
 
     try:
         stored_order = get_order_data(order_id_funpay) or {}
-        resolved_charge = safe_float(stored_order.get("spent"), 0.0) if charge is None else charge
+        stored_spent = stored_order.get("spent")
+        if charge is not None:
+            resolved_charge: Optional[float] = charge
+        elif stored_spent not in (None, "") and safe_float(stored_spent, 0.0) > 0:
+            resolved_charge = safe_float(stored_spent, 0.0)
+        else:
+            resolved_charge = None
         resolved_currency = normalize_currency_code(currency or stored_order.get("currency", "RUB"))
-        resolved_spent_rub = spent_rub if spent_rub is not None else stored_order.get("spent_rub")
+        resolved_spent_rub = spent_rub if spent_rub is not None else (stored_order.get("spent_rub") if resolved_charge is not None else None)
 
         buyer_username = str(stored_order.get("buyer_username") or "").strip()
         if not buyer_username:

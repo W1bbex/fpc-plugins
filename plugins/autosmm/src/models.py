@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from enum import Enum
+import ipaddress
 import re
+import socket
 from typing import Any, Dict, List, Mapping, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 
 
 class BuyerFlowState(str, Enum):
@@ -167,6 +169,128 @@ def normalize_allowed_domain(domain_value: Any) -> str:
     if raw_value.startswith("www."):
         raw_value = raw_value[4:]
     return raw_value
+
+
+_INT_LITERAL_LABEL_RE = re.compile(r"^(?:0[xX][0-9a-fA-F]+|0[0-7]*|[1-9][0-9]*)$")
+_CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
+
+
+def _is_disallowed_ip(ip_obj: Any) -> bool:
+    if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped is not None:
+        return _is_disallowed_ip(ip_obj.ipv4_mapped)
+    if (
+        ip_obj.is_private
+        or ip_obj.is_loopback
+        or ip_obj.is_link_local
+        or ip_obj.is_reserved
+        or ip_obj.is_multicast
+        or ip_obj.is_unspecified
+    ):
+        return True
+    return isinstance(ip_obj, ipaddress.IPv4Address) and ip_obj in _CGNAT_NETWORK
+
+
+def normalize_api_url(raw_url: Any, *, check_dns: bool = False) -> str:
+    """Normalize and validate an SMM panel API endpoint while blocking private/local targets."""
+    raw_value = str(raw_url or "").strip()
+    if not raw_value:
+        raise ValueError("ссылка или домен не должны быть пустыми")
+
+    markdown_match = re.match(r"^\[[^\]]+\]\(([^)]+)\)$", raw_value)
+    if markdown_match:
+        raw_value = markdown_match.group(1).strip()
+
+    raw_value = raw_value.replace("\\", "/").strip()
+    if raw_value.startswith("//"):
+        raw_value = f"https:{raw_value}"
+
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://", raw_value):
+        raw_value = f"https://{raw_value.lstrip('/')}"
+
+    parts = urlsplit(raw_value)
+    if str(parts.scheme or "").lower() not in ("http", "https"):
+        raise ValueError("поддерживаются только HTTP/HTTPS ссылки")
+
+    if not parts.netloc and parts.path:
+        parts = urlsplit(f"https://{str(parts.path).lstrip('/')}")
+
+    raw_netloc = str(parts.netloc or "").strip()
+    if "@" in raw_netloc:
+        raise ValueError("некорректный домен")
+
+    authority = raw_netloc
+    if authority.startswith("["):
+        if "]:" in authority:
+            port_str = authority.split("]:", 1)[1]
+            if not port_str.isdigit():
+                raise ValueError("некорректный порт")
+    elif ":" in authority:
+        _, port_str = authority.split(":", 1)
+        if not port_str.isdigit():
+            raise ValueError("некорректный порт")
+
+    try:
+        port = parts.port
+    except ValueError as ex:
+        raise ValueError("некорректный порт") from ex
+    if port is not None and not (1 <= port <= 65535):
+        raise ValueError("некорректный порт")
+
+    hostname = str(getattr(parts, "hostname", None) or "").strip().strip(".").lower()
+    if hostname.startswith("www."):
+        hostname = hostname[4:]
+    if not hostname or ("." not in hostname and ":" not in hostname):
+        raise ValueError("не удалось распознать домен")
+    if hostname == "localhost" or hostname.endswith((".local", ".localhost", ".internal", ".home.arpa")):
+        raise ValueError("локальные и внутренние домены запрещены")
+
+    try:
+        ip_obj = ipaddress.ip_address(hostname)
+    except ValueError:
+        ip_obj = None
+
+    if ip_obj is not None:
+        if _is_disallowed_ip(ip_obj):
+            raise ValueError("локальные и приватные IP-адреса запрещены")
+    else:
+        labels = hostname.split(".")
+        if labels and all(_INT_LITERAL_LABEL_RE.fullmatch(label or "") for label in labels):
+            raise ValueError("локальные и приватные IP-адреса запрещены")
+        try:
+            socket.inet_aton(hostname)
+        except OSError:
+            pass
+        else:
+            raise ValueError("локальные и приватные IP-адреса запрещены")
+
+        if (
+            not re.fullmatch(r"[a-z0-9.-]+", hostname)
+            or ".." in hostname
+            or hostname.startswith(".")
+            or hostname.endswith(".")
+        ):
+            raise ValueError("некорректный домен")
+
+        if check_dns:
+            try:
+                addr_infos = socket.getaddrinfo(hostname, port or 443, type=socket.SOCK_STREAM)
+            except socket.gaierror:
+                addr_infos = []
+            for _family, _socktype, _proto, _canonname, sockaddr in addr_infos:
+                raw_ip = str(sockaddr[0]).split("%", 1)[0] if isinstance(sockaddr, tuple) and sockaddr else ""
+                if not raw_ip:
+                    continue
+                try:
+                    resolved_ip = ipaddress.ip_address(raw_ip)
+                except ValueError:
+                    continue
+                if _is_disallowed_ip(resolved_ip):
+                    raise ValueError("локальные и приватные IP-адреса запрещены")
+
+    canonical_host = f"[{hostname}]" if ":" in hostname else hostname
+    if port is not None:
+        canonical_host = f"{canonical_host}:{port}"
+    return f"https://{canonical_host}/api/v2"
 
 
 def is_plausible_allowed_domain(domain_value: Any) -> bool:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 if TYPE_CHECKING:
@@ -57,6 +58,7 @@ from .funpay_sync import (
 from .links import normalize_incoming_text
 from .orders import _apply_status_result, _find_order_by_any_order_ref
 from .panel_api import (
+    _extract_service_credentials,
     _fetch_single_order_status,
     _normalize_api_key,
     _panel_api_json,
@@ -178,15 +180,8 @@ def _handle_buyer_refill_command(
         return True
 
     cfg = load_config()
-    services = cfg.get("services") if isinstance(cfg, dict) else None
-    service_cfg = services.get(str(service_number)) if isinstance(services, dict) else None
-    if not isinstance(service_cfg, dict):
-        c.send_message(msg_chat_id, _REFILL_UNAVAILABLE_TEXT)
-        return True
-
-    api_url = str(service_cfg.get("api_url") or "").strip()
-    api_key = _normalize_api_key(service_cfg.get("api_key"))
-    if not api_url or _validate_api_key_for_action(service_number, "refill", api_key):
+    api_url, api_key, config_err = _extract_service_credentials(cfg, service_number)
+    if config_err or not api_url or _validate_api_key_for_action(service_number, "refill", api_key):
         c.send_message(msg_chat_id, _REFILL_UNAVAILABLE_TEXT)
         return True
 
@@ -371,6 +366,7 @@ def _persist_and_notify_matched_order(
     )
     _send_buyer_message(c, buyer_chat_id, msg_payment)
 
+    now_ts = time.time()
     with rt.CONTEXT_LOCK:
         rt.waiting_for_link[str(order_id)] = {
             "buyer_id": buyer_id,
@@ -385,6 +381,8 @@ def _persist_and_notify_matched_order(
             "lot_title": matched_lot_title,
             "state": BUYER_STATE_WAITING_LINK,
             "step": "await_link",
+            "created_ts": now_ts,
+            "updated_ts": now_ts,
         }
 
 

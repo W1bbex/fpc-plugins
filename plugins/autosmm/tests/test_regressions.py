@@ -493,6 +493,409 @@ class AutoSmmRegressionsTests(unittest.TestCase):
             if orig_events is not None:
                 sys.modules["src.core.funpay_events"] = orig_events
 
+    def test_panel_api_status_rate_limit_secret_sanitization_and_balance_note(self):
+        import logging
+        from src.core import panel_api
+
+        self.assertEqual(panel_api._normalize_runtime_status("Partially Completed"), "partial")
+        self.assertEqual(panel_api._normalize_runtime_status("Completed"), "completed")
+
+        err_status = panel_api._classify_panel_api_result(
+            action="status",
+            payload={"error": "Unexpected panel error"},
+            raw_text='{"error":"Unexpected panel error"}',
+        )
+        self.assertEqual(err_status["error"], "unknown")
+        self.assertEqual(err_status["error_class"], "UNKNOWN_ERROR")
+
+        rate_429 = panel_api._classify_panel_api_result(
+            action="status",
+            response=SimpleNamespace(status_code=429),
+            payload={"error": "Too many requests"},
+            raw_text='{"error":"Too many requests"}',
+        )
+        self.assertEqual(rate_429["error"], "rate_limited")
+        self.assertEqual(rate_429["error_class"], "TRANSPORT_ERROR")
+
+        rate_txt = panel_api._classify_panel_api_result(
+            action="add",
+            response=SimpleNamespace(status_code=200),
+            payload={"error": "Rate limit exceeded"},
+            raw_text='{"error":"Rate limit exceeded"}',
+        )
+        self.assertEqual(rate_txt["error"], "rate_limited")
+
+        secret = "SUPER_SECRET_KEY_VALUE_123456"
+        records = []
+
+        class _MemHandler(logging.Handler):
+            def emit(self, record):
+                records.append(record.getMessage())
+
+        logger = logging.getLogger("FPC.autosmm")
+        orig_level = logger.level
+        handler = _MemHandler()
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+        fake_resp = SimpleNamespace(
+            status_code=200,
+            text=f'{{"error":"bad key={secret} token {secret}"}}',
+            json=lambda: {"error": f"bad key={secret}"},
+        )
+        try:
+            with mock.patch("src.core.panel_api.requests.post", return_value=fake_resp):
+                panel_api._panel_api_json(
+                    f"https://panel.example/api/v2?key={secret}",
+                    {"key": secret, "action": "status", "order": 1},
+                    timeout=5,
+                )
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(orig_level)
+        joined_logs = "\n".join(records)
+        self.assertNotIn(secret, joined_logs)
+
+        _note, risk_status = panel_api._build_transport_error_balance_note(
+            {"ok": True, "balance": float("nan"), "currency": "RUB"},
+            {"ok": True, "balance": 10.0, "currency": "RUB"},
+        )
+        self.assertEqual(risk_status, "manual_check_balance_unavailable")
+
+        bad_url, bad_key, bad_err = panel_api._extract_service_credentials(
+            {"services": {"1": {"api_url": "http://127.0.0.1/api/v2", "api_key": "REALKEY12345"}}},
+            1,
+        )
+        self.assertIsNone(bad_url)
+        self.assertEqual(bad_key, "")
+        self.assertTrue(bool(bad_err))
+
+        import socket as _socket
+
+        with (
+            mock.patch(
+                "src.models.socket.getaddrinfo",
+                return_value=[(_socket.AF_INET, _socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))],
+            ),
+            mock.patch("src.core.panel_api.requests.post") as post_mock,
+        ):
+            with self.assertRaises(ValueError):
+                panel_api._panel_api_request("https://rebind.attacker.net/api/v2", {"action": "balance"})
+            post_mock.assert_not_called()
+
+    def test_funpay_sync_partial_refund_guard_and_concurrent_cancel_dedup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "autosmm.db"
+            with mock.patch.object(rt, "DB_PATH", str(db_path)):
+                storage.upsert_order_data(
+                    10, "FP-PR-LOCK", 901, "pending", 100.0, "https://t.me/test", 100, 1, funpay_status="open"
+                )
+                row = storage.get_order_data("FP-PR-LOCK")
+                funpay_sync._apply_funpay_status_update(
+                    "FP-PR-LOCK",
+                    row,
+                    "partially_refunded",
+                    checked_at="2026-01-01 00:01:00",
+                    source="poll",
+                    refund_source="funpay_order",
+                )
+                row_after_partial = storage.get_order_data("FP-PR-LOCK")
+                self.assertEqual(row_after_partial["funpay_status"], "partially_refunded")
+
+                funpay_sync._apply_funpay_status_update(
+                    "FP-PR-LOCK",
+                    row_after_partial,
+                    "closed",
+                    checked_at="2026-01-01 00:02:00",
+                    source="poll",
+                    refund_source="funpay_order",
+                )
+                self.assertEqual(storage.get_order_data("FP-PR-LOCK")["funpay_status"], "partially_refunded")
+
+                cancel_calls = []
+                barrier = threading.Barrier(4)
+                with mock.patch.object(
+                    funpay_sync,
+                    "_attempt_panel_cancel_after_funpay_refund",
+                    side_effect=lambda order, source="": cancel_calls.append((order["order_id"], source)) or True,
+                ):
+                    def worker():
+                        barrier.wait(timeout=5)
+                        funpay_sync._apply_funpay_status_update(
+                            "FP-PR-LOCK",
+                            dict(row_after_partial),
+                            "refunded",
+                            checked_at="2026-01-01 00:03:00",
+                            source="race_worker",
+                            refund_source="funpay_order",
+                        )
+
+                    threads = [threading.Thread(target=worker) for _ in range(4)]
+                    for th in threads:
+                        th.start()
+                    for th in threads:
+                        th.join(timeout=5)
+                self.assertEqual(len(cancel_calls), 1)
+                self.assertEqual(storage.get_order_data("FP-PR-LOCK")["funpay_status"], "refunded")
+
+    def test_buyer_flow_link_command_recovery_and_context_copy_isolation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "autosmm.db"
+            orig_wait = dict(rt.waiting_for_link)
+            try:
+                with mock.patch.object(rt, "DB_PATH", str(db_path)):
+                    db.init_db(str(db_path))
+                    db_orders.upsert_order_dict(
+                        {
+                            "order_id": "FP-PAUSE-NO-CACHE",
+                            "buyer_id": 70,
+                            "chat_id": 700,
+                            "buyer_username": "buyer70",
+                            "service_id": 11,
+                            "service_number": 1,
+                            "quantity": 100,
+                            "summa": 50.0,
+                            "status": "pending",
+                            "funpay_status": "open",
+                            "buyer_flow_state": engine.BUYER_STATE_LINK_PAUSED,
+                        }
+                    )
+                    db_orders.upsert_order_dict(
+                        {
+                            "order_id": "FP-CONF-NO-CACHE",
+                            "buyer_id": 71,
+                            "chat_id": 701,
+                            "buyer_username": "buyer71",
+                            "service_id": 11,
+                            "service_number": 1,
+                            "quantity": 100,
+                            "summa": 50.0,
+                            "status": "pending",
+                            "funpay_status": "open",
+                            "buyer_flow_state": engine.BUYER_STATE_WAITING_CONFIRM,
+                            "saved_link": "https://t.me/old_link",
+                        }
+                    )
+                    db_orders.upsert_order_dict(
+                        {
+                            "order_id": "FP-WAIT-TOGGLE",
+                            "buyer_id": 72,
+                            "chat_id": 702,
+                            "buyer_username": "buyer72",
+                            "service_id": 11,
+                            "service_number": 1,
+                            "quantity": 100,
+                            "summa": 50.0,
+                            "status": "pending",
+                            "funpay_status": "open",
+                            "buyer_flow_state": engine.BUYER_STATE_WAITING_LINK,
+                        }
+                    )
+                    rt.waiting_for_link.clear()
+                    sent = []
+                    cardinal = SimpleNamespace(
+                        account=SimpleNamespace(get_order=lambda oid: SimpleNamespace(status="PAID")),
+                        send_message=lambda cid, text, **kw: sent.append((cid, text)),
+                    )
+                    with mock.patch.object(buyer_flow, "load_config", return_value={}):
+                        buyer_flow._handle_buyer_link_command(cardinal, "!ссылка", 70, 700)
+                        self.assertEqual(
+                            storage.get_order_data("FP-PAUSE-NO-CACHE")["buyer_flow_state"],
+                            engine.BUYER_STATE_WAITING_LINK,
+                        )
+                        self.assertIn("возобновлено", sent[-1][1])
+                        cached_resumed = rt.waiting_for_link["FP-PAUSE-NO-CACHE"]
+                        self.assertIn("created_ts", cached_resumed)
+                        self.assertIn("updated_ts", cached_resumed)
+
+                        buyer_flow._handle_buyer_link_command(cardinal, "!ссылка", 71, 701)
+                        conf_row = storage.get_order_data("FP-CONF-NO-CACHE")
+                        self.assertEqual(conf_row["buyer_flow_state"], engine.BUYER_STATE_WAITING_LINK)
+                        self.assertIsNone(conf_row.get("saved_link"))
+                        self.assertIn("сброшена", sent[-1][1])
+
+                        buyer_flow._handle_buyer_link_command(cardinal, "!ссылка", 72, 702)
+                        self.assertEqual(
+                            storage.get_order_data("FP-WAIT-TOGGLE")["buyer_flow_state"],
+                            engine.BUYER_STATE_LINK_PAUSED,
+                        )
+                        self.assertIn("приостановлено", sent[-1][1])
+
+                        caller_ctx = {"buyer_id": 72, "chat_id": 702, "order_id_funpay": "FP-WAIT-TOGGLE"}
+                        buyer_flow._transition_waiting_state(
+                            caller_ctx,
+                            "FP-WAIT-TOGGLE",
+                            72,
+                            702,
+                            engine.BUYER_STATE_WAITING_LINK,
+                        )
+                        self.assertIsNot(rt.waiting_for_link["FP-WAIT-TOGGLE"], caller_ctx)
+            finally:
+                rt.waiting_for_link.clear()
+                rt.waiting_for_link.update(orig_wait)
+
+    def test_notifications_unknown_charge_and_panel_submission_key_normalization(self):
+        sent_bot = []
+        fake_bot = SimpleNamespace(send_message=lambda cid, text, **kw: sent_bot.append((cid, text)))
+        orig_bot = rt.bot
+        try:
+            rt.bot = fake_bot
+            with (
+                mock.patch.object(notifications, "load_config", return_value={"notification_chat_id": "999"}),
+                mock.patch.object(
+                    notifications,
+                    "_fetch_start_notification_charge",
+                    return_value=(None, None, None, None, None),
+                ),
+                mock.patch.object(
+                    notifications,
+                    "get_order_data",
+                    return_value={"order_id": "FP-NO-CH", "buyer_username": "alice", "spent": 0.0},
+                ),
+            ):
+                notifications.send_order_started_notification(
+                    SimpleNamespace(
+                        account=SimpleNamespace(get_order=lambda oid: SimpleNamespace(buyer_username="alice")),
+                        telegram=SimpleNamespace(bot=fake_bot),
+                    ),
+                    "FP-NO-CH",
+                    321,
+                    "https://panel.example/api/v2",
+                    "KEY12345",
+                    150.0,
+                    1000,
+                    service_number=1,
+                )
+        finally:
+            rt.bot = orig_bot
+
+        self.assertEqual(len(sent_bot), 1)
+        self.assertIn("стоимость уточняется", sent_bot[0][1])
+        self.assertIn("Профит: уточняется", sent_bot[0][1])
+        self.assertNotIn("0.00 RUB", sent_bot[0][1])
+
+        with (
+            mock.patch.object(panel_submission, "_persist_created_order_records"),
+            mock.patch.object(panel_submission, "schedule_single_panel_balance_refresh"),
+            mock.patch.object(panel_submission, "get_order_data", return_value={"order_id": "FP-KEY"}),
+            mock.patch.object(panel_submission, "_is_order_refundedish", return_value=False),
+            mock.patch.object(panel_submission, "check_order_status"),
+            mock.patch.object(panel_submission, "_send_buyer_order_confirmation"),
+            mock.patch.object(panel_submission, "send_order_started_notification") as notify_mock,
+        ):
+            panel_submission._finalize_created_order(
+                c=SimpleNamespace(),
+                cfg={"services": {"1": {"api_url": "https://panel.example/api/v2", "api_key": "api_key=CLEANKEY123"}}},
+                order_id_funpay="FP-KEY",
+                buyer_chat_id=100,
+                panel_order_id=999,
+                link_="https://t.me/test",
+                lot_price=10.0,
+                real_amount=100,
+                service_number=1,
+            )
+        notify_mock.assert_called_once()
+        self.assertEqual(notify_mock.call_args.args[4], "CLEANKEY123")
+
+    def test_analytics_excludes_refunded_revenue_locks_view_modes_and_refill_ssrf(self):
+        from src.services import analytics
+
+        orders_list = [
+            {"order_id": "OK1", "status": "completed", "funpay_status": "closed", "summa": 100.0, "spent": 40.0, "currency": "RUB"},
+            {"order_id": "REF1", "status": "completed", "funpay_status": "refunded", "summa": 200.0, "spent": 50.0, "currency": "RUB"},
+        ]
+        summary = analytics._analytics_get_period_analytics("all", load_merged=lambda: orders_list)
+        self.assertAlmostEqual(summary["revenue"], 100.0)
+        self.assertAlmostEqual(summary["spent"], 40.0)
+        self.assertAlmostEqual(summary["profit"], 60.0)
+        self.assertEqual(summary["refunded"], 1)
+        self.assertAlmostEqual(summary["losses"], 50.0)
+
+        analytics._set_analytics_view_mode(555, 777, "more")
+        self.assertEqual(analytics._get_analytics_view_mode(555, 777), "more")
+
+        sent_buyer = []
+        cardinal = SimpleNamespace(
+            account=SimpleNamespace(get_order=lambda oid: SimpleNamespace(status="PAID")),
+            send_message=lambda cid, text: sent_buyer.append((cid, text)),
+        )
+        stubs = _build_fake_funpay_modules() if "FunPayAPI" not in sys.modules else {}
+        orig_events_mod = sys.modules.pop("src.core.funpay_events", None)
+        try:
+            with mock.patch.dict(sys.modules, stubs):
+                funpay_events = importlib.import_module("src.core.funpay_events")
+                with (
+                    mock.patch.object(
+                        funpay_events,
+                        "_resolve_buyer_command_order",
+                        return_value={"order_id": "FP-REF-SSRF", "buyer_id": 55, "chat_id": 550, "id_zakaz": 321, "service_number": 1, "funpay_status": "open"},
+                    ),
+                    mock.patch.object(
+                        funpay_events,
+                        "load_config",
+                        return_value={"services": {"1": {"api_url": "http://127.0.0.1/api/v2", "api_key": "KEY123456"}}},
+                    ),
+                    mock.patch.object(funpay_events, "_panel_api_json") as panel_json_mock,
+                ):
+                    handled = funpay_events._handle_buyer_refill_command(cardinal, "рефилл 321", 55, 550)
+                self.assertTrue(handled)
+                panel_json_mock.assert_not_called()
+                self.assertEqual(sent_buyer, [(550, funpay_events._REFILL_UNAVAILABLE_TEXT)])
+        finally:
+            sys.modules.pop("src.core.funpay_events", None)
+            if orig_events_mod is not None:
+                sys.modules["src.core.funpay_events"] = orig_events_mod
+
+    def test_storage_claim_zero_chat_id_summa_backup_ssrf_locks_and_repo_isolation(self):
+        from src.storage import backups
+        from src.tg import common as tg_common
+
+        self.assertIs(tg_common._CALLBACK_TOKENS_LOCK, rt.CONTEXT_LOCK)
+        repo_storage_dir = Path(__file__).resolve().parent.parent / "storage"
+        self.assertFalse(repo_storage_dir.exists())
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "autosmm.db"
+            with mock.patch.object(rt, "DB_PATH", str(db_path)):
+                db.init_db(str(db_path))
+                ok_claim, reason, _row = db_orders.claim_order_for_panel_submission(
+                    "FP-ZERO-CHAT",
+                    saved_link="https://t.me/ch",
+                    service_number=1,
+                    seed_fields={"buyer_id": 9, "chat_id": 0, "quantity": 100, "service_id": 5, "price": 0.0},
+                )
+                self.assertTrue(ok_claim, reason)
+                claimed = db_orders.get_order("FP-ZERO-CHAT")
+                self.assertEqual(claimed["chat_id"], 0)
+                self.assertEqual(claimed["summa"], 0.0)
+
+                db_orders.upsert_order_dict(
+                    {
+                        "order_id": "FP-ZERO-SUMMA",
+                        "summa": 0.0,
+                        "order_price": 120.0,
+                        "quantity": 100,
+                        "service_id": 5,
+                        "service_number": 1,
+                    }
+                )
+                zero_summa = db_orders.get_order("FP-ZERO-SUMMA")
+                self.assertEqual(zero_summa["summa"], 0.0)
+
+        ok_backup, backup_msg = backups._validate_backup_wrapper(
+            {
+                "autosmm_backup_version": 2,
+                "files": {
+                    "auto_lots.json": {
+                        "services": {"1": {"api_url": "http://127.0.0.1/api/v2", "api_key": "K123"}}
+                    }
+                },
+                "orders": [],
+                "state": {},
+            }
+        )
+        self.assertFalse(ok_backup)
+        self.assertIn("api_url", backup_msg)
+
 
 if __name__ == "__main__":
     unittest.main()

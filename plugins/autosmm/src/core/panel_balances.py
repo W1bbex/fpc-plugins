@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-import ipaddress
 import re
 import threading
 import time
@@ -11,6 +10,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
 from .. import runtime as rt
+from ..models import normalize_api_url
 from ..storage.storage import load_config
 from .panel_api import (
     _normalize_api_key,
@@ -29,66 +29,6 @@ def format_currency_symbol(currency: str) -> str:
     if currency_upper == "RUB":
         return "₽"
     return currency_upper or ""
-
-
-def normalize_api_url(raw_url: Any) -> str:
-    """Normalize and validate an SMM panel API endpoint while blocking private/local targets."""
-    raw_value = str(raw_url or "").strip()
-    if not raw_value:
-        raise ValueError("ссылка или домен не должны быть пустыми")
-
-    markdown_match = re.match(r"^\[[^\]]+\]\(([^)]+)\)$", raw_value)
-    if markdown_match:
-        raw_value = markdown_match.group(1).strip()
-
-    raw_value = raw_value.replace("\\", "/").strip()
-    if raw_value.startswith("//"):
-        raw_value = f"https:{raw_value}"
-
-    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://", raw_value):
-        raw_value = f"https://{raw_value.lstrip('/')}"
-
-    parts = urlsplit(raw_value)
-    host = str(parts.netloc or "").strip().lower()
-
-    if not host and parts.path:
-        fallback_parts = urlsplit(f"https://{str(parts.path).lstrip('/')}")
-        host = str(fallback_parts.netloc or "").strip().lower()
-        parts = fallback_parts
-
-    if "@" in host:
-        host = host.rsplit("@", 1)[-1]
-    if host.startswith("www."):
-        host = host[4:]
-
-    if not host or "." not in host:
-        raise ValueError("не удалось распознать домен")
-
-    hostname = str(getattr(parts, "hostname", None) or host.split(":", 1)[0]).strip("[]").lower()
-    if not hostname or ("." not in hostname and ":" not in hostname):
-        raise ValueError("не удалось распознать домен")
-    if hostname.endswith((".local", ".localhost", ".internal", ".home.arpa")):
-        raise ValueError("локальные и внутренние домены запрещены")
-    try:
-        ip_obj = ipaddress.ip_address(hostname)
-    except ValueError:
-        ip_obj = None
-    if ip_obj is not None:
-        if (
-            ip_obj.is_private
-            or ip_obj.is_loopback
-            or ip_obj.is_link_local
-            or ip_obj.is_reserved
-            or ip_obj.is_multicast
-            or ip_obj.is_unspecified
-        ):
-            raise ValueError("локальные и приватные IP-адреса запрещены")
-    else:
-        host_no_port = host.split(":", 1)[0]
-        if not re.fullmatch(r"[a-z0-9.-]+", host_no_port) or host_no_port.startswith(".") or host_no_port.endswith("."):
-            raise ValueError("некорректный домен")
-
-    return f"https://{host}/api/v2"
 
 
 def extract_service_domain(api_url: Any) -> str:
@@ -129,6 +69,10 @@ def has_valid_service_credentials(service_number: int, service_cfg: Optional[Dic
         or is_placeholder_api_url(api_url_raw)
         or _validate_api_key_for_action(service_number, "balance", api_key)
     ):
+        return False
+    try:
+        normalize_api_url(api_url_raw)
+    except ValueError:
         return False
     return True
 
@@ -206,19 +150,18 @@ def _cache_inflight_dict_locked() -> Dict[str, Dict[str, Any]]:
 
 def invalidate_panel_balance_cache(service_number: Optional[int] = None) -> None:
     """Invalidate cached panel balances and advance cache generation to drop stale async writes."""
+    if service_number is None:
+        rt.invalidate_panel_balance_cache()
+        return
     with rt.PANEL_BALANCE_CACHE_LOCK:
         rt.PANEL_BALANCE_CACHE["generation"] = int(rt.PANEL_BALANCE_CACHE.get("generation") or 0) + 1
         rt.PANEL_BALANCE_CACHE["timestamp"] = 0.0
         _cache_inflight_dict_locked().clear()
         services_map = _cache_services_dict_locked()
-        if service_number is None:
-            services_map.clear()
-            rt.PANEL_BALANCE_CACHE["text"] = "недоступно"
-        else:
-            services_map.pop(str(service_number), None)
-            rt.PANEL_BALANCE_CACHE["text"] = "недоступно" if not services_map else compute_total_balance_text(
-                None, services_map
-            )
+        services_map.pop(str(service_number), None)
+        rt.PANEL_BALANCE_CACHE["text"] = "недоступно" if not services_map else compute_total_balance_text(
+            None, services_map
+        )
 
 
 def compute_total_balance_text(
@@ -449,7 +392,7 @@ def schedule_panel_balances_refresh(
 
         inflight = _cache_inflight_dict_locked()
         existing = inflight.get(inflight_key)
-        if existing is None and service_number is not None:
+        if existing is None and service_number is not None and not force:
             existing = inflight.get("all")
         if existing is not None:
             if on_complete is not None:

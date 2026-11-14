@@ -211,7 +211,10 @@ def _prepare_order_params(raw: Mapping[str, Any]) -> Optional[Tuple[Any, ...]]:
         return None
 
     buyer_raw = raw.get("buyer_id")
-    summa = safe_float(raw.get("summa", raw.get("order_price", 0.0)), 0.0)
+    raw_summa = raw.get("summa")
+    if raw_summa is None:
+        raw_summa = raw.get("order_price", 0.0)
+    summa = safe_float(raw_summa, 0.0)
     chistota_raw = raw.get("chistota")
     chistota = summa if chistota_raw is None else safe_float(chistota_raw, 0.0)
     fallback_used_int, fallback_reason = _normalize_fallback_pair(
@@ -638,7 +641,7 @@ def claim_order_for_panel_submission(
             seed = dict(seed_fields or {})
             merged = {
                 "order_id": target_id,
-                "chat_id": safe_int(seed.get("chat_id")),
+                "chat_id": normalize_chat_id(seed.get("chat_id")),
                 "buyer_id": seed.get("buyer_id"),
                 "buyer_username": str(seed.get("buyer_username") or ""),
                 "lot_title": str(seed.get("lot_title") or ""),

@@ -31,6 +31,7 @@ from ..models import (
     safe_int as _safe_int,
 )
 from ..storage.storage import (
+    ORDERS_LOCK,
     get_order_data,
     load_orders_data,
     update_order_fields,
@@ -146,49 +147,55 @@ def _apply_funpay_status_update(
     if not normalized_status:
         return dict(order_record)
 
-    previous_funpay_status = _get_effective_funpay_status(get_order_data(order_id_funpay)) or _get_effective_funpay_status(order_record)
-    if previous_funpay_status == "refunded" and normalized_status != "refunded":
-        rt.logger.info(
-            f"FUNPAY STATUS REGRESSION BLOCKED: order=#{order_id_funpay}, "
-            f"{previous_funpay_status}->{normalized_status}, source={source}"
-        )
-        return dict(order_record)
-    if previous_funpay_status == "partially_refunded" and normalized_status == "open":
-        rt.logger.info(
-            f"FUNPAY STATUS REGRESSION BLOCKED: order=#{order_id_funpay}, "
-            f"{previous_funpay_status}->{normalized_status}, source={source}"
-        )
-        return dict(order_record)
+    with ORDERS_LOCK:
+        previous_funpay_status = _get_effective_funpay_status(get_order_data(order_id_funpay)) or _get_effective_funpay_status(order_record)
+        if previous_funpay_status == "refunded" and normalized_status != "refunded":
+            rt.logger.info(
+                f"FUNPAY STATUS REGRESSION BLOCKED: order=#{order_id_funpay}, "
+                f"{previous_funpay_status}->{normalized_status}, source={source}"
+            )
+            return dict(order_record)
+        if previous_funpay_status == "partially_refunded" and normalized_status in ("open", "closed"):
+            rt.logger.info(
+                f"FUNPAY STATUS REGRESSION BLOCKED: order=#{order_id_funpay}, "
+                f"{previous_funpay_status}->{normalized_status}, source={source}"
+            )
+            return dict(order_record)
 
-    fields: Dict[str, Any] = {
-        "funpay_status": normalized_status,
-        "funpay_status_checked_at": checked_at,
-    }
-    if normalized_status in ("refunded", "partially_refunded"):
-        fields.update(
-            {
-                "refund_detected_at": checked_at,
-                "refund_source": refund_source,
-                "buyer_flow_state": BUYER_STATE_REFUNDED,
-                "saved_link": None,
-                "updated_at": checked_at,
-            }
-        )
-        with rt.CONTEXT_LOCK:
-            rt.waiting_for_link.pop(str(order_id_funpay), None)
+        fields: Dict[str, Any] = {
+            "funpay_status": normalized_status,
+            "funpay_status_checked_at": checked_at,
+        }
+        if normalized_status in ("refunded", "partially_refunded"):
+            fields.update(
+                {
+                    "refund_detected_at": checked_at,
+                    "refund_source": refund_source,
+                    "buyer_flow_state": BUYER_STATE_REFUNDED,
+                    "saved_link": None,
+                    "updated_at": checked_at,
+                }
+            )
 
-    try:
-        update_order_fields(order_id_funpay, **fields)
-    except (sqlite3.Error, OSError) as ex:
-        if not swallow_save_error:
-            raise
-        rt.logger.warning(f"FUNPAY STATUS SAVE FAILED: order=#{order_id_funpay}, source={source}, error={ex}")
-        fallback_record = dict(order_record)
-        fallback_record.update(fields)
-        return fallback_record
+        try:
+            update_order_fields(order_id_funpay, **fields)
+        except (sqlite3.Error, OSError) as ex:
+            if not swallow_save_error:
+                raise
+            rt.logger.warning(f"FUNPAY STATUS SAVE FAILED: order=#{order_id_funpay}, source={source}, error={ex}")
+            if normalized_status in ("refunded", "partially_refunded"):
+                with rt.CONTEXT_LOCK:
+                    rt.waiting_for_link.pop(str(order_id_funpay), None)
+            fallback_record = dict(order_record)
+            fallback_record.update(fields)
+            return fallback_record
 
-    updated_order = get_order_data(order_id_funpay) or dict(order_record)
-    updated_order.update(fields)
+        if normalized_status in ("refunded", "partially_refunded"):
+            with rt.CONTEXT_LOCK:
+                rt.waiting_for_link.pop(str(order_id_funpay), None)
+
+        updated_order = get_order_data(order_id_funpay) or dict(order_record)
+        updated_order.update(fields)
 
     if normalized_status == "refunded" and previous_funpay_status != "refunded":
         try:

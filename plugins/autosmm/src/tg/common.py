@@ -16,7 +16,7 @@ from .. import runtime as rt
 
 _NAVIGATION_TARGETS: Dict[str, Callable[[types.CallbackQuery], Any]] = {}
 _NAVIGATION_PREFIXES: List[Tuple[str, Callable[[types.CallbackQuery, str], Any]]] = []
-_CALLBACK_TOKENS_LOCK = threading.Lock()
+_CALLBACK_TOKENS_LOCK = rt.CONTEXT_LOCK
 _CALLBACK_TOKENS_MAX = 1000
 
 STATE_RESTORE_BACKUP = "autosmm:restore_backup"

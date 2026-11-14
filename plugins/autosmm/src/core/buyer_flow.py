@@ -202,6 +202,14 @@ def _build_waiting_context_from_order(order_record: Dict) -> Optional[Dict[str, 
     if not order_id:
         return None
     state = _get_buyer_flow_state(order_record)
+    now_ts = time.time()
+    raw_created = order_record.get("created_at")
+    try:
+        created_ts = float(raw_created) if raw_created not in (None, "") else now_ts
+    except (TypeError, ValueError):
+        created_ts = now_ts
+    if created_ts <= 0:
+        created_ts = now_ts
     return {
         "buyer_id": order_record.get("buyer_id"),
         "chat_id": order_record.get("chat_id"),
@@ -216,6 +224,8 @@ def _build_waiting_context_from_order(order_record: Dict) -> Optional[Dict[str, 
         "state": state,
         "step": _step_from_state(state),
         "link": order_record.get("saved_link") or order_record.get("customer_url") or "",
+        "created_ts": created_ts,
+        "updated_ts": now_ts,
     }
 
 
@@ -229,9 +239,15 @@ def _transition_waiting_state(
     select_order: bool = True,
 ) -> None:
     """Update waiting context, persist buyer flow state, and update active selection."""
+    local_ctx = dict(ctx)
+    now_ts = time.time()
+    local_ctx.setdefault("created_ts", now_ts)
+    local_ctx["updated_ts"] = now_ts
+    _save_waiting_context(local_ctx, state=state, saved_link_marker=saved_link_marker)
     with rt.CONTEXT_LOCK:
-        rt.waiting_for_link[order_id] = ctx
-    _save_waiting_context(ctx, state=state, saved_link_marker=saved_link_marker)
+        rt.waiting_for_link[order_id] = dict(local_ctx)
+    ctx.clear()
+    ctx.update(local_ctx)
     if select_order:
         _set_selected_order_for_buyer(buyer_id, chat_id, order_id)
     else:
@@ -340,12 +356,10 @@ def _handle_buyer_link_command(c: "Cardinal", msg_text: str, buyer_id: Any, chat
         _send_buyer_message(c, chat_id, BUYER_PANEL_CREATED_BLOCK_TEXT)
         return True
     with rt.CONTEXT_LOCK:
-        ctx = rt.waiting_for_link.get(order_id)
+        cached = rt.waiting_for_link.get(order_id)
+        ctx = dict(cached) if isinstance(cached, dict) else None
     if ctx is None:
         ctx = _build_waiting_context_from_order(order_record) or {}
-        _transition_waiting_state(ctx, order_id, buyer_id, chat_id, BUYER_STATE_LINK_PAUSED, saved_link_marker=None, select_order=False)
-        _send_buyer_message(c, chat_id, f"⏸ Ожидание ссылки приостановлено.\n\n🧾 Заказ: #{order_id}\n\nКогда будете готовы отправить ссылку:\n!ссылка {order_id}")
-        return True
     if state == BUYER_STATE_LINK_PAUSED:
         _transition_waiting_state(ctx, order_id, buyer_id, chat_id, BUYER_STATE_WAITING_LINK, saved_link_marker=None)
         _send_buyer_message(c, chat_id, f"▶️ Ожидание ссылки возобновлено.\n\n🧾 Заказ: #{order_id}\n\nОтправьте ссылку для запуска заказа.\nСсылка должна начинаться с:\nhttps://")
@@ -353,6 +367,14 @@ def _handle_buyer_link_command(c: "Cardinal", msg_text: str, buyer_id: Any, chat
     if state == BUYER_STATE_WAITING_CONFIRM:
         _transition_waiting_state(ctx, order_id, buyer_id, chat_id, BUYER_STATE_WAITING_LINK, saved_link_marker=None)
         _send_buyer_message(c, chat_id, f"Текущая ссылка сброшена.\n\n🧾 Заказ: #{order_id}\n\nОтправьте новую ссылку.\nСсылка должна начинаться с:\nhttps://")
+        return True
+    if state == BUYER_STATE_WAITING_LINK:
+        if raw_ref:
+            _transition_waiting_state(ctx, order_id, buyer_id, chat_id, BUYER_STATE_WAITING_LINK, select_order=True)
+            _send_buyer_message(c, chat_id, "Отправьте ссылку для запуска заказа.")
+            return True
+        _transition_waiting_state(ctx, order_id, buyer_id, chat_id, BUYER_STATE_LINK_PAUSED, saved_link_marker=None, select_order=False)
+        _send_buyer_message(c, chat_id, f"⏸ Ожидание ссылки приостановлено.\n\n🧾 Заказ: #{order_id}\n\nКогда будете готовы отправить ссылку:\n!ссылка {order_id}")
         return True
     _send_buyer_message(c, chat_id, "Отправьте ссылку для запуска заказа.")
     return True
@@ -422,7 +444,8 @@ def _handle_buyer_cancel_command(c: "Cardinal", msg_text: str, buyer_id: Any, ch
         _send_buyer_message(c, chat_id, "Заказ уже передан в работу.\nАвтоматическая отмена недоступна.")
         return True
     with rt.CONTEXT_LOCK:
-        ctx = rt.waiting_for_link.get(order_id)
+        cached = rt.waiting_for_link.get(order_id)
+        ctx = dict(cached) if isinstance(cached, dict) else None
     if not ctx:
         ctx = _build_waiting_context_from_order(order_record) or {}
     ctx.update({"order_id_funpay": order_id, "buyer_id": buyer_id, "chat_id": chat_id})
@@ -548,7 +571,8 @@ def _handle_waiting_link_message(c: "Cardinal", order_record: Dict, msg_text: st
         _send_buyer_message(c, chat_id, reason)
         return True
     with rt.CONTEXT_LOCK:
-        ctx = rt.waiting_for_link.get(order_id)
+        cached = rt.waiting_for_link.get(order_id)
+        ctx = dict(cached) if isinstance(cached, dict) else None
     if not ctx:
         ctx = _build_waiting_context_from_order(order_record) or {}
     ctx.update({"buyer_id": buyer_id, "chat_id": chat_id, "order_id_funpay": order_id, "link": link_})
@@ -556,10 +580,14 @@ def _handle_waiting_link_message(c: "Cardinal", order_record: Dict, msg_text: st
         _transition_waiting_state(ctx, order_id, buyer_id, chat_id, BUYER_STATE_WAITING_CONFIRM, saved_link_marker=link_)
         _send_link_confirmation_prompt(c, chat_id, order_id, link_)
         return True
+    now_ts = time.time()
+    ctx.setdefault("created_ts", now_ts)
+    ctx["updated_ts"] = now_ts
+    local_ctx = dict(ctx)
+    _save_waiting_context(local_ctx, state=BUYER_STATE_WAITING_LINK, saved_link_marker=link_)
     with rt.CONTEXT_LOCK:
-        rt.waiting_for_link[order_id] = ctx
-    _save_waiting_context(ctx, state=BUYER_STATE_WAITING_LINK, saved_link_marker=link_)
-    process_link_without_confirmation(c, ctx)
+        rt.waiting_for_link[order_id] = dict(local_ctx)
+    process_link_without_confirmation(c, dict(local_ctx))
     _clear_selected_order_for_buyer(buyer_id, chat_id)
     return True
 
@@ -581,7 +609,8 @@ def _handle_waiting_confirm_message(c: "Cardinal", order_record: Dict, msg_text:
         _send_buyer_message(c, chat_id, BUYER_PANEL_CREATED_BLOCK_TEXT)
         return True
     with rt.CONTEXT_LOCK:
-        ctx = rt.waiting_for_link.get(order_id)
+        cached = rt.waiting_for_link.get(order_id)
+        ctx = dict(cached) if isinstance(cached, dict) else None
     if not ctx:
         ctx = _build_waiting_context_from_order(order_record) or {}
     ctx.update({"buyer_id": buyer_id, "chat_id": chat_id, "order_id_funpay": order_id, "link": order_record.get("saved_link") or ctx.get("link") or order_record.get("customer_url") or ""})

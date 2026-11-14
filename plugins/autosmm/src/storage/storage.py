@@ -784,6 +784,7 @@ def wipe_all_autosmm_data() -> Tuple[int, List[str]]:
                 failed.append(path_value)
                 logger.error(f"Не удалось удалить файл {path_value}: {exc}")
         rt.clear_memory_contexts()
+        rt.invalidate_panel_balance_cache()
     return removed, failed
 
 

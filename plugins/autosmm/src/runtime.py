@@ -274,6 +274,24 @@ def clear_memory_contexts() -> None:
         SCREEN_REVISION.clear()
 
 
+def invalidate_panel_balance_cache() -> None:
+    """Clear all cached panel balances and advance generation so stale async writes are discarded."""
+    with PANEL_BALANCE_CACHE_LOCK:
+        PANEL_BALANCE_CACHE["generation"] = int(PANEL_BALANCE_CACHE.get("generation") or 0) + 1
+        PANEL_BALANCE_CACHE["timestamp"] = 0.0
+        inflight = PANEL_BALANCE_CACHE.get("inflight")
+        if isinstance(inflight, dict):
+            inflight.clear()
+        else:
+            PANEL_BALANCE_CACHE["inflight"] = {}
+        services_map = PANEL_BALANCE_CACHE.get("services")
+        if isinstance(services_map, dict):
+            services_map.clear()
+        else:
+            PANEL_BALANCE_CACHE["services"] = {}
+        PANEL_BALANCE_CACHE["text"] = "недоступно"
+
+
 def now_str() -> str:
     """Return local timestamp formatted consistently for order and log records."""
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")

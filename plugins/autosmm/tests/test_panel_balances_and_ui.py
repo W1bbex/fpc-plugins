@@ -574,6 +574,77 @@ class RegressionContractsTests(unittest.TestCase):
         self.assertEqual(len(get_order_calls), 1)
         self.assertEqual(refund_calls, ["FP-ONE-GET"])
 
+    def test_ssrf_url_validation_credentials_force_refresh_and_wipe_cache(self):
+        from src import models
+
+        record_dict = OrderRecord(order_id="FP-TODICT", summa=12.5).to_dict()
+        self.assertEqual(record_dict["order_id"], "FP-TODICT")
+        self.assertEqual(record_dict["summa"], 12.5)
+
+        for bad_url in (
+            "http://127.0.0.1/api/v2",
+            "http://[::1]/api/v2",
+            "http://[::ffff:127.0.0.1]/api/v2",
+            "http://0177.0.0.1/api/v2",
+            "http://2130706433/api/v2",
+            "http://100.64.0.1/api/v2",
+            "http://panel.local/api/v2",
+            "https://user:pass@panel.example/api/v2",
+            "ftp://panel.example/api/v2",
+            "https://panel.example:99999/api/v2",
+        ):
+            with self.assertRaises(ValueError, msg=f"expected rejection for {bad_url}"):
+                models.normalize_api_url(bad_url)
+
+        self.assertEqual(
+            models.normalize_api_url("https://panel.example/api/v2"),
+            "https://panel.example/api/v2",
+        )
+        self.assertFalse(
+            panel_balances.has_valid_service_credentials(
+                1,
+                {"api_url": "http://127.0.0.1/api/v2", "api_key": "REALKEY123456"},
+            )
+        )
+
+        with rt.PANEL_BALANCE_CACHE_LOCK:
+            rt.PANEL_BALANCE_CACHE["services"]["1"] = {"status": "ok", "balance": 10.0}
+            gen_before = int(rt.PANEL_BALANCE_CACHE.get("generation") or 0)
+        storage.wipe_all_autosmm_data()
+        with rt.PANEL_BALANCE_CACHE_LOCK:
+            self.assertEqual(rt.PANEL_BALANCE_CACHE["services"], {})
+            self.assertEqual(rt.PANEL_BALANCE_CACHE["timestamp"], 0.0)
+            self.assertGreater(int(rt.PANEL_BALANCE_CACHE["generation"]), gen_before)
+
+        fake_cfg = {"services": {"2": {"api_url": "https://p2.example/api/v2", "api_key": "REALKEY123456"}}}
+        captured_targets = []
+        with rt.PANEL_BALANCE_CACHE_LOCK:
+            inflight = panel_balances._cache_inflight_dict_locked()
+            inflight["all"] = {"started_at": time.time(), "callbacks": []}
+        try:
+            with (
+                mock.patch.object(
+                    panel_balances,
+                    "refresh_panel_balances_sync",
+                    side_effect=lambda *a, **kw: captured_targets.append(kw.get("service_number")) or (True, "ok"),
+                ),
+                mock.patch.object(
+                    panel_balances.threading,
+                    "Thread",
+                    side_effect=lambda target, name=None, daemon=True: SimpleNamespace(start=target),
+                ),
+            ):
+                scheduled = panel_balances.schedule_panel_balances_refresh(
+                    cfg=fake_cfg,
+                    force=True,
+                    service_number=2,
+                )
+        finally:
+            with rt.PANEL_BALANCE_CACHE_LOCK:
+                panel_balances._cache_inflight_dict_locked().pop("all", None)
+        self.assertTrue(scheduled)
+        self.assertEqual(captured_targets, [2])
+
 
 if __name__ == "__main__":
     unittest.main()

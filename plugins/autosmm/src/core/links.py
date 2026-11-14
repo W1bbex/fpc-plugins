@@ -151,14 +151,18 @@ def _links_is_valid_link(link: str, *, allowed_domains) -> Tuple[bool, str]:
         raw_link = 'https://' + raw_link[8:]
     else:
         return (False, INVALID_LINK_SCHEME_TEXT)
+    if '\\' in raw_link:
+        return (False, '❌ Некорректный формат ссылки.')
     try:
         parsed = urlparse(raw_link)
     except ValueError:
         return (False, '❌ Не удалось прочитать ссылку.')
+    if '\\' in (parsed.netloc or ''):
+        return (False, '❌ Некорректный формат ссылки.')
     hostname = (parsed.hostname or '').strip().lower().strip('.')
     if hostname.startswith('www.'):
         hostname = hostname[4:]
-    if not hostname:
+    if not hostname or not _is_plausible_allowed_domain(hostname):
         return (False, '❌ Не удалось определить домен ссылки.')
     for allowed_domain in _provided_links(allowed_domains):
         domain = _normalize_allowed_domain(allowed_domain)

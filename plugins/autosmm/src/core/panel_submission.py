@@ -42,7 +42,7 @@ from .engine import (
 from .funpay_sync import _apply_refund_gate
 from .links import _format_target_for_panel
 from .orders import check_order_status
-from .panel_api import _get_panel_balance_for_risk_check, send_order_to_service
+from .panel_api import _extract_service_credentials, _get_panel_balance_for_risk_check, send_order_to_service
 from .panel_balances import schedule_single_panel_balance_refresh
 from .refunds import _attempt_panel_cancel_after_funpay_refund, refund_order
 
@@ -283,12 +283,9 @@ def _finalize_created_order(
         _attempt_panel_cancel_after_funpay_refund(latest_after_save, source="concurrent_refund_after_add")
         return
 
-    services = cfg.get("services") if isinstance(cfg, dict) else None
-    service_cfg = services.get(str(service_number)) if isinstance(services, dict) else None
-    api_url = str(service_cfg.get("api_url") or "").strip() if isinstance(service_cfg, dict) else ""
-    api_key = str(service_cfg.get("api_key") or "").strip() if isinstance(service_cfg, dict) else ""
-    if not api_url:
-        rt.logger.warning(f"POST-CREATE NOTIFICATION SKIPPED: не найден config.services[{service_number}]")
+    api_url, api_key, config_err = _extract_service_credentials(cfg, service_number)
+    if config_err or not api_url:
+        rt.logger.warning(f"POST-CREATE NOTIFICATION SKIPPED: {config_err or f'не найден config.services[{service_number}]'}")
     else:
         try:
             send_order_started_notification(

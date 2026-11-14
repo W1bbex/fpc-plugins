@@ -48,6 +48,8 @@ STATUS_BATCH_INTERVAL_SECONDS = 300
 INCORRECT_ORDER_ID_MAX_ATTEMPTS = 3
 
 _SOFT_STATUS_ERRORS = (
+    "timeout",
+    "rate_limited",
     "network_error",
     "http_error",
     "invalid_json",
@@ -256,7 +258,7 @@ def _sync_single_order_status(c: "Cardinal", order_record: Dict, background_sync
 
 
 def _is_batch_transport_error(error_code: Any) -> bool:
-    return str(error_code or "").strip().lower() in ("timeout", "network_error", "invalid_json", "http_error", "unknown")
+    return str(error_code or "").strip().lower() in ("timeout", "rate_limited", "network_error", "invalid_json", "http_error", "unknown")
 
 
 def _save_batch_failure_for_chunk(chunk: List[Dict], error_code: Any, detail: Any) -> None:

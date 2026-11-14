@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional, Tuple
 import uuid
 
 from .. import runtime as rt
+from ..models import normalize_api_url
 from . import db_state
 from . import migrations
 from .storage import (
@@ -162,8 +163,19 @@ def _validate_backup_wrapper(payload: Any) -> Tuple[bool, str]:
 
     cfg_payload = files.get("auto_lots.json")
     if isinstance(cfg_payload, dict):
-        if "services" in cfg_payload and not isinstance(cfg_payload["services"], dict):
+        services_payload = cfg_payload.get("services")
+        if "services" in cfg_payload and not isinstance(services_payload, dict):
             return False, "В бэкапе некорректный раздел services в auto_lots.json."
+        if isinstance(services_payload, dict):
+            for srv_key, srv_cfg in services_payload.items():
+                if not isinstance(srv_cfg, dict):
+                    return False, f"В бэкапе некорректная запись сервиса #{srv_key} в auto_lots.json."
+                raw_api_url = str(srv_cfg.get("api_url") or "").strip()
+                if raw_api_url:
+                    try:
+                        normalize_api_url(raw_api_url)
+                    except ValueError as exc:
+                        return False, f"В бэкапе запрещённый или некорректный api_url для сервиса #{srv_key}: {exc}."
         if "lot_mapping" in cfg_payload and not isinstance(cfg_payload["lot_mapping"], dict):
             return False, "В бэкапе некорректный раздел lot_mapping в auto_lots.json."
 
@@ -233,6 +245,15 @@ def _restore_backup_wrapper(payload: Dict[str, Any]) -> Tuple[bool, str]:
             try:
                 for file_name, file_path in file_map.items():
                     value = files.get(file_name, _backup_default_for_file(file_name))
+                    if file_name == "auto_lots.json" and isinstance(value, dict):
+                        value = json.loads(json.dumps(value, ensure_ascii=False))
+                        services_map = value.get("services")
+                        if isinstance(services_map, dict):
+                            for srv_cfg in services_map.values():
+                                if isinstance(srv_cfg, dict):
+                                    raw_url = str(srv_cfg.get("api_url") or "").strip()
+                                    if raw_url:
+                                        srv_cfg["api_url"] = normalize_api_url(raw_url)
                     parent = os.path.dirname(file_path)
                     if parent:
                         os.makedirs(parent, exist_ok=True)
@@ -248,6 +269,7 @@ def _restore_backup_wrapper(payload: Dict[str, Any]) -> Tuple[bool, str]:
                 raise
 
             rt.clear_memory_contexts()
+            rt.invalidate_panel_balance_cache()
             try:
                 load_config()
             except (OSError, json.JSONDecodeError, ValueError, TypeError) as exc:

@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-from ..models import safe_int as _safe_int
+from ..models import normalize_api_url, safe_int as _safe_int
 from ..storage.storage import load_config
 from .links import ZERO_WIDTH_INVISIBLE_CHARS
 
@@ -28,7 +28,7 @@ def _normalize_api_key(api_key: Any) -> str:
     value = str(api_key or "")
     value = value.translate(ZERO_WIDTH_INVISIBLE_CHARS)
     value = value.strip().strip("\"'").strip()
-    value = re.sub(r"^(?:api\s*key|ключ)\s*[:=]\s*", "", value, flags=re.IGNORECASE).strip()
+    value = re.sub(r"^(?:api[\s_]*key|ключ)\s*[:=]\s*", "", value, flags=re.IGNORECASE).strip()
     return value
 
 
@@ -112,9 +112,10 @@ def _panel_api_request(
     Official method is POST application/x-www-form-urlencoded (Peakerr, PerfectPanel,
     SocPanel PHP examples). GET is a compatibility fallback for older panels.
     """
-    url = str(api_url or "").strip()
-    if not url:
+    raw_url = str(api_url or "").strip()
+    if not raw_url:
         raise ValueError("не указан API URL панели")
+    url = normalize_api_url(raw_url, check_dns=True)
     data = _stringify_panel_params(params)
     action = str(data.get("action") or "")
     post_error: Optional[Exception] = None
@@ -215,6 +216,14 @@ def _map_panel_status_from_text(text: str) -> Optional[str]:
         return "user_inactive"
 
     if has_any([
+        "rate_limited",
+        "rate limit",
+        "too many requests",
+        "too_many_requests",
+    ]):
+        return "rate_limited"
+
+    if has_any([
         "validation_error",
         "validation error",
         "invalid link",
@@ -241,15 +250,17 @@ def _panel_api_json(
     timeout: int = 15,
 ) -> Tuple[requests.Response, Any, str, bool]:
     action = (params or {}).get("action")
+    raw_key = str((params or {}).get("key") or "")
     masked_params = dict(params or {})
     if "key" in masked_params:
-        raw_key = str(masked_params["key"] or "")
         masked_params["key"] = f"{raw_key[:4]}***" if len(raw_key) > 4 else "***"
-    logger.debug(f"[PANEL REQ] url={api_url}, action={action}, params={masked_params}")
+    safe_url = _sanitize_secret_text(api_url, raw_key)
+    logger.debug(f"[PANEL REQ] url={safe_url}, action={action}, params={masked_params}")
     response = _panel_api_request(api_url, params, timeout=timeout)
     payload, raw_text, invalid_json = _decode_panel_response_payload(response)
     http_code = getattr(response, "status_code", None)
-    logger.debug(f"[PANEL RESP] http={http_code}, action={action}, invalid_json={invalid_json}, body={str(raw_text or '')[:300]}")
+    safe_body = _sanitize_secret_text(str(raw_text or "")[:600], raw_key)[:300]
+    logger.debug(f"[PANEL RESP] http={http_code}, action={action}, invalid_json={invalid_json}, body={safe_body}")
     return response, payload, raw_text, invalid_json
 
 
@@ -304,6 +315,7 @@ def _classify_panel_payload_result(
     text_for_match: str,
     http_status: Optional[int],
     invalid_json: bool,
+    secret_value: Optional[str] = None,
 ) -> Dict:
     if (
         action == "add"
@@ -321,11 +333,28 @@ def _classify_panel_payload_result(
         }
 
     if invalid_json:
+        if http_status == 429:
+            return {
+                "error": "rate_limited",
+                "error_class": "TRANSPORT_ERROR",
+                "detail": _sanitize_secret_text(raw_text or "HTTP 429", secret_value),
+                "response": raw_text,
+                "http_status": http_status,
+            }
         return {
             "error": "invalid_json",
             "error_class": "TRANSPORT_ERROR",
-            "detail": raw_text or "Не удалось разобрать JSON-ответ панели.",
+            "detail": _sanitize_secret_text(raw_text or "Не удалось разобрать JSON-ответ панели.", secret_value),
             "response": raw_text,
+            "http_status": http_status,
+        }
+
+    if http_status == 429:
+        return {
+            "error": "rate_limited",
+            "error_class": "TRANSPORT_ERROR",
+            "detail": _sanitize_secret_text(text_for_match or "HTTP 429", secret_value),
+            "response": payload if payload is not None else raw_text,
             "http_status": http_status,
         }
 
@@ -335,8 +364,8 @@ def _classify_panel_payload_result(
             if mapped_4xx:
                 return {
                     "error": mapped_4xx,
-                    "error_class": "PANEL_ERROR",
-                    "detail": text_for_match or mapped_4xx,
+                    "error_class": "TRANSPORT_ERROR" if mapped_4xx == "rate_limited" else "PANEL_ERROR",
+                    "detail": _sanitize_secret_text(text_for_match or mapped_4xx, secret_value),
                     "response": payload,
                     "http_status": http_status,
                 }
@@ -352,13 +381,13 @@ def _classify_panel_payload_result(
     if mapped_status:
         return {
             "error": mapped_status,
-            "error_class": "PANEL_ERROR",
-            "detail": text_for_match or mapped_status,
+            "error_class": "TRANSPORT_ERROR" if mapped_status == "rate_limited" else "PANEL_ERROR",
+            "detail": _sanitize_secret_text(text_for_match or mapped_status, secret_value),
             "response": payload if payload is not None else raw_text,
             "http_status": http_status,
         }
 
-    if action in ("status", "refill") and payload is not None:
+    if action in ("status", "refill") and payload is not None and not (isinstance(payload, dict) and payload.get("error")):
         return {
             "error": "success",
             "error_class": None,
@@ -370,7 +399,7 @@ def _classify_panel_payload_result(
     return {
         "error": "unknown",
         "error_class": "UNKNOWN_ERROR",
-        "detail": text_for_match or "Неизвестный ответ панели.",
+        "detail": _sanitize_secret_text(text_for_match or "Неизвестный ответ панели.", secret_value),
         "response": payload if payload is not None else raw_text,
         "http_status": http_status,
     }
@@ -411,6 +440,7 @@ def _classify_panel_api_result(
         text_for_match=text_for_match,
         http_status=http_status,
         invalid_json=invalid_json,
+        secret_value=secret_value,
     )
 
 
@@ -494,10 +524,10 @@ def _normalize_runtime_status(status_value: Any) -> str:
     haystack = str(status_value or "").strip().lower()
     if not haystack:
         return "unknown"
-    if "completed" in haystack:
-        return "completed"
     if "partial" in haystack:
         return "partial"
+    if "completed" in haystack:
+        return "completed"
     if "canceled" in haystack or "cancelled" in haystack:
         return "canceled"
     if "failed" in haystack or haystack == "fail" or " error" in f" {haystack}" or haystack.startswith("error"):
@@ -609,9 +639,13 @@ def _extract_service_credentials(config: Any, service_number: Any) -> Tuple[Opti
     service_cfg = services.get(str(service_number)) if isinstance(services, dict) else None
     if not isinstance(service_cfg, dict):
         return None, "", f"Нет настроек для service_number={service_number}"
-    api_url = str(service_cfg.get("api_url") or "").strip()
-    if not api_url:
+    raw_url = str(service_cfg.get("api_url") or "").strip()
+    if not raw_url:
         return None, "", f"Не указан api_url для service_number={service_number}"
+    try:
+        api_url = normalize_api_url(raw_url)
+    except ValueError as ex:
+        return None, "", f"Некорректный api_url для service_number={service_number}: {ex}"
     api_key = _normalize_api_key(service_cfg.get("api_key"))
     return api_url, api_key, None
 
@@ -665,7 +699,7 @@ def _panel_single_status(service_number: int, panel_order_id: int, timeout: int=
         http_status = getattr(response, 'status_code', None)
         text_for_check = ' '.join((part for part in [_stringify_for_matching(payload), _stringify_for_matching(raw_text)] if part)).strip()
         if not invalid_json and (http_status is None or http_status < 500) and _is_incorrect_order_id_text(text_for_check):
-            return {'ok': False, 'error': 'incorrect_order_id', 'detail': text_for_check or 'Incorrect order ID', 'raw': payload if payload is not None else raw_text}
+            return {'ok': False, 'error': 'incorrect_order_id', 'detail': _sanitize_secret_text(text_for_check or 'Incorrect order ID', api_key), 'raw': payload if payload is not None else raw_text}
         classified = _classify_panel_api_result(action='status', response=response, payload=payload, raw_text=raw_text, invalid_json=invalid_json, secret_value=api_key)
         if classified.get('error') != 'success':
             logger.error(f"STATUS CHECK ERROR: service=#{service_number}, order={panel_order_id}, error={classified.get('error')}, detail={_sanitize_secret_text(classified.get('detail'), api_key)}")
@@ -701,7 +735,7 @@ def _panel_batch_status(service_number: int, order_ids: List[int], timeout: int=
             return {'ok': True, 'entries': entries}
         text_for_check = ' '.join((part for part in [_stringify_for_matching(payload), _stringify_for_matching(raw_text)] if part)).strip()
         if not invalid_json and (http_status is None or http_status < 500) and _is_incorrect_order_id_text(text_for_check):
-            return {'ok': False, 'error': 'incorrect_order_id', 'detail': text_for_check or 'Incorrect order ID', 'raw': payload if payload is not None else raw_text}
+            return {'ok': False, 'error': 'incorrect_order_id', 'detail': _sanitize_secret_text(text_for_check or 'Incorrect order ID', api_key), 'raw': payload if payload is not None else raw_text}
         classified = _classify_panel_api_result(action='status', response=response, payload=payload, raw_text=raw_text, invalid_json=invalid_json, secret_value=api_key)
         if classified.get('error') != 'success':
             logger.error(f"BATCH STATUS ERROR: service=#{service_number}, orders={orders_param}, error={classified.get('error')}, detail={_sanitize_secret_text(classified.get('detail'), api_key)}")
@@ -744,10 +778,15 @@ def _get_panel_balance_for_risk_check(service_number: Any) -> Dict[str, Any]:
     if not isinstance(service_cfg, dict):
         return {"ok": False, "error": "service_not_found", "text": "недоступно"}
 
-    api_url = str(service_cfg.get("api_url") or "").strip()
+    raw_url = str(service_cfg.get("api_url") or "").strip()
     api_key = _normalize_api_key(service_cfg.get("api_key"))
-    if not api_url or not api_key:
+    if not raw_url or not api_key:
         return {"ok": False, "error": "credentials_missing", "text": "недоступно"}
+    try:
+        api_url = normalize_api_url(raw_url)
+    except ValueError as ex:
+        logger.warning(f"BALANCE RISK CHECK INVALID URL: service=#{service_number}, error={ex}")
+        return {"ok": False, "error": "invalid_api_url", "text": "недоступно"}
 
     try:
         _response, payload, _raw_text, invalid_json = _panel_api_json(
@@ -788,27 +827,31 @@ def _build_transport_error_balance_note(
 
     if before_ok and after_ok and str(balance_before.get("currency")) == str(balance_after.get("currency")):
         try:
-            delta = float(balance_after.get("balance") or 0) - float(balance_before.get("balance") or 0)
+            before_val = float(balance_before.get("balance"))
+            after_val = float(balance_after.get("balance"))
         except (TypeError, ValueError):
-            delta = 0.0
-        delta_text = f"{delta:.2f} {str(balance_after.get('currency') or '').upper()}".strip()
-        if float(balance_after.get("balance") or 0) < float(balance_before.get("balance") or 0):
+            before_val = None
+            after_val = None
+        if before_val is not None and after_val is not None and math.isfinite(before_val) and math.isfinite(after_val):
+            delta = after_val - before_val
+            delta_text = f"{delta:.2f} {str(balance_after.get('currency') or '').upper()}".strip()
+            if after_val < before_val:
+                note = (
+                    f"Баланс до запроса: {before_text}\n"
+                    f"Баланс после ошибки: {after_text}\n"
+                    f"Разница: {delta_text}\n\n"
+                    "Возможно, заказ был создан на панели, но AutoSMM не получил ответ.\n"
+                    "Баланс — не доказательство создания заказа, а только признак риска."
+                )
+                return note, "high_risk_balance_decreased"
             note = (
                 f"Баланс до запроса: {before_text}\n"
                 f"Баланс после ошибки: {after_text}\n"
-                f"Разница: {delta_text}\n\n"
-                "Возможно, заказ был создан на панели, но AutoSMM не получил ответ.\n"
-                "Баланс — не доказательство создания заказа, а только признак риска."
+                "Разница: 0\n\n"
+                "Баланс не изменился, но transport-error не позволяет безопасно продолжить автоматически.\n"
+                "Баланс — не доказательство отсутствия заказа, а только признак риска."
             )
-            return note, "high_risk_balance_decreased"
-        note = (
-            f"Баланс до запроса: {before_text}\n"
-            f"Баланс после ошибки: {after_text}\n"
-            "Разница: 0\n\n"
-            "Баланс не изменился, но transport-error не позволяет безопасно продолжить автоматически.\n"
-            "Баланс — не доказательство отсутствия заказа, а только признак риска."
-        )
-        return note, "manual_check_balance_unchanged"
+            return note, "manual_check_balance_unchanged"
 
     note = (
         "Баланс до/после проверить не удалось.\n"
