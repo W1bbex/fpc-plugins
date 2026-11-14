@@ -11,7 +11,7 @@ from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from conftest import make_fake_cardinal
 from src import core, handlers, storage, ui
-from src.ui.formatters import format_catalog_line
+from src.ui.formatters import catalog_caption, format_command_lines
 from src.ui.kit import Btn, CardBuilder, KeyboardBuilder, StyledButton
 
 
@@ -73,21 +73,12 @@ def test_card_builder_and_catalog_formatting_escape_html_and_use_tree_connectors
     assert " ├ One\n ├ Two\n └ Three" in text
     assert "━" not in text
 
-    line = format_catalog_line(
-        {
-            "id": "demo",
-            "name": "Demo<Plugin>&",
-            "status_code": "active",
-            "loaded_version": "1.2.3",
-            "latest_version": "1.2.3",
-            "commands": [("demo", "Open"), ("chatid", "Chat ID")],
-            "has_update": False,
-            "needs_restart": False,
-        }
-    )
-    assert "Demo&lt;Plugin&gt;&amp;" in line
-    assert "/demo" in line
-    assert "/chatid" not in line
+    cmd_lines = format_command_lines([("demo", "Open<UI>"), ("c2", "2"), ("c3", "3"), ("c4", "4"), ("c5", "5"), ("chatid", "Chat ID")])
+    assert "/demo — <i>Open&lt;UI&gt;</i>" in cmd_lines[0]
+    assert "/chatid" not in "\n".join(cmd_lines)
+    assert "и ещё 1" in cmd_lines[-1]
+    assert catalog_caption({"status_code": "active", "has_update": False}) == "Работает"
+    assert catalog_caption({"status_code": "active", "has_update": True, "latest_version": "2.0"}) == "Обновление 2.0"
 
 
 def test_plugins_menu_groups_statuses_and_styles_action_buttons() -> None:

@@ -13,7 +13,6 @@ import re
 import shutil
 import sys
 import threading
-import time
 import uuid
 from typing import Any, Callable, Optional
 
@@ -60,10 +59,17 @@ def _extract_json_error(raw_text: str) -> Optional[str]:
     return None
 
 
+def _clean_segment(raw: Any) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(raw or "").strip()).strip("._")
+
+
 def sanitize_segment(raw: Any, fallback: str) -> str:
     """Sanitize a filename or directory component against path traversal."""
-    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(raw or "").strip()).strip("._")
-    return fallback if (not cleaned or cleaned in (".", "..")) else cleaned
+    cleaned = _clean_segment(raw)
+    if cleaned and cleaned not in (".", ".."):
+        return cleaned
+    safe_fallback = _clean_segment(fallback)
+    return safe_fallback if (safe_fallback and safe_fallback not in (".", "..")) else "item"
 
 
 def plugin_label_from_info(plugin_id: str, plugin_info: Optional[dict[str, Any]]) -> str:
@@ -100,7 +106,10 @@ def is_newer_version(latest: str, current: str) -> bool:
     def _key(ver: str) -> tuple[Any, ...]:
         m = semver_re.match(ver)
         if m:
-            nums = tuple(int(part) for part in m.group(1).split("."))
+            raw_nums = [int(part) for part in m.group(1).split(".")]
+            while len(raw_nums) > 1 and raw_nums[-1] == 0:
+                raw_nums.pop()
+            nums = tuple(raw_nums)
             tag = (m.group(2) or "").lower()
             if not tag:
                 return (1, nums, 0, 0)
@@ -173,7 +182,7 @@ def fetch_hub_latest_version(cardinal: Any, tg_user: Any) -> tuple[str, bool]:
     tg_ident = get_telegram_identity(tg_user)
     payload = {
         "funpay_id": fp_ident["id"] or "unknown",
-        "funpay_username": fp_ident["username"] or "unknown",
+        "funpay_username": fp_ident["username"],
         "telegram_id": tg_ident["id"],
         "telegram_username": tg_ident["username"],
         "current_version": VERSION,
@@ -197,7 +206,7 @@ def request_trial_key(cardinal: Any, plugin_name: str, tg_user: Any) -> tuple[bo
     payload = {
         "plugin_name": plugin_name,
         "funpay_id": fp_ident["id"] or "unknown",
-        "funpay_username": fp_ident["username"] or "unknown",
+        "funpay_username": fp_ident["username"],
         "telegram_id": tg_ident["id"],
         "telegram_username": tg_ident["username"],
     }
@@ -298,17 +307,34 @@ def _matches_creator(file_credits: Optional[str], expected_credits: Optional[str
     return expected_credits.strip().lower() in file_credits.strip().lower()
 
 
+def scan_legacy_plugin_files() -> list[tuple[str, str, dict[str, Any]]]:
+    """Scan non-loader .py plugin files and extract metadata once per batch."""
+    plugins_dir = PATHS.plugins_dir
+    if not os.path.isdir(plugins_dir):
+        return []
+    with os.scandir(plugins_dir) as it:
+        entries = sorted(
+            (e for e in it if e.is_file() and e.name.lower().endswith(".py")),
+            key=lambda e: e.name,
+        )
+    scanned: list[tuple[str, str, dict[str, Any]]] = []
+    for entry in entries:
+        meta = extract_py_plugin_metadata(entry.path)
+        if meta.get("is_hub_loader"):
+            continue
+        scanned.append((entry.name, entry.path, meta))
+    return scanned
+
+
 def _iter_matching_legacy_files(
     target_uuid: Optional[str],
     expected_credits: Optional[str] = "@w1bbex",
     exclude_paths: Optional[list[str]] = None,
-) -> list[tuple[os.DirEntry[str], dict[str, Any]]]:
+    legacy_entries: Optional[list[tuple[str, str, dict[str, Any]]]] = None,
+) -> list[tuple[str, str, dict[str, Any]]]:
     """Return non-loader .py entries in plugins_dir matching target_uuid and expected_credits."""
     norm_uuid = str(target_uuid or "").strip().lower()
     if not norm_uuid:
-        return []
-    plugins_dir = PATHS.plugins_dir
-    if not os.path.isdir(plugins_dir):
         return []
 
     excluded = {os.path.normcase(os.path.abspath(PATHS.hub_file))}
@@ -316,24 +342,16 @@ def _iter_matching_legacy_files(
         if path:
             excluded.add(os.path.normcase(os.path.abspath(path)))
 
-    with os.scandir(plugins_dir) as it:
-        entries = sorted(
-            (e for e in it if e.is_file() and e.name.lower().endswith(".py")),
-            key=lambda e: e.name,
-        )
-
-    matches: list[tuple[os.DirEntry[str], dict[str, Any]]] = []
-    for entry in entries:
-        if os.path.normcase(os.path.abspath(entry.path)) in excluded:
-            continue
-        meta = extract_py_plugin_metadata(entry.path)
-        if meta.get("is_hub_loader"):
+    candidates = legacy_entries if legacy_entries is not None else scan_legacy_plugin_files()
+    matches: list[tuple[str, str, dict[str, Any]]] = []
+    for filename, file_path, meta in candidates:
+        if os.path.normcase(os.path.abspath(file_path)) in excluded:
             continue
         if str(meta.get("uuid") or "").strip().lower() != norm_uuid:
             continue
         if expected_credits and not _matches_creator(meta.get("credits"), expected_credits):
             continue
-        matches.append((entry, meta))
+        matches.append((filename, file_path, meta))
     return matches
 
 
@@ -341,16 +359,19 @@ def find_manual_plugin_files(
     target_uuid: Optional[str],
     expected_credits: Optional[str] = "@w1bbex",
     exclude_paths: Optional[list[str]] = None,
+    legacy_entries: Optional[list[tuple[str, str, dict[str, Any]]]] = None,
 ) -> list[dict[str, str]]:
     """List manual or legacy plugin files in plugins/ matching UUID and creator."""
     return [
         {
-            "filename": entry.name,
-            "path": entry.path,
+            "filename": filename,
+            "path": file_path,
             "version": str(meta.get("version") or ""),
             "name": str(meta.get("name") or ""),
         }
-        for entry, meta in _iter_matching_legacy_files(target_uuid, expected_credits, exclude_paths)
+        for filename, file_path, meta in _iter_matching_legacy_files(
+            target_uuid, expected_credits, exclude_paths, legacy_entries=legacy_entries
+        )
     ]
 
 
@@ -368,20 +389,20 @@ def archive_legacy_plugins(
     archived: list[str] = []
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    for entry, _meta in matches:
+    for filename, file_path, _meta in matches:
         os.makedirs(archive_dir, exist_ok=True)
-        stem, ext = os.path.splitext(entry.name)
+        stem, ext = os.path.splitext(filename)
         dest = os.path.join(archive_dir, f"{stem}_{stamp}{ext}")
         counter = 1
         while os.path.exists(dest):
             dest = os.path.join(archive_dir, f"{stem}_{stamp}_{counter}{ext}")
             counter += 1
         try:
-            shutil.move(entry.path, dest)
-            archived.append(entry.name)
-            logger.info("Archived legacy plugin %s -> %s", entry.path, dest)
+            shutil.move(file_path, dest)
+            archived.append(filename)
+            logger.info("Archived legacy plugin %s -> %s", file_path, dest)
         except OSError:
-            logger.exception("Failed archiving legacy plugin %s", entry.path)
+            logger.exception("Failed archiving legacy plugin %s", file_path)
     return archived
 
 
@@ -392,10 +413,12 @@ def generate_loader(
     api_name: str,
     api_version: str,
     api_desc: str,
+    target_filename: Optional[str] = None,
 ) -> str:
     """Generate and atomically write the Cardinal loader stub for a plugin binary."""
     safe_label = sanitize_segment(plugin_label, "plugin")
     safe_folder = sanitize_segment(folder_name, "plugin_build")
+    safe_target = os.path.basename(target_filename) if target_filename else ""
     loader_path = os.path.join(PATHS.plugins_dir, f"{safe_label}.py")
     fallback_uuid = str(
         uuid.UUID(
@@ -411,10 +434,16 @@ def generate_loader(
         f"base_dir = os.path.join(os.path.dirname(__file__), 'w1bbex', {repr(safe_folder)})\n"
         "pyd_path = None\n"
         "if os.path.exists(base_dir):\n"
-        "    for fname in sorted(os.listdir(base_dir)):\n"
-        "        if fname.endswith(('.pyd', '.so', '.py')):\n"
-        "            pyd_path = os.path.join(base_dir, fname)\n"
-        "            if fname.endswith(('.pyd', '.so')):\n"
+        f"    _preferred = os.path.join(base_dir, {repr(safe_target)}) if {repr(safe_target)} else ''\n"
+        "    if _preferred and os.path.isfile(_preferred):\n"
+        "        pyd_path = _preferred\n"
+        "    else:\n"
+        "        for _exts in (('.pyd', '.so'), ('.py',)):\n"
+        "            for fname in sorted(os.listdir(base_dir)):\n"
+        "                if fname.endswith(_exts):\n"
+        "                    pyd_path = os.path.join(base_dir, fname)\n"
+        "                    break\n"
+        "            if pyd_path:\n"
         "                break\n\n"
         "if not pyd_path:\n"
         "    raise ImportError('Бинарный файл плагина не найден!')\n\n"
@@ -533,19 +562,30 @@ def download_plugin(
     )
     old_bin_dir = old_entry.get("bin_dir")
 
+    expected_loader_path = os.path.join(PATHS.plugins_dir, f"{sanitize_segment(plugin_label, 'plugin')}.py")
+    prev_save_bytes: Optional[bytes] = None
+    prev_loader_bytes: Optional[bytes] = None
+    wrote_save = False
+    wrote_loader = False
+
     try:
         with PLUGIN_FS_LOCK:
+            if os.path.isfile(save_path):
+                with open(save_path, "rb") as prev_f:
+                    prev_save_bytes = prev_f.read()
+            if os.path.isfile(expected_loader_path):
+                with open(expected_loader_path, "rb") as prev_l:
+                    prev_loader_bytes = prev_l.read()
+
             atomic_write_bytes(save_path, resp.content)
+            wrote_save = True
             save_abs = os.path.normcase(os.path.abspath(save_path))
             if os.path.isdir(plugin_dir):
                 for entry_name in os.listdir(plugin_dir):
                     if entry_name.lower().endswith(SUPPORTED_PLUGIN_EXTENSIONS):
                         candidate = os.path.join(plugin_dir, entry_name)
                         if os.path.normcase(os.path.abspath(candidate)) != save_abs and os.path.isfile(candidate):
-                            try:
-                                os.remove(candidate)
-                            except OSError:
-                                logger.warning("Could not remove stale plugin file %s", candidate, exc_info=True)
+                            os.remove(candidate)
 
             extracted_meta = extract_py_plugin_metadata(save_path) if save_path.lower().endswith(".py") else {}
             target_uuid = (plugin_info.get("uuid") if plugin_info else None) or extracted_meta.get("uuid")
@@ -556,7 +596,16 @@ def download_plugin(
             )
             archived_files = archive_legacy_plugins(target_uuid=target_uuid, expected_credits=target_credits)
 
-            loader_path = generate_loader(plugin_name, plugin_label, folder_name, api_name, version, api_desc)
+            loader_path = generate_loader(
+                plugin_name,
+                plugin_label,
+                folder_name,
+                api_name,
+                version,
+                api_desc,
+                target_filename=filename,
+            )
+            wrote_loader = True
             clean_old_plugin(plugin_name, new_stub_path=loader_path)
             if old_bin_dir and os.path.normcase(os.path.abspath(old_bin_dir)) != os.path.normcase(
                 os.path.abspath(plugin_dir)
@@ -570,13 +619,30 @@ def download_plugin(
                                  ("description", "uuid", "credits", "is_free", "prefix")}},
                 )
             )
-    except PermissionError:
-        logger.exception("Plugin binary locked during reinstall of %s", plugin_name)
-        return (
-            False,
-            "Файл плагина занят процессом. Удалите плагин в Hub, выполните /restart и установите снова.",
-        )
     except OSError as exc:
+        with PLUGIN_FS_LOCK:
+            if wrote_loader:
+                try:
+                    if prev_loader_bytes is not None:
+                        atomic_write_bytes(expected_loader_path, prev_loader_bytes)
+                    elif os.path.isfile(expected_loader_path):
+                        os.remove(expected_loader_path)
+                except OSError:
+                    logger.warning("Rollback failed for loader %s", expected_loader_path, exc_info=True)
+            if wrote_save:
+                try:
+                    if prev_save_bytes is not None:
+                        atomic_write_bytes(save_path, prev_save_bytes)
+                    elif os.path.isfile(save_path):
+                        os.remove(save_path)
+                except OSError:
+                    logger.warning("Rollback failed for binary %s", save_path, exc_info=True)
+        if isinstance(exc, PermissionError):
+            logger.exception("Plugin binary locked during reinstall of %s", plugin_name)
+            return (
+                False,
+                "Файл плагина занят процессом. Удалите плагин в Hub, выполните /restart и установите снова.",
+            )
         logger.exception("Failed saving plugin %s", plugin_name)
         return False, f"Ошибка сохранения файлов на диск: {exc}"
 
@@ -606,15 +672,25 @@ def validate_hub_source(raw_bytes: bytes, content_type: str = "") -> tuple[bool,
     except SyntaxError as exc:
         return False, f"Получен поврежденный Python-файл: {exc.msg}"
 
-    assigned: set[str] = set()
+    assigned: dict[str, Optional[str]] = {}
     for node in tree.body:
+        val = (
+            node.value.value.strip()
+            if isinstance(getattr(node, "value", None), ast.Constant)
+            and isinstance(node.value.value, str)
+            else None
+        )
         if isinstance(node, ast.Assign):
-            assigned.update(t.id for t in node.targets if isinstance(t, ast.Name))
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    assigned[target.id] = val
         elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            assigned.add(node.target.id)
+            assigned[node.target.id] = val
 
     if not {"VERSION", "UUID", "BIND_TO_PRE_INIT"}.issubset(assigned):
         return False, "Скачанный файл не содержит обязательных метаданных W1bbex Hub."
+    if (assigned.get("UUID") or "").strip().lower() != HUB_UUID.strip().lower():
+        return False, "UUID скачанного файла не совпадает с W1bbex Hub."
     return True, ""
 
 
@@ -630,6 +706,12 @@ def download_and_update_hub(target_path: Optional[str] = None) -> tuple[bool, st
         err_json = safe_json(resp)
         err_msg = err_json.get("error") if err_json else f"HTTP {resp.status_code}"
         return False, f"Ошибка скачивания: {err_msg}"
+
+    expected_sha = resp.headers.get("X-File-SHA256") or resp.headers.get("X-SHA256")
+    if expected_sha:
+        actual_sha = hashlib.sha256(resp.content).hexdigest().lower()
+        if actual_sha != str(expected_sha).strip().lower():
+            return False, "Контрольная сумма (SHA-256) файла обновления Hub не совпадает."
 
     ok, reason = validate_hub_source(resp.content, resp.headers.get("Content-Type", ""))
     if not ok:
@@ -746,6 +828,7 @@ def inspect_plugin_state(
     plugin_info: dict[str, Any],
     installed: Optional[dict[str, Any]] = None,
     keys: Optional[dict[str, Any]] = None,
+    legacy_entries: Optional[list[tuple[str, str, dict[str, Any]]]] = None,
 ) -> dict[str, Any]:
     """Build a complete read-only status snapshot for one catalog plugin."""
     pid = str(plugin_info.get("id", ""))
@@ -777,6 +860,7 @@ def inspect_plugin_state(
         plugin_info.get("uuid"),
         plugin_info.get("credits") or "@w1bbex",
         exclude_paths=exclude,
+        legacy_entries=legacy_entries,
     )
     plugin_label = plugin_label_from_info(pid, plugin_info)
     storage_dir = os.path.join(PATHS.cardinal_root, "storage", "w1bbex", sanitize_segment(plugin_label, pid))

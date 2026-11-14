@@ -384,15 +384,28 @@ def render_update_notification(
     }.get(urgency, "Доступно обновление")
 
     ver_transition = f"{update['curr_ver']} → {update['latest']}"
-    card = CardBuilder(tg_icon("refresh"), f"{update['name']} · {update['latest']}")
-    card.tree(
-        f"<b>{esc(urgency_badge)}</b>",
-        [f"Версия: {code(ver_transition)}"],
-    )
     changelog = str(update.get("changelog") or "Без описания").strip()
     if len(changelog) > 1800:
         changelog = changelog[:1799].rstrip() + "…"
-    card.quote(esc(changelog))
+
+    def _build_update_card(changelog_text: str) -> str:
+        card = CardBuilder(tg_icon("refresh"), f"{update['name']} · {update['latest']}")
+        card.tree(
+            f"<b>{esc(urgency_badge)}</b>",
+            [f"Версия: {code(ver_transition)}"],
+        )
+        if changelog_text:
+            card.quote(esc(changelog_text))
+        return card.build()
+
+    rendered_text = _build_update_card(changelog)
+    if len(rendered_text) > 4096:
+        limit = len(changelog)
+        while len(rendered_text) > 4096 and limit > 0:
+            excess = len(rendered_text) - 4096
+            limit = max(0, limit - max(excess, limit // 4 + 1))
+            trimmed = (changelog[:limit].rstrip() + "…") if limit > 0 else ""
+            rendered_text = _build_update_card(trimmed)
 
     kb = KeyboardBuilder()
     if update.get("target") == "hub":
@@ -405,7 +418,7 @@ def render_update_notification(
         Btn(toggle_label, "hub:toggle_notify_from_msg", style="success" if notify_enabled else "danger",
             icon="bell" if notify_enabled else "bell_off"),
     )
-    return card.build(), kb.build()
+    return rendered_text, kb.build()
 
 
 def rebuild_notification_toggle_markup(

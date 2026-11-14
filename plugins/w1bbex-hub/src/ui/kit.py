@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import copy
+import hashlib
 import html
 from html.parser import HTMLParser
+import threading
 from typing import Any, Iterable, Literal, Optional, Sequence
 
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -14,6 +16,33 @@ from .icons import clean_button_text, icon_id
 
 ButtonStyle = Literal["primary", "success", "danger"]
 VALID_BUTTON_STYLES: frozenset[str] = frozenset({"primary", "success", "danger"})
+_MAX_CALLBACK_BYTES = 64
+_COMPACT_CALLBACK_PREFIX = "hub:cb:"
+_COMPACT_CALLBACK_LIMIT = 512
+_COMPACT_CALLBACK_LOCK = threading.Lock()
+_COMPACT_CALLBACKS: dict[str, str] = {}
+
+
+def compact_callback_data(callback_data: Optional[str]) -> Optional[str]:
+    """Tokenize callback_data only when UTF-8 length exceeds Telegram's 64-byte limit."""
+    if not isinstance(callback_data, str):
+        return callback_data
+    if len(callback_data.encode("utf-8")) <= _MAX_CALLBACK_BYTES:
+        return callback_data
+    token = f"{_COMPACT_CALLBACK_PREFIX}{hashlib.sha256(callback_data.encode('utf-8')).hexdigest()[:16]}"
+    with _COMPACT_CALLBACK_LOCK:
+        _COMPACT_CALLBACKS[token] = callback_data
+        while len(_COMPACT_CALLBACKS) > _COMPACT_CALLBACK_LIMIT:
+            _COMPACT_CALLBACKS.pop(next(iter(_COMPACT_CALLBACKS)))
+    return token
+
+
+def resolve_callback_data(callback_data: Optional[str]) -> Optional[str]:
+    """Resolve a tokenized callback string back to its original full callback_data."""
+    if not isinstance(callback_data, str) or not callback_data.startswith(_COMPACT_CALLBACK_PREFIX):
+        return callback_data
+    with _COMPACT_CALLBACK_LOCK:
+        return _COMPACT_CALLBACKS.get(callback_data, callback_data)
 
 
 def esc(value: Any) -> str:
@@ -218,17 +247,18 @@ class Btn:
 
     def to_button(self) -> InlineKeyboardButton:
         """Materialize a pyTelegramBotAPI InlineKeyboardButton preserving `style` when set."""
+        cb_data = compact_callback_data(self.callback_data)
         if self.style in VALID_BUTTON_STYLES or self.icon:
             return StyledButton(
                 text=clean_button_text(self.text),
-                callback_data=self.callback_data,
+                callback_data=cb_data,
                 url=self.url,
                 style=self.style,
                 icon_custom_emoji_id=icon_id(self.icon),
             )
         return InlineKeyboardButton(
             text=self.text,
-            callback_data=self.callback_data,
+            callback_data=cb_data,
             url=self.url,
         )
 
@@ -270,27 +300,6 @@ class KeyboardBuilder:
         for row_btns in self._rows:
             markup.row(*row_btns)
         return markup
-
-
-def build_kb_rows(rows: list[list[tuple[str, Optional[str], Optional[str], Optional[ButtonStyle]] | tuple[str, Optional[str], Optional[str]]]]) -> InlineKeyboardMarkup:
-    """Construct an InlineKeyboardMarkup from legacy 3-tuples or styled 4-tuples."""
-    kb = KeyboardBuilder()
-    for row in rows:
-        btns: list[Btn] = []
-        for item in row:
-            if len(item) == 4:
-                label, cb, url, style = item
-            else:
-                label, cb, url = item
-                style = None
-            btns.append(Btn(text=label, callback_data=cb, url=url, style=style))
-        kb.row(*btns)
-    return kb.build()
-
-
-def build_kb(*rows: tuple[str, Optional[str], Optional[str]] | tuple[str, Optional[str], Optional[str], Optional[ButtonStyle]]) -> InlineKeyboardMarkup:
-    """Construct an InlineKeyboardMarkup where each tuple defines a single-button row."""
-    return build_kb_rows([[row] for row in rows])
 
 
 def has_styled_buttons(markup: Any) -> bool:

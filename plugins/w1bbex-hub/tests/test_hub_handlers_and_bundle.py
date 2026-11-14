@@ -196,7 +196,7 @@ def test_built_w1bbex_hub_bundle_matches_cardinal_and_server_contracts(tmp_path:
 
     fake_cardinal = make_fake_cardinal(authorized_users={1})
     controller = mod.init_cardinal(fake_cardinal)
-    assert len(fake_cardinal.telegram.cbq_routes) == 34
+    assert len(fake_cardinal.telegram.cbq_routes) == 33
     assert len(fake_cardinal.telegram.msg_routes) == 3
     assert callable(mod.BIND_TO_DELETE)
     assert controller is not None

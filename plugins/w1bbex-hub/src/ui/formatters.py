@@ -65,30 +65,9 @@ def format_primary_command(commands: list[tuple[str, str]]) -> Optional[str]:
     return f"/{cmd}" if cmd else None
 
 
-def resolve_display_version(state: dict[str, Any]) -> str:
-    return str(state.get("loaded_version") or state.get("installed_version") or state.get("latest_version") or "?").lstrip("v")
-
-
 def catalog_caption(state: dict[str, Any]) -> str:
     if state.get("has_update") and not state.get("needs_restart"):
         return f"Обновление {state.get('latest_version') or ''}"
     if state.get("status_code") == "not_installed":
         return "Бесплатный" if state.get("is_free") else "Ключ сохранён" if state.get("has_key") else "Нужен ключ"
     return STATUS_BADGES.get(str(state.get("status_code")), ("", "Неизвестный статус"))[1]
-
-
-def format_catalog_line(state: dict[str, Any]) -> str:
-    command = format_primary_command(state.get("commands") or [])
-    return f"<b>{esc(state.get('name') or state.get('id'))}</b> · {esc(catalog_caption(state))}" + (f" · {esc(command)}" if command else "")
-
-
-def format_catalog_button(state: dict[str, Any]) -> tuple[str, Optional[str]]:
-    return f"{state.get('name') or state.get('id')} · {catalog_caption(state)}", None
-
-
-def license_summary_text(state: dict[str, Any]) -> str:
-    if state.get("is_free"):
-        return "Бесплатный плагин"
-    if state.get("has_key"):
-        return "Ключ сохранён · проверяется при установке"
-    return "Для установки нужен лицензионный ключ"

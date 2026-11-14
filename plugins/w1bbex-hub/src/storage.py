@@ -215,13 +215,3 @@ def peek_pending_restart(max_age_seconds: float) -> Optional[dict[str, Any]]:
             save_data(data)
             return None
         return valid
-
-
-def pop_pending_restart(max_age_seconds: float) -> Optional[dict[str, Any]]:
-    """Atomically pop pending_restart if present and within max_age_seconds."""
-    def _pop(data: dict[str, Any]) -> Optional[dict[str, Any]]:
-        raw = data.pop("pending_restart", None)
-        return _validate_pending_restart(raw, max_age_seconds)
-
-    _, popped = update_data(_pop)
-    return popped

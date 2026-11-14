@@ -81,12 +81,13 @@ def test_pending_restart_persistence_and_ttl_expiry(isolated_hub: Path, monkeypa
     monkeypatch.setattr(storage.time, "time", lambda: now[0])
 
     storage.save_pending_restart({"action": "install", "plugin_id": "autosmm", "chat_id": 555})
-    assert storage.pop_pending_restart(300.0)["plugin_id"] == "autosmm"
-    assert storage.pop_pending_restart(300.0) is None
+    assert storage.peek_pending_restart(300.0)["plugin_id"] == "autosmm"
+    storage.clear_pending_restart()
+    assert storage.peek_pending_restart(300.0) is None
 
     storage.save_pending_restart({"action": "hub", "chat_id": 555})
     now[0] = 1500.0
-    assert storage.pop_pending_restart(300.0) is None
+    assert storage.peek_pending_restart(300.0) is None
     assert "pending_restart" not in storage.load_data()
 
 

@@ -12,7 +12,7 @@ from telebot.types import InlineKeyboardMarkup
 from ..runtime import VERSION
 from .formatters import (
     STATUS_BADGES, catalog_caption, description_preview, format_command_lines,
-    format_primary_command, license_summary_text, resolve_display_version,
+    format_primary_command,
 )
 from .icons import tg_icon
 from .kit import Btn, CardBuilder, KeyboardBuilder, code, esc, sanitize_telegram_html
@@ -149,31 +149,64 @@ def render_plugin_info(state: dict[str, Any], expanded: bool = False, catalog_vi
     pid, name = str(state["id"]), str(state["name"])
     latest, status = str(state["latest_version"]), str(state["status_code"])
     icon = "rocket" if pid.lower() == "autosmm" else "plugin"
-    card = CardBuilder(tg_icon(icon), name)
-    if state.get("loaded_uuid") and not state.get("loaded_enabled"):
-        card.paragraph("Отключён в Cardinal")
-    if state["needs_restart"]:
-        card.paragraph("Перезапустите Cardinal, чтобы применить изменения")
-    elif status == "broken_files":
-        card.paragraph("Файл загрузчика не найден · переустановите плагин")
-    elif state["has_update"]:
-        card.paragraph(f"Доступно обновление до {code(latest)}")
-    if not state.get("catalog_known", True):
-        card.paragraph("<i>Плагина нет в текущем каталоге · показано локальное состояние</i>")
-    desc = str(state.get("description") or "").strip()
-    if desc:
-        first, separator, rest = desc.partition("\n")
-        plain = re.sub(r"\W+", "", html.unescape(re.sub(r"<[^>]*>", "", first))).lower()
-        normalized_name = re.sub(r"\W+", "", name).lower()
-        if separator and re.fullmatch(re.escape(normalized_name) + r"(?:v?\d{1,16})?", plain):
-            desc = rest.lstrip("\n")
-        if expanded and len(desc) > 3500:
-            card.paragraph(esc(description_preview(desc, 2600)))
-        elif len(desc) <= 3500:
-            safe = sanitize_telegram_html(desc)
-            card.paragraph(safe) if safe != esc(desc) else card.quote(safe)
-        else:
-            card.paragraph(esc(description_preview(desc, 250)))
+
+    def _compose_info_card(desc_mode: str, preview_limit: int = 250) -> tuple[str, str]:
+        card = CardBuilder(tg_icon(icon), name)
+        if state.get("loaded_uuid") and not state.get("loaded_enabled"):
+            card.paragraph("Отключён в Cardinal")
+        if state["needs_restart"]:
+            card.paragraph("Перезапустите Cardinal, чтобы применить изменения")
+        elif status == "broken_files":
+            card.paragraph("Файл загрузчика не найден · переустановите плагин")
+        elif state["has_update"]:
+            card.paragraph(f"Доступно обновление до {code(latest)}")
+        if not state.get("catalog_known", True):
+            card.paragraph("<i>Плагина нет в текущем каталоге · показано локальное состояние</i>")
+        raw_desc = str(state.get("description") or "").strip()
+        clean_desc = ""
+        if raw_desc:
+            first, separator, rest = raw_desc.partition("\n")
+            plain = re.sub(r"\W+", "", html.unescape(re.sub(r"<[^>]*>", "", first))).lower()
+            normalized_name = re.sub(r"\W+", "", name).lower()
+            if separator and re.fullmatch(re.escape(normalized_name) + r"(?:v?\d{1,16})?", plain):
+                raw_desc = rest.lstrip("\n")
+            clean_desc = raw_desc
+        if clean_desc:
+            if desc_mode == "html":
+                safe = sanitize_telegram_html(clean_desc)
+                card.paragraph(safe) if safe != esc(clean_desc) else card.quote(safe)
+            elif desc_mode == "preview" and preview_limit > 0:
+                card.paragraph(esc(description_preview(clean_desc, preview_limit)))
+        if state["needs_restart"]:
+            pass
+        elif state["has_update"] and (state["installed_entry"] or status == "manual"):
+            if status == "manual":
+                card.paragraph("Ручная копия будет заменена установкой через Hub")
+        elif status != "restart_delete" and not (status == "manual" and state["has_update"]) and not state["installed_entry"]:
+            if (state["is_free"] or state["has_key"]) and status == "manual":
+                card.paragraph("Ручная копия будет заменена установкой через Hub")
+        return card.build(), clean_desc
+
+    desc_val = str(state.get("description") or "").strip()
+    if not desc_val:
+        rendered_text, desc = _compose_info_card("none")
+    elif expanded and len(desc_val) > 3500:
+        rendered_text, desc = _compose_info_card("preview", 2600)
+    elif len(desc_val) <= 3500:
+        rendered_text, desc = _compose_info_card("html")
+    else:
+        rendered_text, desc = _compose_info_card("preview", 250)
+
+    if len(rendered_text) > 4096 and desc:
+        preview_limit = 2600 if expanded else 250
+        while preview_limit > 0:
+            rendered_text, _ = _compose_info_card("preview", preview_limit)
+            if len(rendered_text) <= 4096:
+                break
+            preview_limit = preview_limit // 2
+        if len(rendered_text) > 4096:
+            rendered_text, _ = _compose_info_card("none")
+
     commands = state.get("commands") or []
 
     kb = KeyboardBuilder()
@@ -182,8 +215,6 @@ def render_plugin_info(state: dict[str, Any], expanded: bool = False, catalog_vi
         kb.row(Btn("Перезапустить Cardinal", f"hub:restart:{state['restart_action']}:{pid}", style="success", icon="refresh"))
     elif state["has_update"] and (state["installed_entry"] or status == "manual"):
         kb.row(Btn(f"Обновить до {latest}", f"hub:install:{pid}", style="success", icon="download"))
-        if status == "manual":
-            card.paragraph("Ручная копия будет заменена установкой через Hub")
     elif status == "broken_files":
         kb.row(Btn("Восстановить плагин", f"hub:install:{pid}", style="primary", icon="refresh"))
     elif status in {"active", "manual"} and state.get("loaded_enabled") and format_primary_command(commands):
@@ -204,17 +235,15 @@ def render_plugin_info(state: dict[str, Any], expanded: bool = False, catalog_vi
         if state["is_free"] or state["has_key"]:
             label = "Заменить ручную установку" if status == "manual" else "Установить плагин"
             kb.row(Btn(label, f"hub:install:{pid}", style="success", icon="download"))
-            if status == "manual":
-                card.paragraph("Ручная копия будет заменена установкой через Hub")
         elif state.get("catalog_known", True):
             kb.row(Btn("Пробный доступ", f"hub:trial:{pid}", icon="clock"),
                    Btn("Добавить ключ", "hub:activate_key", icon="key"))
-    if desc and len(desc) > 3500:
+    if desc and (len(desc) > 3500 or len(rendered_text) >= 4096):
         kb.row(Btn("Свернуть описание" if expanded else "Полное описание", f"hub:{'info' if expanded else 'description'}:{pid}"))
     kb.row(Btn("Диагностика", f"hub:diagnostics:{pid}", icon="info"))
     destination = f"hub:catalog:{catalog_view}:0" if catalog_view in {"mine", "attention"} else "hub:plugins_menu"
     kb.row(Btn("Назад", destination, style="danger", icon="back"))
-    return card.build(), kb.build()
+    return rendered_text, kb.build()
 
 
 def render_plugin_diagnostics(state: dict[str, Any]) -> tuple[str, InlineKeyboardMarkup]:

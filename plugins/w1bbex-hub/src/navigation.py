@@ -20,12 +20,61 @@ from .ui import (
 )
 
 
+def _valid_interval(data: dict[str, Any]) -> int:
+    minutes = data.get("update_check_interval_minutes", 30)
+    return minutes if isinstance(minutes, int) and not isinstance(minutes, bool) and 5 <= minutes <= 10080 else 30
+
+
 class HubNavigation:
     """Navigation behavior layered over the existing state and transport methods."""
 
     STATE_AWAIT_KEY = "hub:await_key"
     STATE_AWAIT_INTERVAL = "hub:await_interval"
     HUB_STEP_STATES = frozenset({STATE_AWAIT_KEY, STATE_AWAIT_INTERVAL})
+
+    def _get_views_lock(self) -> threading.Lock:
+        lock = vars(self).get("_views_lock")
+        if lock is None:
+            lock = threading.Lock()
+            vars(self)["_views_lock"] = lock
+        return lock
+
+    def _set_catalog_view(self, chat_id: int, message_id: int, view: str) -> None:
+        with self._get_views_lock():
+            views = vars(self).setdefault("_catalog_views", {})
+            views[(chat_id, message_id)] = view
+            if len(views) > 128:
+                views.pop(next(iter(views)))
+
+    def _get_catalog_view(self, chat_id: int, message_id: int) -> str:
+        with self._get_views_lock():
+            return vars(self).get("_catalog_views", {}).get((chat_id, message_id), "all")
+
+    def _try_begin_action(self, key: str) -> bool:
+        lock = vars(self).get("_actions_lock")
+        if lock is None:
+            lock = threading.Lock()
+            vars(self)["_actions_lock"] = lock
+        in_flight = vars(self).setdefault("_in_flight_actions", set())
+        with lock:
+            if key in in_flight:
+                return False
+            in_flight.add(key)
+            return True
+
+    def _end_action(self, key: str) -> None:
+        lock = vars(self).get("_actions_lock")
+        in_flight = vars(self).get("_in_flight_actions")
+        if lock is not None and isinstance(in_flight, set):
+            with lock:
+                in_flight.discard(key)
+
+    def _safe_refresh_callback_screen(self, callback: Any, edit_fn: Any, fallback_fn: Any) -> None:
+        try:
+            edit_fn(callback)
+        except Exception:
+            logger.debug("Original callback message unavailable; sending fresh menu", exc_info=True)
+            fallback_fn()
 
     @staticmethod
     def _step_user_id(event: Any) -> int:
@@ -102,9 +151,7 @@ class HubNavigation:
         data = load_data()
         if not data.get("auto_check_updates", True) and not catalog_requested:
             return
-        minutes = data.get("update_check_interval_minutes", 30)
-        if not isinstance(minutes, int) or isinstance(minutes, bool) or not 5 <= minutes <= 10080:
-            minutes = 30
+        minutes = _valid_interval(data)
         catalog_ok = {"fresh": True}
         def refresh() -> tuple[str, bool]:
             auto_check = bool(load_data().get("auto_check_updates", True))
@@ -129,14 +176,35 @@ class HubNavigation:
                                               cached_only=True, version=self._menu_background.version)
 
     def plugins_menu(self, callback: Any, force_refresh: bool = False,
-                     page: int = 0, view: str = "all") -> Any:
+                     page: int = 0, view: str = "all", *, background: bool = False) -> Any:
+        if force_refresh and background:
+            action_key = f"refresh:{callback.message.chat.id}:{callback.message.id}"
+            if not self._try_begin_action(action_key):
+                return self._alert(callback, "Обновление каталога уже выполняется")
+            try:
+                self._ack(callback, "Обновляю каталог…")
+            except Exception:
+                logger.debug("Early callback ack failed for plugins_menu", exc_info=True)
+
+            def _worker() -> None:
+                try:
+                    if not STOP_EVENT.is_set():
+                        self._render_plugins_menu(callback, force_refresh=True, page=page, view=view)
+                finally:
+                    self._end_action(action_key)
+
+            threading.Thread(target=_worker, name="hub-catalog-refresh", daemon=True).start()
+            return CB_ANSWERED
+
+        return self._render_plugins_menu(callback, force_refresh=force_refresh, page=page, view=view)
+
+    def _render_plugins_menu(self, callback: Any, force_refresh: bool = False,
+                             page: int = 0, view: str = "all") -> Any:
         states, _ = self._states(force_refresh=force_refresh, cached_only=not force_refresh)
         status = catalog_status()
         text, markup = render_plugins_menu(states, page, view, status)
         self._edit_html(text, callback.message.chat.id, callback.message.id, reply_markup=markup)
-        self._catalog_views[(callback.message.chat.id, callback.message.id)] = view
-        if len(self._catalog_views) > 128:
-            self._catalog_views.pop(next(iter(self._catalog_views)))
+        self._set_catalog_view(callback.message.chat.id, callback.message.id, view)
         if force_refresh:
             notice = "Каталог обновлён" if status["available"] else "Не удалось обновить каталог"
             return self._alert(callback, notice, show_alert=False)
@@ -164,7 +232,7 @@ class HubNavigation:
         if view == "diagnostics":
             text, markup = render_plugin_diagnostics(state)
         else:
-            previous = self._catalog_views.get((callback.message.chat.id, callback.message.id), "all")
+            previous = self._get_catalog_view(callback.message.chat.id, callback.message.id)
             text, markup = render_plugin_info(state, expanded=view == "description", catalog_view=previous)
         self._edit_html(text, callback.message.chat.id, callback.message.id,
                         reply_markup=markup, disable_web_page_preview=True)
@@ -189,9 +257,7 @@ class HubNavigation:
 
     def settings_menu(self, callback: Any) -> None:
         data = load_data()
-        interval = data.get("update_check_interval_minutes", 30)
-        if not isinstance(interval, int) or isinstance(interval, bool) or not 5 <= interval <= 10080:
-            interval = 30
+        interval = _valid_interval(data)
         text, markup = render_settings(bool(data.get("notify_updates", True)), get_sys_info(), bool(data.get("auto_check_updates", True)), interval)
         self._edit_html(text, callback.message.chat.id, callback.message.id, reply_markup=markup)
 
@@ -205,10 +271,10 @@ class HubNavigation:
         handlers.wake_update_checker()
         return self.settings_menu(callback)
 
-    def check_interval_menu(self, callback: Any) -> None:
-        data = load_data()
+    @staticmethod
+    def _build_check_interval_card(data: dict[str, Any]) -> tuple[str, Any]:
         enabled = bool(data.get("auto_check_updates", True))
-        interval = data.get("update_check_interval_minutes", 30)
+        interval = _valid_interval(data)
         card = CardBuilder(tg_icon("refresh"), "Частота проверки обновлений")
         card.paragraph(f"Сейчас: каждые {esc(interval)} мин" if enabled else "Сейчас: не проверять автоматически")
         card.paragraph("Выберите интервал или укажите свой: от 5 до 10 080 минут")
@@ -219,7 +285,11 @@ class HubNavigation:
         kb.row(Btn("Свой интервал", "hub:custom_interval", icon="settings"))
         kb.row(Btn("Не проверять", "hub:set_interval:0", style="danger"))
         kb.row(Btn("Назад", "hub:settings", icon="back"))
-        self._edit_html(card.build(), callback.message.chat.id, callback.message.id, reply_markup=kb.build())
+        return card.build(), kb.build()
+
+    def check_interval_menu(self, callback: Any) -> None:
+        text, markup = self._build_check_interval_card(load_data())
+        self._edit_html(text, callback.message.chat.id, callback.message.id, reply_markup=markup)
 
     def _save_interval(self, minutes: int) -> None:
         from . import handlers
@@ -244,16 +314,28 @@ class HubNavigation:
         return self.check_interval_menu(callback)
 
     def custom_interval_prompt(self, callback: Any) -> None:
-        msg = self._send_html(callback.message.chat.id, "Введите интервал проверки в минутах: от <b>5</b> до <b>10 080</b>. Для отмены отправьте «отмена».")
+        prompt_kb = KeyboardBuilder().row(Btn("Отмена", "hub:check_interval")).build()
+        msg = self._send_html(
+            callback.message.chat.id,
+            "Введите интервал проверки в минутах: от <b>5</b> до <b>10 080</b>. Для отмены нажмите кнопку ниже или отправьте «отмена».",
+            reply_markup=prompt_kb,
+        )
         self._set_hub_state(
             callback.message.chat.id,
             getattr(msg, "id", getattr(callback.message, "id", 0)),
             self._step_user_id(callback),
             self.STATE_AWAIT_INTERVAL,
-            {"callback": callback},
+            {"callback": callback, "prompt_msg_id": getattr(msg, "id", None)},
         )
 
-    def _process_interval_input(self, message: Any, callback: Any) -> None:
+    def _refresh_check_interval_after_step(self, chat_id: int, callback: Any) -> None:
+        def _send_fresh() -> None:
+            text, markup = self._build_check_interval_card(load_data())
+            self._send_html(chat_id, text, reply_markup=markup)
+
+        self._safe_refresh_callback_screen(callback, self.check_interval_menu, _send_fresh)
+
+    def _process_interval_input(self, message: Any, callback: Any, *, prompt_msg_id: Any = None) -> None:
         from . import handlers
         if not handlers._is_authorized(self.tg, getattr(message, "from_user", None)):
             return
@@ -269,8 +351,13 @@ class HubNavigation:
             return
         if raw.lower() == "отмена":
             self._clear_hub_state(chat_id, user_id)
+            if prompt_msg_id:
+                try:
+                    self.bot.delete_message(chat_id, prompt_msg_id)
+                except Exception:
+                    logger.debug("Could not delete interval prompt message %s", prompt_msg_id, exc_info=True)
             self.bot.send_message(chat_id, "Ввод интервала отменён")
-            self.check_interval_menu(callback)
+            self._refresh_check_interval_after_step(chat_id, callback)
             return
         if not raw.isascii() or not raw.isdigit() or len(raw) > 5 or not 5 <= int(raw) <= 10080:
             retry = self.bot.reply_to(message, "Введите целое число от 5 до 10 080 или отправьте «отмена».")
@@ -279,7 +366,7 @@ class HubNavigation:
                 getattr(retry, "id", getattr(message, "id", 0)),
                 user_id,
                 self.STATE_AWAIT_INTERVAL,
-                {"callback": callback},
+                {"callback": callback, "prompt_msg_id": getattr(retry, "id", prompt_msg_id)},
             )
             return
         self._clear_hub_state(chat_id, user_id)
@@ -289,11 +376,19 @@ class HubNavigation:
             logger.exception("Failed saving custom update interval")
             self.bot.reply_to(message, "Не удалось сохранить настройку. Попробуйте ещё раз.")
             return
+        if prompt_msg_id:
+            try:
+                self.bot.delete_message(chat_id, prompt_msg_id)
+            except Exception:
+                logger.debug("Could not delete interval prompt message %s", prompt_msg_id, exc_info=True)
         self.bot.reply_to(message, "Интервал проверки сохранён")
-        self.check_interval_menu(callback)
+        self._refresh_check_interval_after_step(chat_id, callback)
 
-    def check_updates_menu(self, callback: Any) -> None:
+    def check_updates_menu(self, callback: Any) -> Any:
         chat, message = callback.message.chat.id, callback.message.id
+        action_key = f"check_updates:{chat}:{message}"
+        if not self._try_begin_action(action_key):
+            return self._alert(callback, "Проверка обновлений уже выполняется")
         background = self._menu_background
         with background.lock:
             background.serial += 1
@@ -334,6 +429,8 @@ class HubNavigation:
                 result = CardBuilder(tg_icon("alert"), "Не удалось проверить обновления")
                 result.paragraph("Повторите попытку позже")
                 body, markup = result.build(), KeyboardBuilder().row(Btn("Назад", "hub:settings", icon="back")).build()
+            finally:
+                self._end_action(action_key)
             with background.lock:
                 should_edit = not STOP_EVENT.is_set() and background.views.get((chat, message)) == serial
             if should_edit:

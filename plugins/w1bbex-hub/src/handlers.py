@@ -29,6 +29,7 @@ from .core import (
     invoke_plugin_command,
     is_newer_version,
     request_trial_key,
+    scan_legacy_plugin_files,
     trigger_cardinal_restart,
 )
 from .menu_background import MenuBackground
@@ -41,7 +42,6 @@ from .runtime import (
     STOP_EVENT,
     UPDATE_WAKE_EVENT,
     UPDATE_CHECK_INITIAL_DELAY_SECONDS,
-    UPDATE_CHECK_INTERVAL_SECONDS,
     UUID,
     VERSION,
     configure_file_logging,
@@ -78,6 +78,7 @@ from .ui import (
     render_trial_activated,
     render_trial_prompt,
     render_update_notification,
+    resolve_callback_data,
     strip_button_styles,
 )
 
@@ -137,7 +138,11 @@ def _build_plugin_states(
     data = load_data()
     installed = data.get("installed") if isinstance(data.get("installed"), dict) else {}
     keys = data.get("keys") if isinstance(data.get("keys"), dict) else {}
-    states = [inspect_plugin_state(cardinal, p, installed, keys) for p in merge_local_plugins(plugins, installed)]
+    legacy_entries = scan_legacy_plugin_files()
+    states = [
+        inspect_plugin_state(cardinal, p, installed, keys, legacy_entries=legacy_entries)
+        for p in merge_local_plugins(plugins, installed)
+    ]
     return states, data
 
 
@@ -402,8 +407,35 @@ class HubController(HubNavigation, TelegramTransport):
         self.bot = self.tg.bot
         self._acked_callbacks: set[str] = set()
         self._menu_background = MenuBackground()
+        self._views_lock = threading.Lock()
         self._catalog_views: dict[tuple[int, int], str] = {}
         self._hub_states: dict[tuple[int, int], dict[str, Any]] = {}
+        self._actions_lock = threading.Lock()
+        self._in_flight_actions: set[str] = set()
+        self._exact_routes: dict[str, Callable[[CallbackQuery], Any]] = {}
+        self._prefix_routes: tuple[tuple[str, Callable[[CallbackQuery, Optional[str]], Any]], ...] = ()
+
+    def set_routes(
+        self,
+        exact_routes: dict[str, Callable[[CallbackQuery], Any]],
+        prefix_routes: tuple[tuple[str, Callable[[CallbackQuery, Optional[str]], Any]], ...],
+    ) -> None:
+        """Store route tables so compact callback tokens can dispatch through the same handlers."""
+        self._exact_routes = exact_routes
+        self._prefix_routes = prefix_routes
+
+    def dispatch_compact_callback(self, c: CallbackQuery, _arg: Optional[str] = None) -> Any:
+        """Resolve a tokenized callback_data and execute the matching Hub route."""
+        resolved = resolve_callback_data(getattr(c, "data", None))
+        if not resolved or resolved == getattr(c, "data", None):
+            return self._alert(c, "Кнопка устарела · откройте /hub заново.")
+        fn = self._exact_routes.get(resolved)
+        if fn is not None:
+            return fn(c)
+        for prefix, handler in self._prefix_routes:
+            if resolved.startswith(prefix):
+                return handler(c, _parse_cb_arg(resolved, prefix))
+        return self._alert(c, "Действие не найдено · откройте /hub заново.")
 
     def _states(self, force_refresh: bool = False, cached_only: bool = False) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         return _build_plugin_states(self.cardinal, force_refresh=force_refresh, cached_only=cached_only)
@@ -460,7 +492,7 @@ class HubController(HubNavigation, TelegramTransport):
             getattr(msg, "id", getattr(c.message, "id", 0)),
             self._step_user_id(c),
             self.STATE_AWAIT_KEY,
-            {"callback": c},
+            {"callback": c, "prompt_msg_id": getattr(msg, "id", None)},
         )
 
     def _is_hub_step_message(self, message: Message) -> bool:
@@ -485,12 +517,26 @@ class HubController(HubNavigation, TelegramTransport):
         if orig_callback is None:
             self._clear_hub_state(chat_id, user_id)
             return
+        prompt_msg_id = data.get("prompt_msg_id")
         if state == self.STATE_AWAIT_KEY:
-            self._process_key_input(message, orig_callback)
+            self._process_key_input(message, orig_callback, prompt_msg_id=prompt_msg_id)
         elif state == self.STATE_AWAIT_INTERVAL:
-            self._process_interval_input(message, orig_callback)
+            self._process_interval_input(message, orig_callback, prompt_msg_id=prompt_msg_id)
 
-    def _process_key_input(self, message: Message, orig_callback: CallbackQuery) -> None:
+    def _delete_prompt_message(self, chat_id: int, prompt_msg_id: Any) -> None:
+        if prompt_msg_id:
+            try:
+                self.bot.delete_message(chat_id, prompt_msg_id)
+            except Exception:
+                logger.debug("Could not delete prompt message %s", prompt_msg_id, exc_info=True)
+
+    def _process_key_input(
+        self,
+        message: Message,
+        orig_callback: CallbackQuery,
+        *,
+        prompt_msg_id: Any = None,
+    ) -> None:
         if not _is_authorized(self.tg, getattr(message, "from_user", None)):
             return
         chat_id = message.chat.id
@@ -498,6 +544,7 @@ class HubController(HubNavigation, TelegramTransport):
         key = message.text.strip() if message.text else ""
         if key.startswith("/"):
             self._clear_hub_state(chat_id, user_id)
+            self._delete_prompt_message(chat_id, prompt_msg_id)
             if key.split()[0].split("@")[0].lower() == "/hub":
                 self.hub_command(message)
             else:
@@ -505,17 +552,23 @@ class HubController(HubNavigation, TelegramTransport):
             return
         if key.lower() == "отмена":
             self._clear_hub_state(chat_id, user_id)
+            self._delete_prompt_message(chat_id, prompt_msg_id)
             self.bot.send_message(chat_id, "Действие отменено.")
-            self.main_menu(orig_callback)
+            self._safe_refresh_callback_screen(
+                orig_callback,
+                self.main_menu,
+                lambda: self._send_html(chat_id, *self._main_content(message.from_user)),
+            )
             return
         if not key:
+            self._delete_prompt_message(chat_id, prompt_msg_id)
             retry_msg = self.bot.reply_to(message, "Пустой ключ. Попробуйте еще раз или отправьте 'отмена'.")
             self._set_hub_state(
                 chat_id,
                 getattr(retry_msg, "id", getattr(message, "id", 0)),
                 user_id,
                 self.STATE_AWAIT_KEY,
-                {"callback": orig_callback},
+                {"callback": orig_callback, "prompt_msg_id": getattr(retry_msg, "id", None)},
             )
             return
 
@@ -528,6 +581,7 @@ class HubController(HubNavigation, TelegramTransport):
         )
         matched = next((p for p in candidates if key.upper().startswith(str(p["prefix"]).upper())), None)
         if not matched:
+            self._delete_prompt_message(chat_id, prompt_msg_id)
             prefixes = "".join(
                 f"• <code>{esc(p['prefix'])}...</code> — {esc(p.get('name', ''))}\n"
                 for p in plugins
@@ -543,11 +597,12 @@ class HubController(HubNavigation, TelegramTransport):
                 getattr(retry_msg, "id", getattr(message, "id", 0)),
                 user_id,
                 self.STATE_AWAIT_KEY,
-                {"callback": orig_callback},
+                {"callback": orig_callback, "prompt_msg_id": getattr(retry_msg, "id", None)},
             )
             return
 
         self._clear_hub_state(chat_id, user_id)
+        self._delete_prompt_message(chat_id, prompt_msg_id)
         plugin_name = matched["id"]
         plugin_label = str(matched.get("name", plugin_name))
         try:
@@ -560,58 +615,127 @@ class HubController(HubNavigation, TelegramTransport):
         text, kb = render_key_activated(plugin_name, plugin_label, key)
         self._reply_html(message, text, reply_markup=kb)
 
-    def install_plugin(self, c: CallbackQuery, plugin_name: Optional[str]) -> Any:
+    def _run_install_plugin(
+        self,
+        c: CallbackQuery,
+        plugin_name: str,
+        msg_obj: Any,
+        action_key: str,
+        *,
+        background: bool = False,
+        catalog: Optional[list[dict[str, Any]]] = None,
+    ) -> None:
+        def _can_edit() -> bool:
+            return not background or not STOP_EVENT.is_set()
+
+        try:
+            catalog = catalog if catalog is not None else get_plugins()
+            plugin_info = next((x for x in catalog if x.get("id") == plugin_name), None)
+            plugin_label = str(plugin_info.get("name", plugin_name)) if plugin_info else plugin_name
+            is_free = bool(plugin_info.get("is_free")) if plugin_info else False
+
+            data = load_data()
+            installed = data.get("installed") if isinstance(data.get("installed"), dict) else {}
+            was_installed = plugin_name in installed
+            key = (data.get("keys") or {}).get(plugin_name)
+            if not plugin_info and not catalog and not key:
+                text, kb = render_catalog_unavailable(plugin_name)
+                if _can_edit():
+                    self._edit_html(text, msg_obj.chat.id, msg_obj.id, reply_markup=kb)
+                return
+            if not key and not is_free:
+                text, kb = render_missing_key_notice(plugin_name, plugin_label)
+                if _can_edit():
+                    self._edit_html(text, msg_obj.chat.id, msg_obj.id, reply_markup=kb)
+                return
+
+            if _can_edit():
+                self._edit_html(
+                    f"<i>Скачиваю и устанавливаю {esc(plugin_label)}...</i>",
+                    msg_obj.chat.id,
+                    msg_obj.id,
+                )
+            success, msg = download_plugin(self.cardinal, plugin_name, key, c.from_user)
+            if success:
+                after_installed = load_data().get("installed")
+                after_entry = after_installed.get(plugin_name) if isinstance(after_installed, dict) else None
+                if not isinstance(after_entry, dict):
+                    after_entry = {}
+                _save_restart_marker(
+                    action="update" if was_installed else "install",
+                    chat_id=msg_obj.chat.id,
+                    plugin_id=plugin_name,
+                    plugin_name=plugin_label,
+                    target_version=str(after_entry.get("version") or (plugin_info or {}).get("latest_version") or ""),
+                    expected_uuid=str((plugin_info or {}).get("uuid") or ""),
+                )
+
+            text, kb = render_install_result(plugin_name, plugin_label, success, msg, is_update=was_installed)
+            if _can_edit():
+                self._edit_html(text, msg_obj.chat.id, msg_obj.id, reply_markup=kb)
+        except Exception:
+            if not background:
+                raise
+            logger.exception("Async install failed for %s", plugin_name)
+            if _can_edit():
+                try:
+                    self._edit_html(
+                        "<b>Ошибка установки плагина</b>\nПовторите попытку позже или откройте /hub.",
+                        msg_obj.chat.id,
+                        msg_obj.id,
+                    )
+                except Exception:
+                    logger.debug("Could not display install error", exc_info=True)
+        finally:
+            self._end_action(action_key)
+
+    def install_plugin(self, c: CallbackQuery, plugin_name: Optional[str], *, background: bool = False) -> Any:
         if not plugin_name:
             return self._alert(c, "Некорректный идентификатор плагина")
         msg_obj = getattr(c, "message", None)
         if msg_obj is None:
             return self._alert(c, "Сообщение устарело. Откройте /hub заново.")
 
-        catalog = get_plugins()
-        plugin_info = next((x for x in catalog if x.get("id") == plugin_name), None)
-        plugin_label = str(plugin_info.get("name", plugin_name)) if plugin_info else plugin_name
-        is_free = bool(plugin_info.get("is_free")) if plugin_info else False
+        action_key = f"install:{plugin_name}"
+        if not self._try_begin_action(action_key):
+            return self._alert(c, "Установка уже выполняется · подождите")
 
-        data = load_data()
-        installed = data.get("installed") if isinstance(data.get("installed"), dict) else {}
-        was_installed = plugin_name in installed
-        key = (data.get("keys") or {}).get(plugin_name)
-        if not plugin_info and not catalog and not key:
-            text, kb = render_catalog_unavailable(plugin_name)
-            self._edit_html(text, msg_obj.chat.id, msg_obj.id, reply_markup=kb)
-            return None
-        if not key and not is_free:
-            text, kb = render_missing_key_notice(plugin_name, plugin_label)
-            self._edit_html(text, msg_obj.chat.id, msg_obj.id, reply_markup=kb)
-            return None
+        if background:
+            with CACHE_LOCK:
+                cached = PLUGINS_CACHE.get("items")
+                cached_list = list(cached) if isinstance(cached, list) else []
+            cached_info = next((x for x in cached_list if isinstance(x, dict) and x.get("id") == plugin_name), None)
+            plugin_label = str(cached_info.get("name", plugin_name)) if cached_info else plugin_name
+            try:
+                self._ack(c, f"Устанавливаю {plugin_label}")
+            except Exception:
+                logger.debug("Early callback ack failed for install:%s", plugin_name, exc_info=True)
+            threading.Thread(
+                target=self._run_install_plugin,
+                args=(c, plugin_name, msg_obj, action_key),
+                kwargs={"background": True},
+                name=f"hub-install-{plugin_name}",
+                daemon=True,
+            ).start()
+            return CB_ANSWERED
 
         try:
-            self._ack(c, f"Устанавливаю {plugin_label}")
+            catalog = get_plugins()
+            plugin_info = next((x for x in catalog if x.get("id") == plugin_name), None)
+            plugin_label = str(plugin_info.get("name", plugin_name)) if plugin_info else plugin_name
+            data = load_data()
+            key = (data.get("keys") or {}).get(plugin_name)
+            is_free = bool(plugin_info.get("is_free")) if plugin_info else False
+            if (plugin_info or catalog or key) and (key or is_free):
+                try:
+                    self._ack(c, f"Устанавливаю {plugin_label}")
+                except Exception:
+                    logger.debug("Early callback ack failed for install:%s", plugin_name, exc_info=True)
         except Exception:
-            logger.debug("Early callback ack failed for install:%s", plugin_name, exc_info=True)
+            self._end_action(action_key)
+            raise
 
-        self._edit_html(
-            f"<i>Скачиваю и устанавливаю {esc(plugin_label)}...</i>",
-            msg_obj.chat.id,
-            msg_obj.id,
-        )
-        success, msg = download_plugin(self.cardinal, plugin_name, key, c.from_user)
-        if success:
-            after_installed = load_data().get("installed")
-            after_entry = after_installed.get(plugin_name) if isinstance(after_installed, dict) else None
-            if not isinstance(after_entry, dict):
-                after_entry = {}
-            _save_restart_marker(
-                action="update" if was_installed else "install",
-                chat_id=msg_obj.chat.id,
-                plugin_id=plugin_name,
-                plugin_name=plugin_label,
-                target_version=str(after_entry.get("version") or (plugin_info or {}).get("latest_version") or ""),
-                expected_uuid=str((plugin_info or {}).get("uuid") or ""),
-            )
-
-        text, kb = render_install_result(plugin_name, plugin_label, success, msg, is_update=was_installed)
-        self._edit_html(text, msg_obj.chat.id, msg_obj.id, reply_markup=kb)
+        self._run_install_plugin(c, plugin_name, msg_obj, action_key, background=False, catalog=catalog)
         return CB_ANSWERED
 
     def trial_request(self, c: CallbackQuery, plugin_name: Optional[str]) -> Any:
@@ -624,23 +748,57 @@ class HubController(HubNavigation, TelegramTransport):
         self._edit_html(text, c.message.chat.id, c.message.id, reply_markup=kb, disable_web_page_preview=True)
         return None
 
-    def trial_confirm(self, c: CallbackQuery, plugin_name: Optional[str]) -> Any:
+    def _run_trial_confirm(self, c: CallbackQuery, plugin_name: str, msg_obj: Any, action_key: str) -> None:
+        try:
+            ok, result = request_trial_key(self.cardinal, plugin_name, c.from_user)
+            if not ok:
+                if not STOP_EVENT.is_set():
+                    self._alert(c, f"{result}")
+                return
+
+            p = next((x for x in get_plugins() if x.get("id") == plugin_name), None)
+            plugin_label = str(p.get("name", plugin_name)) if p else plugin_name
+            try:
+                update_data(lambda d: d.setdefault("keys", {}).__setitem__(plugin_name, result))
+            except OSError as exc:
+                logger.exception("Failed saving trial key for %s", plugin_name)
+                if not STOP_EVENT.is_set():
+                    self._alert(c, f"Ошибка сохранения ключа: {exc}")
+                return
+
+            text, kb = render_trial_activated(plugin_name, plugin_label, result)
+            if not STOP_EVENT.is_set():
+                self._edit_html(text, msg_obj.chat.id, msg_obj.id, reply_markup=kb)
+        except Exception:
+            logger.exception("Trial request failed for %s", plugin_name)
+        finally:
+            self._end_action(action_key)
+
+    def trial_confirm(self, c: CallbackQuery, plugin_name: Optional[str], *, background: bool = False) -> Any:
         if not plugin_name:
             return self._alert(c, "Некорректный идентификатор плагина")
-        ok, result = request_trial_key(self.cardinal, plugin_name, c.from_user)
-        if not ok:
-            return self._alert(c, f"{result}")
+        msg_obj = getattr(c, "message", None)
+        if msg_obj is None:
+            return self._alert(c, "Сообщение устарело. Откройте /hub заново.")
 
-        p = next((x for x in get_plugins() if x.get("id") == plugin_name), None)
-        plugin_label = str(p.get("name", plugin_name)) if p else plugin_name
-        try:
-            update_data(lambda d: d.setdefault("keys", {}).__setitem__(plugin_name, result))
-        except OSError as exc:
-            logger.exception("Failed saving trial key for %s", plugin_name)
-            return self._alert(c, f"Ошибка сохранения ключа: {exc}")
+        action_key = f"trial:{plugin_name}"
+        if not self._try_begin_action(action_key):
+            return self._alert(c, "Запрос пробного ключа уже выполняется · подождите")
 
-        text, kb = render_trial_activated(plugin_name, plugin_label, result)
-        self._edit_html(text, c.message.chat.id, c.message.id, reply_markup=kb)
+        if background:
+            try:
+                self._ack(c, "Запрашиваю пробный ключ…")
+            except Exception:
+                logger.debug("Early callback ack failed for trial:%s", plugin_name, exc_info=True)
+            threading.Thread(
+                target=self._run_trial_confirm,
+                args=(c, plugin_name, msg_obj, action_key),
+                name=f"hub-trial-{plugin_name}",
+                daemon=True,
+            ).start()
+            return CB_ANSWERED
+
+        self._run_trial_confirm(c, plugin_name, msg_obj, action_key)
         return None
 
     def delete_confirm_handler(self, c: CallbackQuery, plugin_name: Optional[str]) -> Any:
@@ -828,43 +986,74 @@ class HubController(HubNavigation, TelegramTransport):
                 return self._alert(c, "Настройка сохранена · откройте /hub, чтобы увидеть текущее состояние")
         return CB_ANSWERED
 
-    def hub_update_handler(self, c: CallbackQuery) -> Any:
+    def _run_hub_update(self, msg_obj: Any, action_key: str) -> None:
+        try:
+            self._edit_html("<i>Скачивание обновления Hub...</i>", msg_obj.chat.id, msg_obj.id)
+            ok, message = download_and_update_hub()
+            if ok:
+                disk_ver = None
+                if PATHS.hub_file and os.path.isfile(PATHS.hub_file):
+                    disk_ver = extract_py_plugin_metadata(PATHS.hub_file).get("version")
+                _save_restart_marker(
+                    action="hub",
+                    chat_id=msg_obj.chat.id,
+                    message_id=msg_obj.id,
+                    target_version=str(disk_ver or ""),
+                )
+                logger.info("Downloaded Hub update v%s; saved pending_restart marker", disk_ver or "?")
+                text, kb = render_hub_update_result(str(disk_ver) if disk_ver else None)
+                if not STOP_EVENT.is_set():
+                    self._edit_html(text, msg_obj.chat.id, msg_obj.id, reply_markup=kb)
+                return
+            text, kb = render_hub_update_error(message)
+            if not STOP_EVENT.is_set():
+                self._edit_html(text, msg_obj.chat.id, msg_obj.id, reply_markup=kb)
+        except Exception:
+            logger.exception("Async Hub update failed")
+            if not STOP_EVENT.is_set():
+                try:
+                    text, kb = render_hub_update_error("Неожиданная ошибка при загрузке обновления Hub.")
+                    self._edit_html(text, msg_obj.chat.id, msg_obj.id, reply_markup=kb)
+                except Exception:
+                    logger.debug("Could not display Hub update error", exc_info=True)
+        finally:
+            self._end_action(action_key)
+
+    def hub_update_handler(self, c: CallbackQuery, *, background: bool = False) -> Any:
         msg_obj = getattr(c, "message", None)
         if msg_obj is None:
             return self._alert(c, "Сообщение устарело. Откройте /hub заново.")
+        action_key = "update_hub"
+        if not self._try_begin_action(action_key):
+            return self._alert(c, "Обновление Hub уже выполняется · подождите")
         try:
             self._ack(c, "Загружаю обновление Hub")
         except Exception:
             logger.debug("Early callback ack failed for hub_update_handler", exc_info=True)
 
-        self._edit_html("<i>Скачивание обновления Hub...</i>", msg_obj.chat.id, msg_obj.id)
-        ok, message = download_and_update_hub()
-        if ok:
-            disk_ver = None
-            if PATHS.hub_file and os.path.isfile(PATHS.hub_file):
-                disk_ver = extract_py_plugin_metadata(PATHS.hub_file).get("version")
-            _save_restart_marker(
-                action="hub",
-                chat_id=msg_obj.chat.id,
-                message_id=msg_obj.id,
-                target_version=str(disk_ver or ""),
-            )
-            logger.info("Downloaded Hub update v%s; saved pending_restart marker", disk_ver or "?")
-            text, kb = render_hub_update_result(str(disk_ver) if disk_ver else None)
-            self._edit_html(text, msg_obj.chat.id, msg_obj.id, reply_markup=kb)
+        if background:
+            threading.Thread(
+                target=self._run_hub_update,
+                args=(msg_obj, action_key),
+                name="hub-self-update",
+                daemon=True,
+            ).start()
             return CB_ANSWERED
-        text, kb = render_hub_update_error(message)
-        self._edit_html(text, msg_obj.chat.id, msg_obj.id, reply_markup=kb)
+
+        self._run_hub_update(msg_obj, action_key)
         return CB_ANSWERED
 
     def hub_command(self, message: Message) -> None:
         if not _is_authorized(self.tg, getattr(message, "from_user", None)):
             return
         self._clear_hub_state(message.chat.id, self._step_user_id(message))
-        try:
-            update_data(lambda d: d.__setitem__("owner_tg_id", message.chat.id))
-        except OSError:
-            logger.exception("Failed saving owner_tg_id")
+        chat_type = str(getattr(message.chat, "type", "") or "").lower()
+        is_private_chat = (chat_type == "private") or (not chat_type and isinstance(message.chat.id, int) and message.chat.id > 0)
+        if is_private_chat:
+            try:
+                update_data(lambda d: d.__setitem__("owner_tg_id", message.chat.id))
+            except OSError:
+                logger.exception("Failed saving owner_tg_id")
         text, kb = self._main_content(message.from_user)
         sent = self._send_html(message.chat.id, text, reply_markup=kb)
         msg_id = getattr(sent, "message_id", None) or getattr(sent, "id", None)
@@ -887,7 +1076,19 @@ class HubController(HubNavigation, TelegramTransport):
             )
             return
 
-        plugin, key = parts[1].strip().lower(), parts[2].strip()
+        raw_plugin, key = parts[1].strip(), parts[2].strip()
+        catalog = get_plugins()
+        p = next((x for x in catalog if str(x.get("id") or "").lower() == raw_plugin.lower()), None)
+        if p is not None:
+            plugin = str(p["id"])
+        else:
+            installed_map = load_data().get("installed")
+            matched_local = (
+                next((k for k in installed_map if str(k).lower() == raw_plugin.lower()), None)
+                if isinstance(installed_map, dict)
+                else None
+            )
+            plugin = str(matched_local or raw_plugin)
         try:
             update_data(lambda d: d.setdefault("keys", {}).__setitem__(plugin, key))
         except OSError as exc:
@@ -895,7 +1096,6 @@ class HubController(HubNavigation, TelegramTransport):
             self._reply_html(message, f"<b>Ошибка сохранения ключа:</b> {esc(exc)}")
             return
 
-        p = next((x for x in get_plugins() if x.get("id") == plugin), None)
         plugin_label = str(p.get("name", plugin)) if p else plugin
         text, kb = render_key_activated(plugin, plugin_label, key)
         self._reply_html(message, text, reply_markup=kb)
@@ -919,7 +1119,6 @@ def init_cardinal(cardinal: Optional[Cardinal]) -> Optional[HubController]:
     exact_routes = {
         "hub:main": controller.main_menu,
         "hub:plugins_menu": lambda c: controller.plugins_menu(c, force_refresh=False),
-        "hub:plugins_refresh": lambda c: controller.plugins_menu(c, force_refresh=True),
         "hub:cancel_step": controller.cancel_step,
         "hub:activate_key": controller.activate_key_handler,
         "hub:licenses": controller.show_licenses,
@@ -931,12 +1130,13 @@ def init_cardinal(cardinal: Optional[Cardinal]) -> Optional[HubController]:
         "hub:custom_interval": controller.custom_interval_prompt,
         "hub:environment": controller.environment_menu,
         "hub:update_hub": controller.hub_release_menu,
-        "hub:download_hub": controller.hub_update_handler,
+        "hub:download_hub": lambda c: controller.hub_update_handler(c, background=True),
         "hub:toggle_notify": controller.toggle_notify,
         "hub:toggle_notify_main": lambda c: controller.toggle_notify(c, return_to_main=True),
         "hub:toggle_notify_from_msg": controller.toggle_notify_msg_handler,
     }
     prefix_routes = (
+        ("hub:cb:", controller.dispatch_compact_callback),
         ("hub:set_interval:", controller.set_interval_callback),
         ("hub:plugin_enable:", lambda c, arg: controller.set_plugin_enabled(c, arg, True)),
         ("hub:plugin_disable:", lambda c, arg: controller.set_plugin_enabled(c, arg, False)),
@@ -944,16 +1144,16 @@ def init_cardinal(cardinal: Optional[Cardinal]) -> Optional[HubController]:
         ("hub:description:", lambda c, arg: controller.plugin_info_menu(c, arg, view="description")),
         ("hub:diagnostics:", lambda c, arg: controller.plugin_info_menu(c, arg, view="diagnostics")),
         ("hub:catalog:", controller.catalog_page),
-        ("hub:refresh:", lambda c, arg: controller.catalog_page(c, arg, refresh=True)),
-        ("hub:install:", controller.install_plugin),
+        ("hub:install:", lambda c, arg: controller.install_plugin(c, arg, background=True)),
         ("hub:trial:", controller.trial_request),
-        ("hub:trial_confirm:", controller.trial_confirm),
+        ("hub:trial_confirm:", lambda c, arg: controller.trial_confirm(c, arg, background=True)),
         ("hub:delete_confirm:", controller.delete_confirm_handler),
         ("hub:delete:", controller.delete_plugin_handler),
         ("hub:remind:", controller.remind_handler),
         ("hub:restart:", controller.restart_cardinal_handler),
         ("hub:open:", controller.open_plugin_handler),
     )
+    controller.set_routes(exact_routes, prefix_routes)
     try:
         for cb_name, fn in exact_routes.items():
             tg.cbq_handler(
