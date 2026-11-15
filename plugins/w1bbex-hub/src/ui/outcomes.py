@@ -386,7 +386,8 @@ def render_update_notification(
         "high": "Важное обновление",
     }.get(urgency, "Доступно обновление")
 
-    ver_transition = f"{update['curr_ver']} → {update['latest']}"
+    curr_ver = update.get("curr_ver")
+    ver_transition = f"{curr_ver} → {update['latest']}" if curr_ver else str(update['latest'])
     changelog = str(update.get("changelog") or "Без описания").strip()
     if len(changelog) > 1800:
         changelog = changelog[:1799].rstrip() + "…"
@@ -413,11 +414,13 @@ def render_update_notification(
     kb = KeyboardBuilder()
     if update.get("target") == "hub":
         kb.row(Btn(f"Обновить Hub до {update['latest']}", "hub:update_hub", style="success", icon="download"))
+        remind_key = update.get("update_key") or update["id"]
     else:
-        kb.row(Btn(f"Обновить до {update['latest']}", f"hub:install:{update['id']}", style="success"))
+        kb.row(Btn(f"Обновить до {update['latest']}", f"hub:upd:{update['id']}", style="success"))
+        remind_key = update["id"]
     toggle_label = "Все уведомления: вкл" if notify_enabled else "Все уведомления: выкл"
     kb.row(
-        Btn("Напомнить завтра", f"hub:remind:{update['update_key']}"),
+        Btn("Напомнить завтра", f"hub:remind:{remind_key}"),
         Btn(toggle_label, "hub:toggle_notify_from_msg", style="success" if notify_enabled else "danger",
             icon="bell" if notify_enabled else "bell_off"),
     )
@@ -443,7 +446,9 @@ def rebuild_notification_toggle_markup(
             if cb_data == "hub:toggle_notify_from_msg":
                 text = toggle_label
                 style = "success" if notify_enabled else "danger"
-            elif cb_data == "hub:update_hub" or (isinstance(cb_data, str) and cb_data.startswith("hub:install:")):
+            elif cb_data == "hub:update_hub" or (
+                isinstance(cb_data, str) and (cb_data.startswith("hub:install:") or cb_data.startswith("hub:upd:"))
+            ):
                 style = "success"
             row_btns.append(
                 Btn(

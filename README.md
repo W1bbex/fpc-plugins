@@ -88,20 +88,20 @@ fpc-plugins/
 
 ```bash
 # Сборка W1bbexHub.py (результат — в корне репозитория)
-py -3 plugins/w1bbex-hub/build.py
+python plugins/w1bbex-hub/build.py
 
 # Сборка AutoSMM.py (результат — plugins/autosmm/AutoSMM.py)
-py -3 plugins/autosmm/build.py
+python plugins/autosmm/build.py
 ```
 
 Запуск проверок выполняется отдельно из папки каждого плагина, чтобы изолировать пакеты `src/`:
 
 ```bash
 # Проверки W1bbex Hub
-cd plugins/w1bbex-hub && py -3 -m pytest tests -q
+cd plugins/w1bbex-hub && python -m pytest tests -q
 
 # Проверки AutoSMM
-cd plugins/autosmm && py -3 -m pytest tests -q
+cd plugins/autosmm && python -m pytest tests -q
 ```
 
 ---

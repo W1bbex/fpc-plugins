@@ -172,3 +172,12 @@ AutoSMM v{h(rt.VERSION)} доступен на <b>7 дней без телеме
 
 Мы заранее напомним за <b>48ч</b> и за <b>12ч</b> до окончания. Через 7 дней плагин снова попросит выбрать: принять телеметрию или остаться на AutoSMM v0.0.8."""
     _edit_html_screen(call, text_value, _inline_kb(("🚀 Открыть AutoSMM", "asmm:return_to_settings")), clean=True, disable_preview=True)
+
+
+def build_telemetry_guest_warning_markup(security_url: str = TELEMETRY_SECURITY_URL) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        InlineKeyboardButton("✅ Согласиться и продолжить", callback_data="asmm:telemetry_accept"),
+        InlineKeyboardButton("🛡 Насколько это безопасно?", url=security_url),
+    )
+    return kb

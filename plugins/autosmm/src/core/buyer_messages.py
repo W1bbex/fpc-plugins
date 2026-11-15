@@ -3,8 +3,11 @@ from __future__ import annotations
 from datetime import datetime
 import logging
 import re
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 import unicodedata
+
+if TYPE_CHECKING:
+    from cardinal import Cardinal
 
 from ..models import (
     extract_progress_values as _extract_progress_values,

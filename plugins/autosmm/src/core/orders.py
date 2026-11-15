@@ -112,7 +112,11 @@ def _apply_status_result(
     else:
         srv_num = _safe_int(order_record.get("service_number")) or 1
         srv_balance = get_cached_service_balance(srv_num)
-        currency = normalize_currency_code(order_record.get("currency") or srv_balance.get("currency") or "RUB")
+        panel_currency = srv_balance.get("currency")
+        if panel_currency not in (None, ""):
+            currency = normalize_currency_code(panel_currency)
+        else:
+            currency = normalize_currency_code(order_record.get("currency") or "RUB")
     lot_summa = _safe_float(latest_initial.get("summa"), _safe_float(order_record.get("summa"), 0.0))
 
     fx_info: Optional[Dict[str, Any]] = None

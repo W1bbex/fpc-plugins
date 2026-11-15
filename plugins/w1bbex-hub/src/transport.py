@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import html
+import threading
 from typing import Any, Callable
 
-from .runtime import CB_ANSWERED
+from .runtime import CB_ANSWERED, logger
 from .ui.icons import without_custom_emojis
 from .ui.kit import has_custom_button_icons, has_styled_buttons, strip_button_icons, strip_button_styles
 
@@ -54,19 +55,32 @@ def _call_tg_html(invoke: Callable[[str, Any], Any], text: str, reply_markup: An
 class TelegramTransport:
     """Reusable message methods; Cardinal lifecycle and routing remain in handlers."""
 
+    def _get_acked_lock(self) -> threading.Lock:
+        lock = vars(self).get("_acked_lock")
+        if lock is None:
+            lock = threading.Lock()
+            vars(self)["_acked_lock"] = lock
+        return lock
+
     def _ack(self, callback: Any, text: str | None = None) -> None:
         cb_id = getattr(callback, "id", None)
-        if getattr(callback, "_hub_acked", False) or (cb_id is not None and cb_id in self._acked_callbacks):
+        lock = self._get_acked_lock()
+        with lock:
+            already_acked = getattr(callback, "_hub_acked", False) or (cb_id is not None and cb_id in self._acked_callbacks)
+        if already_acked:
             return
         trimmed = text[:200] if text else None
         self.bot.answer_callback_query(callback.id, trimmed, show_alert=False)
         setattr(callback, "_hub_acked", True)
         if cb_id is not None:
-            self._acked_callbacks.add(cb_id)
+            with lock:
+                self._acked_callbacks.add(cb_id)
 
     def _alert(self, callback: Any, text: str, show_alert: bool = True) -> Any:
         cb_id = getattr(callback, "id", None)
-        is_acked = getattr(callback, "_hub_acked", False) or (cb_id is not None and cb_id in self._acked_callbacks)
+        lock = self._get_acked_lock()
+        with lock:
+            is_acked = getattr(callback, "_hub_acked", False) or (cb_id is not None and cb_id in self._acked_callbacks)
         trimmed = (text or "")[:200]
         if is_acked:
             if show_alert and getattr(callback, "message", None):
@@ -76,7 +90,8 @@ class TelegramTransport:
             self.bot.answer_callback_query(callback.id, trimmed, show_alert=show_alert)
             setattr(callback, "_hub_acked", True)
             if cb_id is not None:
-                self._acked_callbacks.add(cb_id)
+                with lock:
+                    self._acked_callbacks.add(cb_id)
         except Exception:
             if show_alert and getattr(callback, "message", None):
                 try:

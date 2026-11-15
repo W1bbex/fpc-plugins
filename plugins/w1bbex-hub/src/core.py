@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import ast
 import copy
+from dataclasses import dataclass
 import os
 import re
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional, Union
 
 from .runtime import LOADER_HEADER, PATHS, UUID as HUB_UUID, VERSION, logger
 
@@ -192,11 +193,59 @@ def find_manual_plugin_files(
     ]
 
 
-def collect_pending_updates(data: dict[str, Any], plugins: list[dict[str, Any]], now: float) -> list[dict[str, Any]]:
+@dataclass(slots=True, frozen=True)
+class PluginUpdateDTO:
+    """Strongly-typed data transfer object for plugin and Hub release notifications."""
+
+    id: str
+    name: str
+    latest: str
+    curr_ver: Optional[str] = None
+    urgency: str = "medium"
+    changelog: str = "Без описания"
+    update_key: Optional[str] = None
+    target: str = "plugin"
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "PluginUpdateDTO":
+        return cls(
+            id=str(raw.get("id") or ""),
+            name=str(raw.get("name") or ""),
+            latest=str(raw.get("latest") or ""),
+            curr_ver=str(raw.get("curr_ver")) if raw.get("curr_ver") is not None else None,
+            urgency=str(raw.get("urgency") or "medium"),
+            changelog=str(raw.get("changelog") or "Без описания"),
+            update_key=str(raw.get("update_key")) if raw.get("update_key") is not None else None,
+            target=str(raw.get("target") or "plugin"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "latest": self.latest,
+            "curr_ver": self.curr_ver,
+            "urgency": self.urgency,
+            "changelog": self.changelog,
+            "update_key": self.update_key,
+            "target": self.target,
+        }
+
+    def __getitem__(self, key: str) -> Any:
+        try:
+            return getattr(self, key)
+        except AttributeError as ex:
+            raise KeyError(key) from ex
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+
+def collect_pending_updates(data: dict[str, Any], plugins: list[dict[str, Any]], now: float) -> list[PluginUpdateDTO]:
     """Compute installed plugin updates that are eligible for notification."""
     installed = data.get("installed") if isinstance(data.get("installed"), dict) else {}
     notified = data.get("notified_updates") if isinstance(data.get("notified_updates"), dict) else {}
-    pending: list[dict[str, Any]] = []
+    pending: list[PluginUpdateDTO] = []
 
     for p in plugins:
         pid = p.get("id", "")
@@ -209,20 +258,21 @@ def collect_pending_updates(data: dict[str, Any], plugins: list[dict[str, Any]],
             continue
 
         update_key = f"{pid}_{latest}"
-        remind_at = notified.get(update_key)
+        remind_at = notified.get(update_key) if notified.get(update_key) is not None else notified.get(pid)
         if remind_at == -1 or (isinstance(remind_at, (int, float)) and now < remind_at):
             continue
 
         pending.append(
-            {
-                "id": pid,
-                "name": str(p.get("name", pid)),
-                "latest": latest,
-                "curr_ver": curr_ver,
-                "urgency": str(p.get("urgency", "medium")),
-                "changelog": str(p.get("changelog") or "Без описания"),
-                "update_key": update_key,
-            }
+            PluginUpdateDTO(
+                id=pid,
+                name=str(p.get("name", pid)),
+                latest=latest,
+                curr_ver=curr_ver,
+                urgency=str(p.get("urgency", "medium")),
+                changelog=str(p.get("changelog") or "Без описания"),
+                update_key=update_key,
+                target="plugin",
+            )
         )
     return pending
 
@@ -289,6 +339,122 @@ def find_loaded_plugin(
     return None, None
 
 
+def _inspect_loaded_plugin_attributes(
+    cardinal: Any,
+    plugin_info: dict[str, Any],
+    installed_entry: Optional[dict[str, Any]],
+) -> dict[str, Any]:
+    """Extract runtime registration, commands, and file paths for a loaded Cardinal plugin."""
+    loaded_uuid, loaded_plugin = find_loaded_plugin(cardinal, plugin_info, installed_entry)
+    loaded_version = (str(getattr(loaded_plugin, "version", "") or "") or None) if loaded_plugin else None
+    loaded_enabled = bool(getattr(loaded_plugin, "enabled", True)) if loaded_plugin else False
+    loaded_path = _normalize_plugin_path(getattr(loaded_plugin, "path", None)) if loaded_plugin else ""
+    loaded_file_exists = bool(loaded_path and os.path.isfile(loaded_path))
+    raw_cmds = getattr(loaded_plugin, "commands", None) if loaded_plugin else None
+    commands = [(str(cmd), str(desc)) for cmd, desc in raw_cmds.items()] if isinstance(raw_cmds, dict) else []
+    settings_page = bool(getattr(loaded_plugin, "settings_page", False)) if loaded_plugin else False
+    return {
+        "loaded_uuid": loaded_uuid,
+        "loaded_plugin": loaded_plugin,
+        "loaded_version": loaded_version,
+        "loaded_enabled": loaded_enabled,
+        "loaded_path": loaded_path,
+        "loaded_file_exists": loaded_file_exists,
+        "commands": commands,
+        "settings_page": settings_page,
+    }
+
+
+def _resolve_installed_entry_status(
+    stub_exists: bool,
+    plugins_registry_present: bool,
+    loaded_plugin: Any,
+    installed_version: Optional[str],
+    loaded_version: Optional[str],
+    loaded_path: str,
+    stub_path: str,
+    loaded_enabled: bool,
+) -> tuple[str, bool, str]:
+    """Determine lifecycle status code and restart requirements for an installed plugin entry."""
+    if not stub_exists:
+        return "broken_files", False, "general"
+    if not plugins_registry_present:
+        return "installed", False, "general"
+    if loaded_plugin is None:
+        return "restart_install", True, "install"
+    if _versions_differ(installed_version, loaded_version):
+        return "restart_update", True, "update"
+    if loaded_path != _normalize_plugin_path(stub_path):
+        return "restart_install", True, "install"
+    if not loaded_enabled:
+        return "disabled", False, "general"
+    return "active", False, "general"
+
+
+def _resolve_uninstalled_entry_status(
+    loaded_plugin: Any,
+    loaded_file_exists: bool,
+    manual_files: list,
+) -> tuple[str, bool, str]:
+    """Determine lifecycle status code and restart requirements when no installed entry is tracked."""
+    if loaded_plugin is not None:
+        if loaded_file_exists:
+            return "manual", False, "general"
+        return "restart_delete", True, "delete"
+    if manual_files:
+        return "manual", False, "general"
+    return "not_installed", False, "general"
+
+
+def _resolve_manual_version(
+    plugin_info: dict[str, Any],
+    manual_files: list,
+    loaded_version: Optional[str],
+    loaded_uuid: Optional[str],
+    loaded_path: str,
+) -> Optional[str]:
+    """Resolve single or loaded manual installation version for a plugin."""
+    manual_versions = {item["version"] for item in manual_files if item.get("version")}
+    matching_paths = {_normalize_plugin_path(item["path"]) for item in manual_files}
+    matched_loaded = bool(
+        loaded_version
+        and (
+            str(loaded_uuid or "").lower() == str(plugin_info.get("uuid") or "").lower()
+            or loaded_path in matching_paths
+        )
+    )
+    if matched_loaded:
+        return loaded_version
+    return next(iter(manual_versions)) if len(manual_versions) == 1 else None
+
+
+def _extract_installed_entry_fields(
+    installed: Optional[dict[str, Any]],
+    pid: str,
+) -> tuple[Optional[dict[str, Any]], Optional[str], str, bool, str]:
+    """Unpack installed map entry, version, stub path, existence, and bin_dir."""
+    installed_map = installed if isinstance(installed, dict) else {}
+    raw_entry = installed_map.get(pid)
+    installed_entry = raw_entry if isinstance(raw_entry, dict) else None
+    if not installed_entry:
+        return None, None, "", False, ""
+    installed_version = str(installed_entry.get("version", "")) or None
+    stub_path = str(installed_entry.get("stub_path") or "")
+    stub_exists = bool(stub_path and os.path.isfile(stub_path))
+    bin_dir = str(installed_entry.get("bin_dir") or "")
+    return installed_entry, installed_version, stub_path, stub_exists, bin_dir
+
+
+def _extract_key_status(keys: Optional[dict[str, Any]], pid: str) -> tuple[bool, str]:
+    """Extract key presence and masked display string for a plugin."""
+    keys_map = keys if isinstance(keys, dict) else {}
+    key_val = str(keys_map.get(pid) or "")
+    if not key_val:
+        return False, ""
+    masked_key = f"{key_val[:6]}…{key_val[-4:]}" if len(key_val) > 12 else key_val
+    return True, masked_key
+
+
 def inspect_plugin_state(
     cardinal: Any,
     plugin_info: dict[str, Any],
@@ -302,24 +468,16 @@ def inspect_plugin_state(
     latest_version = str(plugin_info.get("latest_version", "v1.0"))
     is_free = bool(plugin_info.get("is_free", False))
 
-    installed_map = installed if isinstance(installed, dict) else {}
-    keys_map = keys if isinstance(keys, dict) else {}
-    raw_entry = installed_map.get(pid)
-    installed_entry = raw_entry if isinstance(raw_entry, dict) else None
-    installed_version = str(installed_entry.get("version", "")) if installed_entry else None
-    stub_path = str(installed_entry.get("stub_path") or "") if installed_entry else ""
-    stub_exists = bool(stub_path and os.path.isfile(stub_path))
-    bin_dir = str(installed_entry.get("bin_dir") or "") if installed_entry else ""
+    (
+        installed_entry,
+        installed_version,
+        stub_path,
+        stub_exists,
+        bin_dir,
+    ) = _extract_installed_entry_fields(installed, pid)
 
     plugins_registry_present = isinstance(getattr(cardinal, "plugins", None), dict)
-    loaded_uuid, loaded_plugin = find_loaded_plugin(cardinal, plugin_info, installed_entry)
-    loaded_version = (str(getattr(loaded_plugin, "version", "") or "") or None) if loaded_plugin else None
-    loaded_enabled = bool(getattr(loaded_plugin, "enabled", True)) if loaded_plugin else False
-    loaded_path = _normalize_plugin_path(getattr(loaded_plugin, "path", None)) if loaded_plugin else ""
-    loaded_file_exists = bool(loaded_path and os.path.isfile(loaded_path))
-    raw_cmds = getattr(loaded_plugin, "commands", None) if loaded_plugin else None
-    commands = [(str(cmd), str(desc)) for cmd, desc in raw_cmds.items()] if isinstance(raw_cmds, dict) else []
-    settings_page = bool(getattr(loaded_plugin, "settings_page", False)) if loaded_plugin else False
+    loaded_attrs = _inspect_loaded_plugin_attributes(cardinal, plugin_info, installed_entry)
 
     exclude = [stub_path] if stub_path else []
     manual_files = find_manual_plugin_files(
@@ -332,58 +490,36 @@ def inspect_plugin_state(
     storage_dir = os.path.join(PATHS.cardinal_root, "storage", "w1bbex", sanitize_segment(plugin_label, pid))
     storage_dir_exists = os.path.isdir(storage_dir)
 
-    key_val = str(keys_map.get(pid) or "")
-    has_key = bool(key_val)
-    masked_key = f"{key_val[:6]}…{key_val[-4:]}" if len(key_val) > 12 else key_val
+    has_key, masked_key = _extract_key_status(keys, pid)
 
-    needs_restart = False
-    restart_action = "general"
     if installed_entry is not None:
-        if not stub_exists:
-            status_code = "broken_files"
-        elif not plugins_registry_present:
-            status_code = "installed"
-        elif loaded_plugin is None:
-            status_code = "restart_install"
-            needs_restart = True
-            restart_action = "install"
-        elif _versions_differ(installed_version, loaded_version):
-            status_code = "restart_update"
-            needs_restart = True
-            restart_action = "update"
-        elif loaded_path != _normalize_plugin_path(stub_path):
-            status_code = "restart_install"
-            needs_restart = True
-            restart_action = "install"
-        elif not loaded_enabled:
-            status_code = "disabled"
-        else:
-            status_code = "active"
-    else:
-        if loaded_plugin is not None:
-            if loaded_file_exists:
-                status_code = "manual"
-            else:
-                status_code = "restart_delete"
-                needs_restart = True
-                restart_action = "delete"
-        elif manual_files:
-            status_code = "manual"
-        else:
-            status_code = "not_installed"
-
-    manual_versions = {item["version"] for item in manual_files if item.get("version")}
-    matching_paths = {_normalize_plugin_path(item["path"]) for item in manual_files}
-    matched_loaded = bool(
-        loaded_version
-        and (
-            str(loaded_uuid or "").lower() == str(plugin_info.get("uuid") or "").lower()
-            or loaded_path in matching_paths
+        status_code, needs_restart, restart_action = _resolve_installed_entry_status(
+            stub_exists,
+            plugins_registry_present,
+            loaded_attrs["loaded_plugin"],
+            installed_version,
+            loaded_attrs["loaded_version"],
+            loaded_attrs["loaded_path"],
+            stub_path,
+            loaded_attrs["loaded_enabled"],
         )
+    else:
+        status_code, needs_restart, restart_action = _resolve_uninstalled_entry_status(
+            loaded_attrs["loaded_plugin"],
+            loaded_attrs["loaded_file_exists"],
+            manual_files,
+        )
+
+    manual_version = _resolve_manual_version(
+        plugin_info,
+        manual_files,
+        loaded_attrs["loaded_version"],
+        loaded_attrs["loaded_uuid"],
+        loaded_attrs["loaded_path"],
     )
-    manual_version = loaded_version if matched_loaded else (next(iter(manual_versions)) if len(manual_versions) == 1 else None)
-    current_version = installed_version if installed_entry is not None else manual_version if status_code == "manual" else None
-    has_update = bool(current_version and plugin_info.get("catalog_known", True) and is_newer_version(latest_version, current_version))
+    current_version = installed_version if installed_entry is not None else (manual_version if status_code == "manual" else None)
+    catalog_known = bool(plugin_info.get("catalog_known", True))
+    has_update = bool(current_version and catalog_known and is_newer_version(latest_version, current_version))
 
     return {
         "id": pid,
@@ -400,19 +536,19 @@ def inspect_plugin_state(
         "stub_path": stub_path,
         "stub_exists": stub_exists,
         "bin_dir": bin_dir,
-        "loaded_uuid": loaded_uuid,
-        "loaded_version": loaded_version,
-        "loaded_enabled": loaded_enabled,
-        "loaded_file_exists": loaded_file_exists,
-        "commands": commands,
-        "settings_page": settings_page,
+        "loaded_uuid": loaded_attrs["loaded_uuid"],
+        "loaded_version": loaded_attrs["loaded_version"],
+        "loaded_enabled": loaded_attrs["loaded_enabled"],
+        "loaded_file_exists": loaded_attrs["loaded_file_exists"],
+        "commands": loaded_attrs["commands"],
+        "settings_page": loaded_attrs["settings_page"],
         "manual_files": manual_files,
         "manual_version": manual_version,
         "storage_dir_exists": storage_dir_exists,
         "has_key": has_key,
         "masked_key": masked_key,
         "has_update": has_update,
-        "catalog_known": plugin_info.get("catalog_known", True),
+        "catalog_known": catalog_known,
     }
 
 

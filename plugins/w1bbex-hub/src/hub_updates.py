@@ -6,7 +6,7 @@ import time
 from types import SimpleNamespace
 from typing import Any
 
-from .core import get_disk_hub_pending_version, is_newer_version
+from .core import PluginUpdateDTO, get_disk_hub_pending_version, is_newer_version
 from .hub_api import fetch_hub_latest_version
 from .runtime import VERSION, logger
 from .storage import update_data
@@ -34,11 +34,15 @@ def notify_hub_update(cardinal: Any, data: dict[str, Any]) -> int:
     if reminder == -1 or (isinstance(reminder, (int, float)) and time.time() < reminder):
         return 0
 
-    update = {
-        "target": "hub", "id": "w1bbex_hub", "name": "W1bbex Hub",
-        "latest": latest, "curr_ver": VERSION, "update_key": update_key,
-        "changelog": "Доступна новая версия менеджера плагинов. Нажмите «Обновить Hub», чтобы загрузить её",
-    }
+    update = PluginUpdateDTO(
+        target="hub",
+        id="w1bbex_hub",
+        name="W1bbex Hub",
+        latest=latest,
+        curr_ver=VERSION,
+        update_key=update_key,
+        changelog="Доступна новая версия менеджера плагинов. Нажмите «Обновить Hub», чтобы загрузить её",
+    )
     text, markup = render_update_notification(update, notify_enabled=True)
     try:
         _call_tg_html(

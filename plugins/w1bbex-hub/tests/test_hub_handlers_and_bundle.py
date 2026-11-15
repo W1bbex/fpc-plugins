@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import importlib.util
+import logging
 from pathlib import Path
 import re
+import sys
 import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -14,6 +16,34 @@ import pytest
 from conftest import REPO_ROOT, make_fake_cardinal
 import build as hub_build
 from src import core, handlers, hub_api, installer, lifecycle, navigation, runtime, storage
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_bundle_artifacts():
+    orig_meta = list(sys.meta_path)
+    orig_modules = set(sys.modules.keys())
+    yield
+    hub_logger = logging.getLogger("FPC.W1bbexHub")
+    for handler in list(hub_logger.handlers):
+        try:
+            handler.close()
+        except Exception:
+            pass
+        hub_logger.removeHandler(handler)
+
+    sys.meta_path[:] = [
+        f for f in sys.meta_path
+        if getattr(f, "_bundle_id", None) != "_w1bbex_hub_src"
+        and f in orig_meta
+    ]
+
+    for mod_name in list(sys.modules.keys()):
+        if mod_name not in orig_modules and (
+            mod_name == "_w1bbex_hub_src"
+            or mod_name.startswith("_w1bbex_hub_src.")
+            or mod_name.startswith("W1bbexHub_")
+        ):
+            sys.modules.pop(mod_name, None)
 
 
 def test_main_menu_uses_semver_comparison_not_inequality(
@@ -196,7 +226,7 @@ def test_built_w1bbex_hub_bundle_matches_cardinal_and_server_contracts(tmp_path:
 
     fake_cardinal = make_fake_cardinal(authorized_users={1})
     controller = mod.init_cardinal(fake_cardinal)
-    assert len(fake_cardinal.telegram.cbq_routes) == 33
+    assert len(fake_cardinal.telegram.cbq_routes) == 34
     assert len(fake_cardinal.telegram.msg_routes) == 3
     assert callable(mod.BIND_TO_DELETE)
     assert controller is not None
@@ -422,7 +452,9 @@ def test_hub_init_guards_missing_telegram_stop_hook_and_offline_catalog(
     lifecycle.stop_hub()
     assert runtime.STOP_EVENT.is_set()
 
-    built_path = hub_build.build(tmp_path / "W1bbexHub_check.py")
+    plugin_slot = tmp_path / "plugins" / "W1bbexHub_check.py"
+    plugin_slot.parent.mkdir(parents=True, exist_ok=True)
+    built_path = hub_build.build(plugin_slot)
     spec = importlib.util.spec_from_file_location("W1bbexHub_stop_check", built_path)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)

@@ -355,16 +355,19 @@ def add_website(message: types.Message, new_site: str) -> None:
         rt.bot.send_message(message.chat.id, "❌ Не удалось определить корректный домен сайта.")
         return
     added = False
+    saved = False
     with CONFIG_LOCK:
         valid_links = load_valid_links()
         if normalized_site not in valid_links:
             valid_links.append(normalized_site)
-            save_valid_links(valid_links)
+            saved = save_valid_links(valid_links)
             added = True
-    if added:
+    if not added:
+        rt.bot.send_message(message.chat.id, f"❌ Сайт {normalized_site} уже есть в списке.")
+    elif saved:
         rt.bot.send_message(message.chat.id, f"✅ Сайт {normalized_site} успешно добавлен в список.")
     else:
-        rt.bot.send_message(message.chat.id, f"❌ Сайт {normalized_site} уже есть в списке.")
+        rt.bot.send_message(message.chat.id, "❌ Ошибка сохранения списка разрешённых сайтов на диск.")
 
 
 def manage_websites(call: types.CallbackQuery) -> None:
@@ -395,8 +398,11 @@ def reset_valid_links_prompt(call: types.CallbackQuery) -> None:
 
 
 def reset_valid_links_confirm(call: types.CallbackQuery) -> None:
-    reset_valid_links_to_defaults()
-    _safe_answer_callback(call, "Список сброшен")
+    res = reset_valid_links_to_defaults()
+    if res:
+        _safe_answer_callback(call, "Список сброшен")
+    else:
+        _safe_answer_callback(call, "Ошибка сохранения списка по умолчанию", show_alert=True)
     manage_websites(call)
 
 
@@ -410,7 +416,7 @@ def show_allowed_websites_list(
     _clear_screen_state(call)
 
     valid_links = load_valid_links()
-    per_page = 20
+    per_page = 8
     total_pages = max(1, ((len(valid_links) - 1) // per_page) + 1) if valid_links else 1
     chat_id = int(call.message.chat.id)
     if page is None:
@@ -435,12 +441,21 @@ def show_allowed_websites_list(
         ]
         for idx in range(0, len(buttons), 2):
             kb_.row(*buttons[idx : idx + 2])
-        nav_buttons = []
-        if current_page > 0:
-            nav_buttons.append(InlineKeyboardButton("⬅️", callback_data=f"asmm:sites_page_{current_page - 1}"))
-        if end < len(valid_links):
-            nav_buttons.append(InlineKeyboardButton("➡️", callback_data=f"asmm:sites_page_{current_page + 1}"))
-        if nav_buttons:
+        if total_pages > 1:
+            nav_buttons = [
+                InlineKeyboardButton(
+                    "⬅️" if current_page > 0 else "·",
+                    callback_data=f"asmm:sites_page_{current_page - 1}" if current_page > 0 else "asmm:sites_page_curr",
+                ),
+                InlineKeyboardButton(
+                    f"{current_page + 1}/{total_pages}",
+                    callback_data="asmm:sites_page_curr",
+                ),
+                InlineKeyboardButton(
+                    "➡️" if end < len(valid_links) else "·",
+                    callback_data=f"asmm:sites_page_{current_page + 1}" if end < len(valid_links) else "asmm:sites_page_curr",
+                ),
+            ]
             kb_.row(*nav_buttons)
         page_suffix = f" (стр. {current_page + 1}/{total_pages})" if total_pages > 1 else ""
         text_ = f"🌐 <b>Разрешённые сайты</b>{page_suffix}\n\nНажмите на сайт, чтобы удалить его из списка."
@@ -456,6 +471,9 @@ def show_allowed_websites_list(
 
 
 def allowed_websites_page_callback(call: types.CallbackQuery) -> None:
+    if str(call.data or "").endswith("_curr"):
+        _safe_answer_callback(call)
+        return
     try:
         page = int(str(call.data or "").rsplit("_", 1)[-1])
     except ValueError:
@@ -464,6 +482,9 @@ def allowed_websites_page_callback(call: types.CallbackQuery) -> None:
 
 
 def _nav_sites_page(call: types.CallbackQuery, target: str) -> None:
+    if str(target or "").endswith("_curr"):
+        _safe_answer_callback(call)
+        return
     try:
         page = int(str(target or "").rsplit("_", 1)[-1])
     except ValueError:
@@ -498,16 +519,19 @@ def process_add_website(message: types.Message) -> None:
 def _delete_allowed_website_and_refresh(call: types.CallbackQuery, domain: str) -> None:
     domain = _normalize_allowed_domain(domain)
     removed = False
+    saved = False
     with CONFIG_LOCK:
         valid_links = load_valid_links()
         if domain in valid_links:
             valid_links.remove(domain)
-            save_valid_links(valid_links)
+            saved = save_valid_links(valid_links)
             removed = True
-    if removed:
+    if not removed:
+        _safe_answer_callback(call, "Сайт уже отсутствует")
+    elif saved:
         _safe_answer_callback(call, "Удалено")
     else:
-        _safe_answer_callback(call, "Сайт уже отсутствует")
+        _safe_answer_callback(call, "Ошибка сохранения изменений на диск", show_alert=True)
     show_allowed_websites_list(call, preserve_page=True)
 
 

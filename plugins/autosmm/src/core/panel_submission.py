@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import threading
-import time
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 if TYPE_CHECKING:
@@ -306,14 +305,14 @@ def _finalize_created_order(
             rt.logger.warning(f"Не удалось отправить уведомление о запуске заказа #{order_id_funpay}: {notify_ex}")
 
     try:
-        check_order_status(c, panel_order_id, buyer_chat_id, link_, order_id_funpay)
-    except Exception as check_ex:
-        rt.logger.warning(f"Ошибка запуска проверки статуса #{order_id_funpay}: {check_ex}")
-
-    try:
         _send_buyer_order_confirmation(c, cfg, buyer_chat_id, order_id_funpay, panel_order_id, link_, real_amount)
     except Exception as buyer_ex:
         rt.logger.warning(f"Не удалось отправить подтверждение покупателю по #{order_id_funpay}: {buyer_ex}")
+
+    try:
+        check_order_status(c, panel_order_id, buyer_chat_id, link_, order_id_funpay)
+    except Exception as check_ex:
+        rt.logger.warning(f"Ошибка запуска проверки статуса #{order_id_funpay}: {check_ex}")
 
 
 def _handle_transport_error_after_add(

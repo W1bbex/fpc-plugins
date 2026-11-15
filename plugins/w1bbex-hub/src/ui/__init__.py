@@ -35,6 +35,11 @@ from .outcomes import (
     render_update_notification,
 )
 from .screens import (
+    render_check_interval,
+    render_check_updates_error,
+    render_check_updates_in_progress,
+    render_check_updates_result,
+    render_custom_interval_prompt,
     render_environment,
     render_main_menu,
     render_plugin_diagnostics,

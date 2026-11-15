@@ -494,3 +494,312 @@ def test_matches_creator_and_plugin_label_from_info_none_safe() -> None:
     assert core._matches_creator("W1bbex", "@w1bbex") is True
     assert core._matches_creator("@w1bbex", "W1bbex") is True
     assert core._matches_creator(None, "@w1bbex") is False
+
+
+def test_transport_alert_suppresses_fallback_send_failure_without_name_error() -> None:
+    fake_bot = MagicMock()
+    fake_bot.answer_callback_query.side_effect = Exception("cb expired")
+    fake_bot.send_message.side_effect = Exception("network down")
+
+    transport = handlers.TelegramTransport()
+    transport.bot = fake_bot
+    transport._acked_callbacks = set()
+
+    cb = _make_callback(data="hub:main")
+    # Must not raise NameError: name 'logger' is not defined
+    res = transport._alert(cb, "Alert message", show_alert=True)
+    assert res == handlers.CB_ANSWERED
+
+
+def test_check_updates_menu_releases_action_lock_on_pre_thread_error() -> None:
+    cardinal = make_fake_cardinal(authorized_users={42})
+    controller = handlers.HubController(cardinal)
+    cb = _make_callback(data="hub:check_updates", chat_id=123, msg_id=456)
+
+    cardinal.telegram.bot.edit_message_text.side_effect = Exception("Telegram 429 rate limit")
+
+    with pytest.raises(Exception, match="429"):
+        controller.check_updates_menu(cb)
+
+    action_key = "check_updates:123:456"
+    with controller._actions_lock:
+        assert action_key not in controller._in_flight_actions
+
+    assert controller._try_begin_action(action_key) is True
+
+
+def test_download_plugin_preserves_old_artifacts_when_config_update_fails(
+    isolated_hub: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old_bin_dir = Path(runtime.PATHS.plugins_dir) / "w1bbex" / "demo_v1.0"
+    old_bin_dir.mkdir(parents=True, exist_ok=True)
+    old_binary = old_bin_dir / "DemoPlugin.pyd"
+    old_binary.write_bytes(b"\x00old-binary-content")
+
+    old_stub_path = Path(runtime.PATHS.plugins_dir) / "Demo.py"
+    old_stub_path.write_text(f"{runtime.LOADER_HEADER}\n# Old loader code\n", encoding="utf-8")
+
+    storage.update_data(
+        lambda d: d.setdefault("installed", {}).__setitem__(
+            "demo",
+            {
+                "name": "Demo",
+                "version": "1.0",
+                "stub_path": str(old_stub_path),
+                "bin_dir": str(old_bin_dir),
+            },
+        )
+    )
+
+    monkeypatch.setattr(
+        installer,
+        "get_plugins",
+        lambda: [{"id": "demo", "name": "Demo", "filename": "DemoPlugin.pyd", "latest_version": "2.0"}],
+    )
+    fake_resp = SimpleNamespace(
+        status_code=200,
+        headers={"Content-Type": "application/octet-stream", "X-Filename": "DemoPlugin.pyd"},
+        content=b"\x00new-binary-content",
+    )
+    monkeypatch.setattr(installer.requests, "post", lambda *a, **kw: fake_resp)
+
+    def failing_update_data(*a: Any, **kw: Any) -> None:
+        raise OSError("disk write failed during config save")
+
+    monkeypatch.setattr(installer, "update_data", failing_update_data)
+
+    cardinal = make_fake_cardinal()
+    ok, msg = installer.download_plugin(cardinal, "demo", None, SimpleNamespace(id=42, username="u"))
+
+    assert ok is False
+    assert "disk write failed" in msg
+
+    assert old_stub_path.exists()
+    assert "# Old loader code" in old_stub_path.read_text(encoding="utf-8")
+    assert old_binary.exists()
+    assert old_binary.read_bytes() == b"\x00old-binary-content"
+
+    pending = Path(runtime.PATHS.pending_delete_file)
+    if pending.exists():
+        assert str(old_bin_dir) not in pending.read_text(encoding="utf-8")
+
+
+def test_delete_plugin_handler_blocks_when_install_action_in_flight(
+    isolated_hub: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cardinal = make_fake_cardinal(authorized_users={42})
+    controller = handlers.HubController(cardinal)
+
+    storage.update_data(
+        lambda d: d.setdefault("installed", {}).__setitem__(
+            "demo", {"name": "Demo", "version": "1.0", "stub_path": "Demo.py"}
+        )
+    )
+
+    cb = _make_callback(data="hub:delete:demo", chat_id=123, msg_id=456)
+    delete_called = False
+
+    def fake_delete(plugin_name: str) -> dict[str, Any]:
+        nonlocal delete_called
+        delete_called = True
+        return {"ok": True}
+
+    monkeypatch.setattr(installer, "delete_plugin_files", fake_delete)
+
+    assert controller._try_begin_action("install:demo") is True
+
+    controller.delete_plugin_handler(cb, "demo")
+
+    assert delete_called is False
+    cardinal.telegram.bot.answer_callback_query.assert_called_once()
+    assert "подождите" in cardinal.telegram.bot.answer_callback_query.call_args.args[1].lower()
+
+
+def test_install_plugin_blocks_when_delete_action_in_flight(
+    isolated_hub: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cardinal = make_fake_cardinal(authorized_users={42})
+    controller = handlers.HubController(cardinal)
+
+    cb = _make_callback(data="hub:install:demo", chat_id=123, msg_id=456)
+    download_called = False
+
+    def fake_download(*a: Any, **kw: Any) -> tuple[bool, str]:
+        nonlocal download_called
+        download_called = True
+        return True, "ok"
+
+    monkeypatch.setattr(installer, "download_plugin", fake_download)
+
+    assert controller._try_begin_action("delete:demo") is True
+
+    controller.install_plugin(cb, "demo")
+
+    assert download_called is False
+    cardinal.telegram.bot.answer_callback_query.assert_called_once()
+    assert "удаляется" in cardinal.telegram.bot.answer_callback_query.call_args.args[1].lower()
+
+
+def test_fetch_catalog_generation_fencing_discards_stale_failed_request(
+    isolated_hub: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src import catalog
+
+    runtime.PLUGINS_CACHE["items"] = [{"id": "initial_plugin", "name": "Initial"}]
+    runtime.PLUGINS_CACHE["checked_at"] = time.time()
+    runtime.PLUGINS_CACHE["error"] = False
+    runtime.PLUGINS_CACHE["request_generation"] = 5
+
+    req_gen = 4
+    fetched = None
+
+    with runtime.CACHE_LOCK:
+        if req_gen == runtime.PLUGINS_CACHE.get("request_generation"):
+            runtime.PLUGINS_CACHE["checked_at"] = time.time()
+            runtime.PLUGINS_CACHE["error"] = fetched is None
+
+    assert runtime.PLUGINS_CACHE["error"] is False
+    assert len(runtime.PLUGINS_CACHE["items"]) == 1
+
+
+def test_trial_confirm_error_renders_keyboard_with_retry_and_back(
+    isolated_hub: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cardinal = make_fake_cardinal(authorized_users={42})
+    controller = handlers.HubController(cardinal)
+
+    monkeypatch.setattr(
+        hub_api,
+        "get_plugins",
+        lambda: [{"id": "demo", "name": "DemoPlugin", "is_free": False}],
+    )
+    monkeypatch.setattr(
+        hub_api,
+        "request_trial_key",
+        lambda *a, **kw: (False, "Пробный период уже использован."),
+    )
+
+    cb = _make_callback(data="hub:trial_confirm:demo", chat_id=123, msg_id=456)
+    controller.trial_confirm(cb, "demo", background=False)
+
+    cardinal.telegram.bot.edit_message_text.assert_called_once()
+    call_args = cardinal.telegram.bot.edit_message_text.call_args
+    rendered_text = call_args[0][0]
+    kb = call_args[1]["reply_markup"]
+
+    assert "Не удалось активировать пробный период" in rendered_text
+    assert "Пробный период уже использован" in rendered_text
+    buttons = [b.callback_data for row in kb.keyboard for b in row]
+    assert "hub:trial_confirm:demo" in buttons
+    assert "hub:info:demo" in buttons
+
+
+def test_update_notification_uses_short_callback_and_routes_cleanly(
+    isolated_hub: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.ui.outcomes import render_update_notification
+    update_data = {
+        "id": "autosmm",
+        "name": "AutoSMM",
+        "curr_ver": "1.0.0",
+        "latest": "2.0.0",
+        "update_key": "autosmm_2.0.0",
+        "changelog": "Major update",
+    }
+    text, kb = render_update_notification(update_data, notify_enabled=True)
+    buttons = [b for row in kb.keyboard for b in row]
+    cb_datas = [b.callback_data for b in buttons]
+
+    assert "hub:upd:autosmm" in cb_datas
+    assert "hub:remind:autosmm" in cb_datas
+    for cb in cb_datas:
+        assert len(cb.encode("utf-8")) <= 64
+        assert not cb.startswith("hub:cb:")
+
+    cardinal = make_fake_cardinal(authorized_users={42})
+    controller = handlers.init_cardinal(cardinal)
+    assert controller is not None
+    called_with = []
+    monkeypatch.setattr(controller, "install_plugin", lambda c, arg, **kw: called_with.append(arg))
+
+    # Test route registration and dispatch for hub:upd:
+    cb_obj = _make_callback(data="hub:upd:autosmm", chat_id=123, msg_id=456)
+    for prefix, fn in controller._prefix_routes:
+        if prefix == "hub:upd:":
+            fn(cb_obj, "autosmm")
+            break
+    assert called_with == ["autosmm"]
+
+
+def test_navigation_screens_rendered_via_ui_layer(isolated_hub: Path) -> None:
+    from src.ui.screens import (
+        render_check_interval,
+        render_check_updates_error,
+        render_check_updates_in_progress,
+        render_check_updates_result,
+        render_custom_interval_prompt,
+    )
+    text1, kb1 = render_check_interval(enabled=True, interval=60)
+    assert "60 мин" in text1
+    assert any(b.callback_data == "hub:set_interval:60" for row in kb1.keyboard for b in row)
+
+    text2, kb2 = render_custom_interval_prompt()
+    assert "Введите интервал" in text2
+    assert any(b.callback_data == "hub:check_interval" for row in kb2.keyboard for b in row)
+
+    text3, kb3 = render_check_updates_in_progress()
+    assert "Проверяем" in text3
+
+    text4, kb4 = render_check_updates_result("1.2.3", newer=True, available=True, updates=[])
+    assert "1.2.3" in text4
+    assert any(b.callback_data == "hub:update_hub" for row in kb4.keyboard for b in row)
+
+    text5, kb5 = render_check_updates_error()
+    assert "Не удалось" in text5
+
+
+def test_plugin_update_dto_contract_and_rendering(isolated_hub: Path) -> None:
+    from src.core import PluginUpdateDTO, collect_pending_updates
+    from src.ui.outcomes import render_update_notification
+
+    dto = PluginUpdateDTO(
+        id="test_plug",
+        name="Test Plugin",
+        latest="v2.0",
+        curr_ver="v1.0",
+        urgency="high",
+        changelog="Major overhaul",
+        update_key="test_plug_v2.0",
+        target="plugin",
+    )
+    assert dto.id == "test_plug"
+    assert dto["latest"] == "v2.0"
+    assert dto.get("curr_ver") == "v1.0"
+    assert dto.to_dict()["name"] == "Test Plugin"
+
+    # Test rendering with DTO directly
+    text, kb = render_update_notification(dto, notify_enabled=True)
+    assert "Test Plugin" in text
+    assert "v1.0 → v2.0" in text
+    assert "Major overhaul" in text
+    assert any(b.callback_data == "hub:upd:test_plug" for row in kb.keyboard for b in row)
+
+    # Test collect_pending_updates produces DTO
+    cfg_data = {
+        "installed": {"test_plug": {"version": "v1.0"}},
+        "notified_updates": {},
+    }
+    plugins_meta = [{
+        "id": "test_plug",
+        "name": "Test Plugin",
+        "latest_version": "v2.0",
+        "urgency": "critical",
+        "changelog": "Critical security patch",
+        "notify_users": True,
+    }]
+    pending = collect_pending_updates(cfg_data, plugins_meta, now=1000.0)
+    assert len(pending) == 1
+    assert isinstance(pending[0], PluginUpdateDTO)
+    assert pending[0].urgency == "critical"
+    assert pending[0]["changelog"] == "Critical security patch"
+

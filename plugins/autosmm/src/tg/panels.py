@@ -40,9 +40,7 @@ MAX_PANEL_SERVICE_NUMBER = 999999
 PANEL_BALANCE_CACHE_TTL_SECONDS = core_panel_balances.PANEL_BALANCE_CACHE_TTL_SECONDS
 normalize_api_url = core_panel_balances.normalize_api_url
 _extract_service_domain = core_panel_balances.extract_service_domain
-_is_placeholder_api_url = core_panel_balances.is_placeholder_api_url
 _invalidate_balance_cache = core_panel_balances.invalidate_panel_balance_cache
-_format_currency_for_main_menu = core_panel_balances.format_currency_symbol
 
 
 def _domain_to_service_name(domain: str) -> str:
@@ -106,7 +104,16 @@ def _get_service_balance_payload(service_number: int, service_cfg: Optional[Dict
     )
 
 
-def render_api_menu(cfg: Dict, *, use_cache_only: bool = True) -> Tuple[str, InlineKeyboardMarkup]:
+API_MENU_PAGE_CONTEXT: Dict[int, int] = {}
+API_SERVICES_PER_PAGE = 8
+
+
+def render_api_menu(
+    cfg: Dict,
+    *,
+    use_cache_only: bool = True,
+    page: int = 0,
+) -> Tuple[str, InlineKeyboardMarkup]:
     services = cfg.get("services", {}) or {}
     service_rows: List[Tuple[str, Dict, Dict[str, Any], str]] = []
     cached_by_key: Dict[str, Dict[str, Any]] = {}
@@ -126,24 +133,43 @@ def render_api_menu(cfg: Dict, *, use_cache_only: bool = True) -> Tuple[str, Inl
         service_rows.append((srv_num, srv_data or {}, payload, display_name))
 
     total_balance_text = core_panel_balances.compute_total_balance_text(services, cached_by_key)
-    lines = ["🔌 Интеграция API", "", f"Общий баланс: {h(total_balance_text)}", "", "Подключённые сервисы:", ""]
-    max_visible = 25
-    visible_rows = service_rows[:max_visible]
+    per_page = API_SERVICES_PER_PAGE
+    total_pages = max(1, ((len(service_rows) - 1) // per_page) + 1) if service_rows else 1
+    current_page = max(0, min(int(page or 0), total_pages - 1))
+    start = current_page * per_page
+    end = start + per_page
+    visible_rows = service_rows[start:end]
+
+    page_suffix = f" (стр. {current_page + 1}/{total_pages})" if total_pages > 1 else ""
+    lines = ["🔌 Интеграция API", "", f"Общий баланс: {h(total_balance_text)}", "", f"Подключённые сервисы{page_suffix}:", ""]
     if visible_rows:
         for idx, (_, _, payload, display_name) in enumerate(visible_rows):
             lines.append(f"📡 {h(display_name)}")
             lines.append(f"Состояние подключения: {payload.get('status_emoji', '❌')}")
             if idx != len(visible_rows) - 1:
                 lines.append("")
-        if len(service_rows) > max_visible:
-            lines.append("")
-            lines.append(f"<i>...и ещё {len(service_rows) - max_visible} сервисов</i>")
     else:
         lines.append("Сервисов пока нет.")
 
     kb = InlineKeyboardMarkup(row_width=1)
     for srv_num, _, _, display_name in visible_rows:
         kb.add(InlineKeyboardButton(f"📡 {display_name}", callback_data=f"asmm:api_service_{srv_num}"))
+    if total_pages > 1:
+        nav_buttons = [
+            InlineKeyboardButton(
+                "⬅️" if current_page > 0 else "·",
+                callback_data=f"asmm:api_page_{current_page - 1}" if current_page > 0 else "asmm:api_page_curr",
+            ),
+            InlineKeyboardButton(
+                f"{current_page + 1}/{total_pages}",
+                callback_data="asmm:api_page_curr",
+            ),
+            InlineKeyboardButton(
+                "➡️" if end < len(service_rows) else "·",
+                callback_data=f"asmm:api_page_{current_page + 1}" if end < len(service_rows) else "asmm:api_page_curr",
+            ),
+        ]
+        kb.row(*nav_buttons)
     kb.row(
         InlineKeyboardButton("➕ Добавить сервис", callback_data="asmm:add_service"),
         InlineKeyboardButton("➖ Удалить сервис", callback_data="asmm:delete_service"),
@@ -216,9 +242,13 @@ def _open_api_menu(
     message_id: Optional[int] = None,
     *,
     force_refresh: bool = True,
+    page: Optional[int] = None,
 ) -> None:
+    if page is not None:
+        API_MENU_PAGE_CONTEXT[chat_id] = max(0, int(page))
+    current_page = API_MENU_PAGE_CONTEXT.get(chat_id, 0)
     cfg = load_config()
-    text_, kb = render_api_menu(cfg, use_cache_only=True)
+    text_, kb = render_api_menu(cfg, use_cache_only=True, page=current_page)
     target_msg_id = _send_or_edit_plain(chat_id, text_, kb, message_id=message_id)
     if target_msg_id is None or not (cfg.get("services") or {}):
         return
@@ -236,7 +266,7 @@ def _open_api_menu(
                 chat_id,
                 target_msg_id,
                 expected_rev,
-                lambda: render_api_menu(load_config(), use_cache_only=True),
+                lambda: render_api_menu(load_config(), use_cache_only=True, page=API_MENU_PAGE_CONTEXT.get(chat_id, 0)),
                 parse_mode="HTML",
             )
             if updated
@@ -646,7 +676,17 @@ def _build_delete_service_confirmation_text(
     else:
         lines.append("К этому номеру не привязано ни одного лота.")
     lines.extend(["", "Вы уверены, что хотите удалить панель?"])
-    return "\n".join(lines)[:4096]
+    rendered = "\n".join(lines)
+    if len(rendered) <= 4096:
+        return rendered
+    return "\n".join([
+        lines[0],
+        f"К этому номеру привязано лотов: <b>{len(bound_lots)} шт.</b>",
+        "",
+        "После удаления эти лоты останутся без рабочей привязки.",
+        "",
+        "Вы уверены, что хотите удалить панель?",
+    ])
 
 
 def process_delete_service(message: types.Message) -> None:
@@ -734,5 +774,20 @@ def _nav_api_service(call: types.CallbackQuery, target: str) -> None:
     _open_api_service_card(chat_id, service_idx, message_id=message_id)
 
 
+def _nav_api_page(call: types.CallbackQuery, target: str) -> None:
+    _safe_answer_callback(call)
+    if str(target or "").endswith("_curr"):
+        return
+    chat_id, message_id, _ = _extract_call_ids(call)
+    if chat_id is None:
+        return
+    try:
+        page = int(str(target or "").rsplit("_", 1)[-1])
+    except ValueError:
+        page = 0
+    _open_api_menu(chat_id, message_id=message_id, force_refresh=False, page=page)
+
+
 register_navigation_target("asmm:api_settings", api_settings_menu)
 register_navigation_prefix("asmm:api_service_", _nav_api_service)
+register_navigation_prefix("asmm:api_page_", _nav_api_page)

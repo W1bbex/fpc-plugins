@@ -344,16 +344,29 @@ def process_service_num_change(message: types.Message, lot_key: str) -> None:
 def process_fallback_snum_change(message: types.Message, lot_key: str) -> None:
     raw_text = str(getattr(message, "text", None) or "").strip().lower()
     if raw_text in ("0", "-", "отключить", "сброс", "нет", "none", "off", "откл", "отмена"):
+        updated_key = lot_key
+        lot_found = False
         with CONFIG_LOCK:
             cfg = load_config()
             lot_map = cfg.get("lot_mapping", {})
             if lot_key in lot_map:
+                lot_found = True
                 target_lot = lot_map[lot_key]
                 target_lot["fallback_service_number"] = None
                 target_lot["fallback_service_id"] = None
                 cfg["lot_mapping"] = lot_map
                 reindex_lots(cfg)
-        _finish_lot_edit(message, lot_key, f"✅ Резервная панель для {h(lot_key)} отключена.")
+                updated_key = next((k for k, v in (cfg.get("lot_mapping") or {}).items() if v is target_lot), lot_key)
+        if not lot_found:
+            _clear_lot_input_state(message.chat.id)
+            rt.bot.send_message(
+                message.chat.id,
+                f"❌ Лот {h(lot_key)} не найден.",
+                parse_mode="HTML",
+                reply_markup=_inline_kb(("◀️ Назад", "asmm:lot_settings")),
+            )
+            return
+        _finish_lot_edit(message, updated_key, f"✅ Резервная панель для {h(updated_key)} отключена.")
         return
 
     new_snum = _parse_int_or_repeat(
@@ -371,15 +384,28 @@ def process_fallback_snum_change(message: types.Message, lot_key: str) -> None:
 def process_fallback_id_change(message: types.Message, lot_key: str) -> None:
     raw_text = str(getattr(message, "text", None) or "").strip().lower()
     if raw_text in ("0", "-", "отключить", "сброс", "нет", "none", "off", "откл", "отмена"):
+        updated_key = lot_key
+        lot_found = False
         with CONFIG_LOCK:
             cfg = load_config()
             lot_map = cfg.get("lot_mapping", {})
             if lot_key in lot_map:
+                lot_found = True
                 target_lot = lot_map[lot_key]
                 target_lot["fallback_service_id"] = None
                 cfg["lot_mapping"] = lot_map
                 reindex_lots(cfg)
-        _finish_lot_edit(message, lot_key, f"✅ ID резервной услуги для {h(lot_key)} сброшен.")
+                updated_key = next((k for k, v in (cfg.get("lot_mapping") or {}).items() if v is target_lot), lot_key)
+        if not lot_found:
+            _clear_lot_input_state(message.chat.id)
+            rt.bot.send_message(
+                message.chat.id,
+                f"❌ Лот {h(lot_key)} не найден.",
+                parse_mode="HTML",
+                reply_markup=_inline_kb(("◀️ Назад", "asmm:lot_settings")),
+            )
+            return
+        _finish_lot_edit(message, updated_key, f"✅ ID резервной услуги для {h(updated_key)} сброшен.")
         return
 
     new_id = _parse_int_or_repeat(
@@ -506,18 +532,30 @@ def clear_fallback_callback(call: types.CallbackQuery) -> None:
         _dispatch_navigation_callback(call, "asmm:lot_settings")
         return
 
+    updated_key = lot_key
     with CONFIG_LOCK:
         cfg = load_config()
         lot_map = cfg.get("lot_mapping", {})
-        if lot_key in lot_map:
-            target_lot = lot_map[lot_key]
-            target_lot["fallback_service_number"] = None
-            target_lot["fallback_service_id"] = None
-            cfg["lot_mapping"] = lot_map
-            reindex_lots(cfg)
+        if lot_key not in lot_map:
+            _safe_answer_callback(call, "Лот не найден")
+            _dispatch_navigation_callback(call, "asmm:lot_settings")
+            return
+        target_lot = lot_map[lot_key]
+        target_lot["fallback_service_number"] = None
+        target_lot["fallback_service_id"] = None
+        cfg["lot_mapping"] = lot_map
+        reindex_lots(cfg)
+        updated_key = next((k for k, v in (cfg.get("lot_mapping") or {}).items() if v is target_lot), lot_key)
 
+    card_ctx = _get_lot_card_context(chat_id) or {}
     _safe_answer_callback(call, "Резервная панель сброшена")
-    _show_lot_card(chat_id, lot_key, message_id)
+    _show_lot_card(
+        chat_id,
+        updated_key,
+        message_id,
+        back_callback=card_ctx.get("back_callback"),
+        back_label=card_ctx.get("back_label"),
+    )
 
 
 def add_new_lot(call: types.CallbackQuery) -> None:

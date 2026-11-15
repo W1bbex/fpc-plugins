@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+from dataclasses import dataclass, field
 from datetime import datetime
 import hashlib
 import os
@@ -71,16 +72,22 @@ def remove_hub_stub(stub_path: Optional[str]) -> tuple[bool, Optional[str]]:
         return False, f"Не удалось удалить файл лоадера: {exc}"
 
 
-def clean_old_plugin(plugin_name: str, new_stub_path: Optional[str] = None) -> None:
+def clean_old_plugin(
+    plugin_name: str,
+    new_stub_path: Optional[str] = None,
+    old_stub_path: Optional[str] = None,
+) -> tuple[bool, Optional[str]]:
     """Remove old stub file when a plugin's stub path changes during an update."""
-    installed = load_data().get("installed")
-    entry = installed.get(plugin_name) if isinstance(installed, dict) else None
-    old_stub = entry.get("stub_path") if isinstance(entry, dict) else None
-    if old_stub and (
+    if old_stub_path is None:
+        installed = load_data().get("installed")
+        entry = installed.get(plugin_name) if isinstance(installed, dict) else None
+        old_stub_path = entry.get("stub_path") if isinstance(entry, dict) else None
+    if old_stub_path and (
         new_stub_path is None
-        or os.path.normcase(os.path.abspath(old_stub)) != os.path.normcase(os.path.abspath(new_stub_path))
+        or os.path.normcase(os.path.abspath(old_stub_path)) != os.path.normcase(os.path.abspath(new_stub_path))
     ):
-        remove_hub_stub(old_stub)
+        return remove_hub_stub(old_stub_path)
+    return True, None
 
 
 def archive_legacy_plugins(
@@ -184,13 +191,65 @@ def generate_loader(
     return loader_path
 
 
-def download_plugin(
+@dataclass
+class _InstallRollbackContext:
+    save_path: str
+    expected_loader_path: str
+    prev_save_bytes: Optional[bytes] = None
+    prev_loader_bytes: Optional[bytes] = None
+    removed_candidates: list[tuple[str, bytes]] = field(default_factory=list)
+    archived_legacy_pairs: list[tuple[str, str]] = field(default_factory=list)
+    wrote_save: bool = False
+    wrote_loader: bool = False
+
+    def _rollback_files(self) -> None:
+        """Restore previous loader and binary files if modified."""
+        if self.wrote_loader:
+            try:
+                if self.prev_loader_bytes is not None:
+                    atomic_write_bytes(self.expected_loader_path, self.prev_loader_bytes)
+                elif os.path.isfile(self.expected_loader_path):
+                    os.remove(self.expected_loader_path)
+            except OSError:
+                logger.warning("Rollback failed for loader %s", self.expected_loader_path, exc_info=True)
+        if self.wrote_save:
+            try:
+                if self.prev_save_bytes is not None:
+                    atomic_write_bytes(self.save_path, self.prev_save_bytes)
+                elif os.path.isfile(self.save_path):
+                    os.remove(self.save_path)
+            except OSError:
+                logger.warning("Rollback failed for binary %s", self.save_path, exc_info=True)
+
+    def _rollback_candidates_and_legacy(self) -> None:
+        """Restore deleted candidate files and legacy archived plugins."""
+        for cand_path, cand_bytes in self.removed_candidates:
+            try:
+                atomic_write_bytes(cand_path, cand_bytes)
+            except OSError:
+                logger.warning("Rollback failed to restore candidate %s", cand_path, exc_info=True)
+        for orig_path, archived_dest in self.archived_legacy_pairs:
+            try:
+                if os.path.isfile(archived_dest) and not os.path.exists(orig_path):
+                    shutil.move(archived_dest, orig_path)
+                    logger.info("Restored archived legacy plugin %s <- %s", orig_path, archived_dest)
+            except OSError:
+                logger.warning("Rollback failed to restore legacy plugin %s from %s", orig_path, archived_dest, exc_info=True)
+
+    def rollback(self) -> None:
+        """Rollback all filesystem modifications under the installation lock."""
+        with PLUGIN_FS_LOCK:
+            self._rollback_files()
+            self._rollback_candidates_and_legacy()
+
+
+def _fetch_download_response(
     cardinal: Any,
     plugin_name: str,
     license_key: Optional[str],
     tg_user: Any,
-) -> tuple[bool, str]:
-    """Download, verify, install, and persist metadata for a plugin build (.py, .pyd, .so)."""
+) -> tuple[Optional[requests.Response], Optional[str]]:
+    """Execute network request for plugin download and validate HTTP status and JSON errors."""
     payload = {
         "plugin_name": plugin_name,
         "license_key": (license_key or "").strip(),
@@ -202,11 +261,11 @@ def download_plugin(
         resp = requests.post(f"{API_BASE}/download", json=payload, timeout=15, proxies=NO_PROXY)
     except requests.RequestException as exc:
         logger.error("Download plugin error: %s", exc)
-        return False, f"Ошибка сети: {exc}"
+        return None, f"Ошибка сети: {exc}"
 
     if resp.status_code != 200:
         err_json = safe_json(resp)
-        return False, (
+        return None, (
             str(err_json["error"])
             if (err_json and err_json.get("error"))
             else f"Ошибка сервера: HTTP {resp.status_code}"
@@ -216,28 +275,33 @@ def download_plugin(
     if "application/json" in content_type or resp.content.lstrip().startswith(b"{"):
         json_err = safe_json(resp)
         if json_err is not None and not json_err.get("success", True):
-            return False, str(json_err.get("error", "Неизвестная ошибка API."))
+            return None, str(json_err.get("error", "Неизвестная ошибка API."))
     if not resp.content:
-        return False, "Сервер вернул пустой файл сборки."
+        return None, "Сервер вернул пустой файл сборки."
 
-    raw_filename = resp.headers.get("X-Filename", f"{plugin_name}_Release.py")
-    base_filename = raw_filename.replace("\\", "/").rsplit("/", 1)[-1].strip()
+    return resp, None
+
+
+def _resolve_download_filename(plugin_name: str, raw_filename: Optional[str]) -> str:
+    """Derive safe filename with valid plugin extension from header or fallback."""
+    raw = raw_filename or f"{plugin_name}_Release.py"
+    base_filename = raw.replace("\\", "/").rsplit("/", 1)[-1].strip()
     if (
         not base_filename
         or not base_filename.lower().endswith(SUPPORTED_PLUGIN_EXTENSIONS)
         or base_filename in (".", "..")
     ):
-        filename = f"{sanitize_segment(plugin_name, 'plugin')}.py"
-    else:
-        ext = next(e for e in SUPPORTED_PLUGIN_EXTENSIONS if base_filename.lower().endswith(e.lower()))
-        filename = f"{sanitize_segment(base_filename[:-len(ext)], plugin_name)}{ext.lower()}"
+        return f"{sanitize_segment(plugin_name, 'plugin')}.py"
+    ext = next(e for e in SUPPORTED_PLUGIN_EXTENSIONS if base_filename.lower().endswith(e.lower()))
+    return f"{sanitize_segment(base_filename[:-len(ext)], plugin_name)}{ext.lower()}"
 
-    plugin_info = next((x for x in get_plugins() if x.get("id") == plugin_name), None)
-    installed_map = load_data().get("installed")
-    old_entry = installed_map.get(plugin_name) if isinstance(installed_map, dict) else None
-    if not isinstance(old_entry, dict):
-        old_entry = {}
 
+def _verify_downloaded_content(
+    resp: requests.Response,
+    filename: str,
+    plugin_info: Optional[dict[str, Any]],
+) -> Optional[str]:
+    """Validate SHA-256 and python syntax for downloaded payload."""
     expected_sha = (
         resp.headers.get("X-File-SHA256")
         or resp.headers.get("X-SHA256")
@@ -246,17 +310,26 @@ def download_plugin(
     if expected_sha:
         actual_sha = hashlib.sha256(resp.content).hexdigest().lower()
         if actual_sha != str(expected_sha).strip().lower():
-            return False, "Контрольная сумма (SHA-256) загруженного файла не совпадает."
+            return "Контрольная сумма (SHA-256) загруженного файла не совпадает."
 
     if filename.lower().endswith(".py"):
         try:
             source_text = resp.content.decode("utf-8")
             ast.parse(source_text, filename=filename)
         except UnicodeDecodeError:
-            return False, "Загруженный .py файл поврежден (некорректная кодировка UTF-8)."
+            return "Загруженный .py файл поврежден (некорректная кодировка UTF-8)."
         except SyntaxError as exc:
-            return False, f"Загруженный .py файл содержит синтаксическую ошибку (строка {exc.lineno})."
+            return f"Загруженный .py файл содержит синтаксическую ошибку (строка {exc.lineno})."
+    return None
 
+
+def _resolve_target_paths_and_meta(
+    plugin_name: str,
+    filename: str,
+    plugin_info: Optional[dict[str, Any]],
+    old_entry: dict[str, Any],
+) -> tuple[str, str, str, str, str, str, str, str]:
+    """Compute labels, versions, directories, paths, and loader target location."""
     plugin_label = str(old_entry.get("name") or plugin_name) if not plugin_info else plugin_label_from_info(plugin_name, plugin_info)
     version = str(plugin_info.get("latest_version") or old_entry.get("version") or "v1.0") if plugin_info else str(old_entry.get("version") or "v1.0")
     if filename.lower().endswith(".py"):
@@ -271,104 +344,216 @@ def download_plugin(
         if plugin_info
         else "Загружено через W1bbex Hub"
     )
-    old_bin_dir = old_entry.get("bin_dir")
-
     expected_loader_path = os.path.join(PATHS.plugins_dir, f"{sanitize_segment(plugin_label, 'plugin')}.py")
-    prev_save_bytes: Optional[bytes] = None
-    prev_loader_bytes: Optional[bytes] = None
-    archived_legacy_pairs: list[tuple[str, str]] = []
-    wrote_save = False
-    wrote_loader = False
+    return plugin_label, version, folder_name, plugin_dir, save_path, api_name, api_desc, expected_loader_path
+
+
+def _stage_candidate_binaries(plugin_dir: str, save_path: str, ctx: _InstallRollbackContext) -> None:
+    """Remove previous incompatible binaries in the plugin directory and record rollback bytes."""
+    save_abs = os.path.normcase(os.path.abspath(save_path))
+    if not os.path.isdir(plugin_dir):
+        return
+    for entry_name in os.listdir(plugin_dir):
+        if entry_name.lower().endswith(SUPPORTED_PLUGIN_EXTENSIONS):
+            candidate = os.path.join(plugin_dir, entry_name)
+            if os.path.normcase(os.path.abspath(candidate)) != save_abs and os.path.isfile(candidate):
+                with open(candidate, "rb") as cf:
+                    candidate_bytes = cf.read()
+                os.remove(candidate)
+                ctx.removed_candidates.append((candidate, candidate_bytes))
+
+
+def _capture_rollback_snapshots(save_path: str, ctx: _InstallRollbackContext) -> None:
+    """Snapshot existing target binary and loader before overwriting."""
+    if os.path.isfile(save_path):
+        with open(save_path, "rb") as prev_f:
+            ctx.prev_save_bytes = prev_f.read()
+    if os.path.isfile(ctx.expected_loader_path):
+        with open(ctx.expected_loader_path, "rb") as prev_l:
+            ctx.prev_loader_bytes = prev_l.read()
+
+
+def _archive_and_generate_loader(
+    save_path: str,
+    filename: str,
+    plugin_info: Optional[dict[str, Any]],
+    plugin_name: str,
+    plugin_label: str,
+    folder_name: str,
+    api_name: str,
+    version: str,
+    api_desc: str,
+    ctx: _InstallRollbackContext,
+) -> str:
+    """Extract metadata, archive matching legacy copies, and generate executable loader."""
+    extracted_meta = extract_py_plugin_metadata(save_path) if save_path.lower().endswith(".py") else {}
+    target_uuid = (plugin_info.get("uuid") if plugin_info else None) or extracted_meta.get("uuid")
+    target_credits = (
+        (plugin_info.get("credits") if plugin_info else None)
+        or extracted_meta.get("credits")
+        or "@w1bbex"
+    )
+    ctx.archived_legacy_pairs = archive_legacy_plugins(target_uuid=target_uuid, expected_credits=target_credits)
+
+    loader_path = generate_loader(
+        plugin_name,
+        plugin_label,
+        folder_name,
+        api_name,
+        version,
+        api_desc,
+        target_filename=filename,
+    )
+    ctx.wrote_loader = True
+    return loader_path
+
+
+def _persist_installed_record(
+    plugin_name: str,
+    plugin_label: str,
+    version: str,
+    loader_path: str,
+    plugin_dir: str,
+    plugin_info: Optional[dict[str, Any]],
+    old_entry: dict[str, Any],
+) -> None:
+    """Write installed plugin metadata and catalog fields to storage."""
+    existing_catalog = old_entry.get("catalog") if isinstance(old_entry.get("catalog"), dict) else {}
+    catalog_meta = {}
+    for k in ("description", "uuid", "credits", "is_free", "prefix"):
+        val = (plugin_info or {}).get(k)
+        if val is None:
+            val = existing_catalog.get(k)
+        catalog_meta[k] = val
+
+    update_data(
+        lambda d: d.setdefault("installed", {}).__setitem__(
+            plugin_name,
+            {
+                "name": plugin_label,
+                "version": version,
+                "stub_path": loader_path,
+                "bin_dir": plugin_dir,
+                "catalog": catalog_meta,
+            },
+        )
+    )
+
+
+def _commit_installed_plugin(
+    resp_content: bytes,
+    save_path: str,
+    plugin_dir: str,
+    filename: str,
+    plugin_info: Optional[dict[str, Any]],
+    plugin_name: str,
+    plugin_label: str,
+    folder_name: str,
+    api_name: str,
+    version: str,
+    api_desc: str,
+    ctx: _InstallRollbackContext,
+) -> None:
+    """Stage binary on disk, archive duplicates, create loader, and commit storage record."""
+    with PLUGIN_FS_LOCK:
+        installed_map = load_data().get("installed")
+        old_entry = installed_map.get(plugin_name) if isinstance(installed_map, dict) else {}
+        if not isinstance(old_entry, dict):
+            old_entry = {}
+        old_bin_dir = old_entry.get("bin_dir")
+        old_stub = old_entry.get("stub_path")
+
+        _capture_rollback_snapshots(save_path, ctx)
+
+        atomic_write_bytes(save_path, resp_content)
+        ctx.wrote_save = True
+
+        _stage_candidate_binaries(plugin_dir, save_path, ctx)
+
+        loader_path = _archive_and_generate_loader(
+            save_path,
+            filename,
+            plugin_info,
+            plugin_name,
+            plugin_label,
+            folder_name,
+            api_name,
+            version,
+            api_desc,
+            ctx,
+        )
+
+        _persist_installed_record(
+            plugin_name,
+            plugin_label,
+            version,
+            loader_path,
+            plugin_dir,
+            plugin_info,
+            old_entry,
+        )
+
+        clean_old_plugin(plugin_name, new_stub_path=loader_path, old_stub_path=old_stub)
+        if old_bin_dir and os.path.normcase(os.path.abspath(old_bin_dir)) != os.path.normcase(
+            os.path.abspath(plugin_dir)
+        ):
+            queue_pending_deletion(old_bin_dir)
+
+
+def download_plugin(
+    cardinal: Any,
+    plugin_name: str,
+    license_key: Optional[str],
+    tg_user: Any,
+) -> tuple[bool, str]:
+    """Download, verify, install, and persist metadata for a plugin build (.py, .pyd, .so)."""
+    resp, err = _fetch_download_response(cardinal, plugin_name, license_key, tg_user)
+    if err or resp is None:
+        return False, err or "Ошибка загрузки плагина"
+
+    raw_filename = resp.headers.get("X-Filename", f"{plugin_name}_Release.py")
+    filename = _resolve_download_filename(plugin_name, raw_filename)
+
+    plugin_info = next((x for x in get_plugins() if x.get("id") == plugin_name), None)
+    installed_map = load_data().get("installed")
+    old_entry = installed_map.get(plugin_name) if isinstance(installed_map, dict) else {}
+    if not isinstance(old_entry, dict):
+        old_entry = {}
+
+    verify_err = _verify_downloaded_content(resp, filename, plugin_info)
+    if verify_err:
+        return False, verify_err
+
+    (
+        plugin_label,
+        version,
+        folder_name,
+        plugin_dir,
+        save_path,
+        api_name,
+        api_desc,
+        expected_loader_path,
+    ) = _resolve_target_paths_and_meta(plugin_name, filename, plugin_info, old_entry)
+
+    ctx = _InstallRollbackContext(save_path=save_path, expected_loader_path=expected_loader_path)
 
     try:
-        with PLUGIN_FS_LOCK:
-            if os.path.isfile(save_path):
-                with open(save_path, "rb") as prev_f:
-                    prev_save_bytes = prev_f.read()
-            if os.path.isfile(expected_loader_path):
-                with open(expected_loader_path, "rb") as prev_l:
-                    prev_loader_bytes = prev_l.read()
-
-            atomic_write_bytes(save_path, resp.content)
-            wrote_save = True
-            save_abs = os.path.normcase(os.path.abspath(save_path))
-            if os.path.isdir(plugin_dir):
-                for entry_name in os.listdir(plugin_dir):
-                    if entry_name.lower().endswith(SUPPORTED_PLUGIN_EXTENSIONS):
-                        candidate = os.path.join(plugin_dir, entry_name)
-                        if os.path.normcase(os.path.abspath(candidate)) != save_abs and os.path.isfile(candidate):
-                            os.remove(candidate)
-
-            extracted_meta = extract_py_plugin_metadata(save_path) if save_path.lower().endswith(".py") else {}
-            target_uuid = (plugin_info.get("uuid") if plugin_info else None) or extracted_meta.get("uuid")
-            target_credits = (
-                (plugin_info.get("credits") if plugin_info else None)
-                or extracted_meta.get("credits")
-                or "@w1bbex"
-            )
-            archived_legacy_pairs = archive_legacy_plugins(target_uuid=target_uuid, expected_credits=target_credits)
-
-            loader_path = generate_loader(
-                plugin_name,
-                plugin_label,
-                folder_name,
-                api_name,
-                version,
-                api_desc,
-                target_filename=filename,
-            )
-            wrote_loader = True
-            clean_old_plugin(plugin_name, new_stub_path=loader_path)
-            if old_bin_dir and os.path.normcase(os.path.abspath(old_bin_dir)) != os.path.normcase(
-                os.path.abspath(plugin_dir)
-            ):
-                queue_pending_deletion(old_bin_dir)
-
-            existing_catalog = old_entry.get("catalog") if isinstance(old_entry.get("catalog"), dict) else {}
-            catalog_meta = {}
-            for k in ("description", "uuid", "credits", "is_free", "prefix"):
-                val = (plugin_info or {}).get(k)
-                if val is None:
-                    val = existing_catalog.get(k)
-                catalog_meta[k] = val
-
-            update_data(
-                lambda d: d.setdefault("installed", {}).__setitem__(
-                    plugin_name,
-                    {
-                        "name": plugin_label,
-                        "version": version,
-                        "stub_path": loader_path,
-                        "bin_dir": plugin_dir,
-                        "catalog": catalog_meta,
-                    },
-                )
-            )
+        _commit_installed_plugin(
+            resp.content,
+            save_path,
+            plugin_dir,
+            filename,
+            plugin_info,
+            plugin_name,
+            plugin_label,
+            folder_name,
+            api_name,
+            version,
+            api_desc,
+            ctx,
+        )
     except OSError as exc:
-        with PLUGIN_FS_LOCK:
-            if wrote_loader:
-                try:
-                    if prev_loader_bytes is not None:
-                        atomic_write_bytes(expected_loader_path, prev_loader_bytes)
-                    elif os.path.isfile(expected_loader_path):
-                        os.remove(expected_loader_path)
-                except OSError:
-                    logger.warning("Rollback failed for loader %s", expected_loader_path, exc_info=True)
-            if wrote_save:
-                try:
-                    if prev_save_bytes is not None:
-                        atomic_write_bytes(save_path, prev_save_bytes)
-                    elif os.path.isfile(save_path):
-                        os.remove(save_path)
-                except OSError:
-                    logger.warning("Rollback failed for binary %s", save_path, exc_info=True)
-            for orig_path, archived_dest in archived_legacy_pairs:
-                try:
-                    if os.path.isfile(archived_dest) and not os.path.exists(orig_path):
-                        shutil.move(archived_dest, orig_path)
-                        logger.info("Restored archived legacy plugin %s <- %s", orig_path, archived_dest)
-                except OSError:
-                    logger.warning("Rollback failed to restore legacy plugin %s from %s", orig_path, archived_dest, exc_info=True)
+        ctx.rollback()
         if isinstance(exc, PermissionError):
             logger.exception("Plugin binary locked during reinstall of %s", plugin_name)
             return (
@@ -378,7 +563,7 @@ def download_plugin(
         logger.exception("Failed saving plugin %s", plugin_name)
         return False, f"Ошибка сохранения файлов на диск: {exc}"
 
-    archived_names = [os.path.basename(orig) for orig, _ in archived_legacy_pairs]
+    archived_names = [os.path.basename(orig) for orig, _ in ctx.archived_legacy_pairs]
     archived_note = (
         f" В архив (plugins/w1bbex/archive): {', '.join(archived_names)}."
         if archived_names
@@ -433,7 +618,7 @@ def download_and_update_hub(target_path: Optional[str] = None, *, force: bool = 
         resp = requests.get(f"{API_BASE}/download_client", timeout=15, proxies=NO_PROXY)
     except requests.RequestException as exc:
         logger.error("Hub self-update network error: %s", exc)
-        return False, f"Ошибка сети: {exc}"
+        return False, "Ошибка сети при скачивании обновления Hub."
 
     if resp.status_code != 200:
         err_json = safe_json(resp)
@@ -475,8 +660,8 @@ def download_and_update_hub(target_path: Optional[str] = None, *, force: bool = 
     try:
         atomic_write_bytes(dest, resp.content)
     except OSError as exc:
-        logger.exception("Failed writing Hub update")
-        return False, f"Ошибка записи файла обновления: {exc}"
+        logger.exception("Failed writing Hub update: %s", exc)
+        return False, "Ошибка записи файла обновления на диск."
     return True, "W1bbex HUB успешно обновлен!"
 
 

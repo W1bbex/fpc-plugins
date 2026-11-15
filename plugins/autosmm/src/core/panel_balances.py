@@ -15,6 +15,7 @@ from ..storage.storage import load_config
 from .panel_api import _panel_api_json
 from .panel_errors import (
     _normalize_api_key,
+    _sanitize_secret_text,
     _validate_api_key_for_action,
     parse_panel_balance_value,
 )
@@ -121,7 +122,8 @@ def fetch_service_balance_payload(
             "updated_at": time.time(),
         }
     except Exception as ex:
-        rt.logger.warning(f"{rt.LOGGER_PREFIX} Не удалось получить баланс для сервиса #{service_number}: {ex}")
+        safe_ex = _sanitize_secret_text(ex, api_key)
+        rt.logger.warning(f"{rt.LOGGER_PREFIX} Не удалось получить баланс для сервиса #{service_number}: {safe_ex}")
         return {
             "ok": False,
             "status_emoji": "❌",
@@ -435,6 +437,7 @@ def schedule_panel_balances_refresh(
                 rt.logger.debug(f"{rt.LOGGER_PREFIX} Ошибка callback после обновления баланса: {ex}")
 
     thread = threading.Thread(target=_worker, name=f"autosmm-balance-{inflight_key}", daemon=True)
+    rt.register_background_thread(thread)
     thread.start()
     return True
 

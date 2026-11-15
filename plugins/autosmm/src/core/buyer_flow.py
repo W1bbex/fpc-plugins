@@ -349,35 +349,42 @@ def _handle_buyer_link_command(c: "Cardinal", msg_text: str, buyer_id: Any, chat
     if not order_record:
         return True
     order_id = str(order_record.get("order_id"))
-    if _apply_refund_gate(c, order_record, notify_chat_id=chat_id, force_check=True):
-        return True
-    state = _get_buyer_flow_state(order_record)
-    if _has_panel_order(order_record) or state in (BUYER_STATE_PANEL_CREATED, BUYER_STATE_COMPLETED, BUYER_STATE_FAILED):
-        _send_buyer_message(c, chat_id, BUYER_PANEL_CREATED_BLOCK_TEXT)
-        return True
-    with rt.CONTEXT_LOCK:
-        cached = rt.waiting_for_link.get(order_id)
-        ctx = dict(cached) if isinstance(cached, dict) else None
-    if ctx is None:
-        ctx = _build_waiting_context_from_order(order_record) or {}
-    if state == BUYER_STATE_LINK_PAUSED:
-        _transition_waiting_state(ctx, order_id, buyer_id, chat_id, BUYER_STATE_WAITING_LINK, saved_link_marker=None)
-        _send_buyer_message(c, chat_id, f"▶️ Ожидание ссылки возобновлено.\n\n🧾 Заказ: #{order_id}\n\nОтправьте ссылку для запуска заказа.\nСсылка должна начинаться с:\nhttps://")
-        return True
-    if state == BUYER_STATE_WAITING_CONFIRM:
-        _transition_waiting_state(ctx, order_id, buyer_id, chat_id, BUYER_STATE_WAITING_LINK, saved_link_marker=None)
-        _send_buyer_message(c, chat_id, f"Текущая ссылка сброшена.\n\n🧾 Заказ: #{order_id}\n\nОтправьте новую ссылку.\nСсылка должна начинаться с:\nhttps://")
-        return True
-    if state == BUYER_STATE_WAITING_LINK:
-        if raw_ref:
-            _transition_waiting_state(ctx, order_id, buyer_id, chat_id, BUYER_STATE_WAITING_LINK, select_order=True)
-            _send_buyer_message(c, chat_id, "Отправьте ссылку для запуска заказа.")
+
+    with rt.get_order_lock(order_id):
+        fresh_record = get_order_data(order_id) or order_record
+        if _apply_refund_gate(c, fresh_record, notify_chat_id=chat_id, force_check=True):
             return True
-        _transition_waiting_state(ctx, order_id, buyer_id, chat_id, BUYER_STATE_LINK_PAUSED, saved_link_marker=None, select_order=False)
-        _send_buyer_message(c, chat_id, f"⏸ Ожидание ссылки приостановлено.\n\n🧾 Заказ: #{order_id}\n\nКогда будете готовы отправить ссылку:\n!ссылка {order_id}")
+        state = _get_buyer_flow_state(fresh_record)
+        if (
+            _has_panel_order(fresh_record)
+            or bool(fresh_record.get("panel_add_submitted"))
+            or state in (BUYER_STATE_PANEL_CREATED, BUYER_STATE_COMPLETED, BUYER_STATE_FAILED, BUYER_STATE_REFUNDED)
+        ):
+            _send_buyer_message(c, chat_id, BUYER_PANEL_CREATED_BLOCK_TEXT)
+            return True
+        with rt.CONTEXT_LOCK:
+            cached = rt.waiting_for_link.get(order_id)
+            ctx = dict(cached) if isinstance(cached, dict) else None
+        if ctx is None:
+            ctx = _build_waiting_context_from_order(fresh_record) or {}
+        if state == BUYER_STATE_LINK_PAUSED:
+            _transition_waiting_state(ctx, order_id, buyer_id, chat_id, BUYER_STATE_WAITING_LINK, saved_link_marker=None)
+            _send_buyer_message(c, chat_id, f"▶️ Ожидание ссылки возобновлено.\n\n🧾 Заказ: #{order_id}\n\nОтправьте ссылку для запуска заказа.\nСсылка должна начинаться с:\nhttps://")
+            return True
+        if state == BUYER_STATE_WAITING_CONFIRM:
+            _transition_waiting_state(ctx, order_id, buyer_id, chat_id, BUYER_STATE_WAITING_LINK, saved_link_marker=None)
+            _send_buyer_message(c, chat_id, f"Текущая ссылка сброшена.\n\n🧾 Заказ: #{order_id}\n\nОтправьте новую ссылку.\nСсылка должна начинаться с:\nhttps://")
+            return True
+        if state == BUYER_STATE_WAITING_LINK:
+            if raw_ref:
+                _transition_waiting_state(ctx, order_id, buyer_id, chat_id, BUYER_STATE_WAITING_LINK, select_order=True)
+                _send_buyer_message(c, chat_id, "Отправьте ссылку для запуска заказа.")
+                return True
+            _transition_waiting_state(ctx, order_id, buyer_id, chat_id, BUYER_STATE_LINK_PAUSED, saved_link_marker=None, select_order=False)
+            _send_buyer_message(c, chat_id, f"⏸ Ожидание ссылки приостановлено.\n\n🧾 Заказ: #{order_id}\n\nКогда будете готовы отправить ссылку:\n!ссылка {order_id}")
+            return True
+        _send_buyer_message(c, chat_id, "Отправьте ссылку для запуска заказа.")
         return True
-    _send_buyer_message(c, chat_id, "Отправьте ссылку для запуска заказа.")
-    return True
 
 
 def _is_post_panel_or_refunded(order_record: Dict) -> bool:
@@ -567,8 +574,13 @@ def _handle_waiting_link_message(c: "Cardinal", order_record: Dict, msg_text: st
         fresh_record = get_order_data(order_id) or order_record
         if _apply_refund_gate(c, fresh_record, notify_chat_id=chat_id, force_check=True):
             return True
-        if _has_panel_order(fresh_record):
+        if _has_panel_order(fresh_record) or bool(fresh_record.get("panel_add_submitted")):
             _send_buyer_message(c, chat_id, BUYER_PANEL_CREATED_BLOCK_TEXT)
+            return True
+        state = _get_buyer_flow_state(fresh_record)
+        if state not in (BUYER_STATE_WAITING_LINK, BUYER_STATE_WAITING_CONFIRM):
+            if state in (BUYER_STATE_PANEL_CREATED, BUYER_STATE_COMPLETED, BUYER_STATE_FAILED):
+                _send_buyer_message(c, chat_id, BUYER_PANEL_CREATED_BLOCK_TEXT)
             return True
         ok, reason = is_valid_buyer_target(link_)
         if not ok:
@@ -611,8 +623,13 @@ def _handle_waiting_confirm_message(c: "Cardinal", order_record: Dict, msg_text:
         fresh_record = get_order_data(order_id) or order_record
         if _apply_refund_gate(c, fresh_record, notify_chat_id=chat_id, force_check=True):
             return True
-        if _has_panel_order(fresh_record):
+        if _has_panel_order(fresh_record) or bool(fresh_record.get("panel_add_submitted")):
             _send_buyer_message(c, chat_id, BUYER_PANEL_CREATED_BLOCK_TEXT)
+            return True
+        state = _get_buyer_flow_state(fresh_record)
+        if state not in (BUYER_STATE_WAITING_LINK, BUYER_STATE_WAITING_CONFIRM):
+            if state in (BUYER_STATE_PANEL_CREATED, BUYER_STATE_COMPLETED, BUYER_STATE_FAILED):
+                _send_buyer_message(c, chat_id, BUYER_PANEL_CREATED_BLOCK_TEXT)
             return True
         with rt.CONTEXT_LOCK:
             cached = rt.waiting_for_link.get(order_id)

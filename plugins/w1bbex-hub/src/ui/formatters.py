@@ -6,7 +6,7 @@ from html import unescape
 from html.parser import HTMLParser
 from typing import Any, Optional
 
-from .kit import code, esc
+from .kit import esc
 
 STATUS_BADGES: dict[str, tuple[str, str]] = {
     "active": ("", "Работает"),

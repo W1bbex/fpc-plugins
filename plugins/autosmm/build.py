@@ -182,15 +182,19 @@ def _render_bundle(sources: dict[str, str], meta: dict[str, object]) -> str:
     )
 
 
-def build() -> Path:
+def build(out_file: Path | None = None) -> Path:
     """Build single-file AutoSMM.py from src modules and verify its syntax."""
+    target = Path(out_file) if out_file else OUT_FILE
     sources = _collect_sources(SRC_DIR)
     meta = _read_runtime_metadata(SRC_DIR)
     rendered = _render_bundle(sources, meta)
-    ast.parse(rendered, filename=str(OUT_FILE))
-    OUT_FILE.write_text(rendered, encoding="utf-8")
-    return OUT_FILE
+    ast.parse(rendered, filename=str(target))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(rendered, encoding="utf-8", newline="\n")
+    return target
 
 
 if __name__ == "__main__":
-    build()
+    built = build()
+    import sys
+    sys.stdout.write(f"Built {built}\n")

@@ -22,6 +22,7 @@ from .lifecycle import _save_restart_marker
 from .runtime import CACHE_LOCK, CB_ANSWERED, PATHS, PLUGINS_CACHE, STOP_EVENT, logger
 from .storage import load_data, save_pending_restart, update_data
 from .transport import _is_authorized
+from .ui.kit import Btn, KeyboardBuilder
 from .ui import (
     esc,
     render_activate_key_prompt,
@@ -170,8 +171,8 @@ class HubActions:
         try:
             update_data(lambda d: d.setdefault("keys", {}).__setitem__(plugin_name, key))
         except OSError as exc:
-            logger.exception("Failed saving key for %s", plugin_name)
-            self._reply_html(message, f"<b>Ошибка сохранения ключа:</b> {esc(exc)}")
+            logger.exception("Failed saving key for %s: %s", plugin_name, exc)
+            self._reply_html(message, "<b>Ошибка сохранения ключа:</b> не удалось записать данные на диск.")
             return
 
         text, kb = render_key_activated(plugin_name, plugin_label, key)
@@ -258,6 +259,10 @@ class HubActions:
         if msg_obj is None:
             return self._alert(c, "Сообщение устарело. Откройте /hub заново.")
 
+        delete_key = f"delete:{plugin_name}"
+        if self._is_action_in_flight(delete_key):
+            return self._alert(c, "Плагин сейчас удаляется · подождите")
+
         action_key = f"install:{plugin_name}"
         if not self._try_begin_action(action_key):
             return self._alert(c, "Установка уже выполняется · подождите")
@@ -312,20 +317,48 @@ class HubActions:
 
     def _run_trial_confirm(self, c: CallbackQuery, plugin_name: str, msg_obj: Any, action_key: str) -> None:
         try:
+            p = next((x for x in hub_api.get_plugins() if x.get("id") == plugin_name), None)
+            plugin_label = str(p.get("name", plugin_name)) if p else plugin_name
+
             ok, result = hub_api.request_trial_key(self.cardinal, plugin_name, c.from_user)
             if not ok:
                 if not STOP_EVENT.is_set():
                     self._alert(c, f"{result}")
+                    if msg_obj and getattr(msg_obj, "chat", None) and getattr(msg_obj, "id", None):
+                        try:
+                            err_text = (
+                                f"<b>Не удалось активировать пробный период</b>\n"
+                                f"Плагин: <b>{esc(plugin_label)}</b>\n\n"
+                                f"Причина: {esc(str(result or 'Неизвестная ошибка сервера.'))}"
+                            )
+                            kb = (
+                                KeyboardBuilder(max_columns=1)
+                                .row(Btn("🔄 Повторить", f"hub:trial_confirm:{plugin_name}"))
+                                .row(Btn("◀️ К плагину", f"hub:info:{plugin_name}"))
+                                .build()
+                            )
+                            self._edit_html(err_text, msg_obj.chat.id, msg_obj.id, reply_markup=kb)
+                        except Exception:
+                            logger.debug("Could not edit prompt card on trial error", exc_info=True)
                 return
 
-            p = next((x for x in hub_api.get_plugins() if x.get("id") == plugin_name), None)
-            plugin_label = str(p.get("name", plugin_name)) if p else plugin_name
             try:
                 update_data(lambda d: d.setdefault("keys", {}).__setitem__(plugin_name, result))
             except OSError as exc:
-                logger.exception("Failed saving trial key for %s", plugin_name)
+                logger.exception("Failed saving trial key for %s: %s", plugin_name, exc)
                 if not STOP_EVENT.is_set():
-                    self._alert(c, f"Ошибка сохранения ключа: {exc}")
+                    self._alert(c, "Ошибка сохранения пробного ключа на диск.")
+                    if msg_obj and getattr(msg_obj, "chat", None) and getattr(msg_obj, "id", None):
+                        try:
+                            err_text = (
+                                f"<b>Ошибка сохранения пробного ключа</b>\n"
+                                f"Плагин: <b>{esc(plugin_label)}</b>\n\n"
+                                f"Ключ получен, но произошла ошибка записи на диск."
+                            )
+                            kb = KeyboardBuilder(max_columns=1).row(Btn("◀️ К плагину", f"hub:info:{plugin_name}")).build()
+                            self._edit_html(err_text, msg_obj.chat.id, msg_obj.id, reply_markup=kb)
+                        except Exception:
+                            logger.debug("Could not edit prompt card on trial save error", exc_info=True)
                 return
 
             text, kb = render_trial_activated(plugin_name, plugin_label, result)
@@ -333,6 +366,16 @@ class HubActions:
                 self._edit_html(text, msg_obj.chat.id, msg_obj.id, reply_markup=kb)
         except Exception:
             logger.exception("Trial request failed for %s", plugin_name)
+            if not STOP_EVENT.is_set():
+                try:
+                    err_text = (
+                        "<b>Ошибка запроса пробного доступа</b>\n"
+                        "Повторите попытку позже или откройте /hub."
+                    )
+                    kb = KeyboardBuilder(max_columns=1).row(Btn("◀️ В меню", "hub:main")).build()
+                    self._edit_html(err_text, msg_obj.chat.id, msg_obj.id, reply_markup=kb)
+                except Exception:
+                    logger.debug("Could not display trial error screen", exc_info=True)
         finally:
             self._end_action(action_key)
 
@@ -385,43 +428,51 @@ class HubActions:
         if not plugin_name:
             return self._alert(c, "Плагин не установлен или уже удален")
 
-        data = load_data()
-        installed = data.get("installed") if isinstance(data.get("installed"), dict) else {}
-        if plugin_name not in installed:
-            return self._alert(c, "Плагин не установлен или уже удален")
-
-        p_info = next((x for x in hub_api.get_plugins() if x.get("id") == plugin_name), None) or {
-            "id": plugin_name,
-            "name": installed[plugin_name].get("name") or plugin_name,
-        }
-        pre_state = inspect_plugin_state(self.cardinal, p_info, installed, data.get("keys"))
+        install_key = f"install:{plugin_name}"
+        delete_key = f"delete:{plugin_name}"
+        if self._is_action_in_flight(install_key) or not self._try_begin_action(delete_key):
+            return self._alert(c, "Операция над плагином уже выполняется · подождите")
 
         try:
-            result = installer.delete_plugin_files(plugin_name)
-        except OSError as exc:
-            logger.exception("Failed deleting plugin %s", plugin_name)
-            return self._alert(c, f"Ошибка удаления: {exc}")
+            data = load_data()
+            installed = data.get("installed") if isinstance(data.get("installed"), dict) else {}
+            if plugin_name not in installed:
+                return self._alert(c, "Плагин не установлен или уже удален")
 
-        if not result.get("ok"):
-            return self._alert(c, f"Отказ: {result.get('error')}")
+            p_info = next((x for x in hub_api.get_plugins() if x.get("id") == plugin_name), None) or {
+                "id": plugin_name,
+                "name": installed[plugin_name].get("name") or plugin_name,
+            }
+            pre_state = inspect_plugin_state(self.cardinal, p_info, installed, data.get("keys"))
 
-        _save_restart_marker(
-            action="delete",
-            chat_id=c.message.chat.id,
-            plugin_id=plugin_name,
-            plugin_name=str(result.get("plugin_name") or plugin_name),
-            expected_uuid=str(p_info.get("uuid") or pre_state.get("loaded_uuid") or ""),
-            stub_path=str(result.get("stub_path") or ""),
-            bin_dir=str(result.get("bin_dir") or ""),
-        )
+            try:
+                result = installer.delete_plugin_files(plugin_name)
+            except OSError as exc:
+                logger.exception("Failed deleting plugin %s: %s", plugin_name, exc)
+                return self._alert(c, "Ошибка удаления: не удалось удалить файлы плагина.")
 
-        text, kb = render_delete_result(
-            result=result,
-            was_loaded_in_ram=bool(pre_state.get("loaded_uuid")),
-            had_storage_dir=bool(pre_state.get("storage_dir_exists")),
-        )
-        self._edit_html(text, c.message.chat.id, c.message.id, reply_markup=kb)
-        return None
+            if not result.get("ok"):
+                return self._alert(c, f"Отказ: {result.get('error')}")
+
+            _save_restart_marker(
+                action="delete",
+                chat_id=c.message.chat.id,
+                plugin_id=plugin_name,
+                plugin_name=str(result.get("plugin_name") or plugin_name),
+                expected_uuid=str(p_info.get("uuid") or pre_state.get("loaded_uuid") or ""),
+                stub_path=str(result.get("stub_path") or ""),
+                bin_dir=str(result.get("bin_dir") or ""),
+            )
+
+            text, kb = render_delete_result(
+                result=result,
+                was_loaded_in_ram=bool(pre_state.get("loaded_uuid")),
+                had_storage_dir=bool(pre_state.get("storage_dir_exists")),
+            )
+            self._edit_html(text, c.message.chat.id, c.message.id, reply_markup=kb)
+            return None
+        finally:
+            self._end_action(delete_key)
 
     def open_plugin_handler(self, c: CallbackQuery, plugin_name: Optional[str]) -> Any:
         if not plugin_name:
@@ -610,8 +661,8 @@ class HubActions:
         try:
             update_data(lambda d: d.setdefault("keys", {}).__setitem__(plugin, key))
         except OSError as exc:
-            logger.exception("Failed saving manual key for %s", plugin)
-            self._reply_html(message, f"<b>Ошибка сохранения ключа:</b> {esc(exc)}")
+            logger.exception("Failed saving manual key for %s: %s", plugin, exc)
+            self._reply_html(message, "<b>Ошибка сохранения ключа:</b> не удалось записать данные на диск.")
             return
 
         plugin_label = str(p.get("name", plugin)) if p else plugin

@@ -146,15 +146,22 @@ class _FakeCardinal:
 
 
 class BuildTests(unittest.TestCase):
-    def _run_build(self) -> Path:
+    def setUp(self):
+        self._tmp_build_dir = tempfile.TemporaryDirectory()
+        self._bundle_target = Path(self._tmp_build_dir.name) / "AutoSMM.py"
+
+    def tearDown(self):
+        self._tmp_build_dir.cleanup()
+
+    def _run_build(self, out_file: Path | None = None) -> Path:
         spec = importlib.util.spec_from_file_location("build_autosmm", ROOT / "build.py")
         builder = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(builder)
-        return builder.build()
+        return builder.build(out_file=out_file or self._bundle_target)
 
     def test_build_outputs_compilable_standalone_bundle(self):
         built_path = self._run_build()
-        self.assertEqual(built_path, ROOT / "AutoSMM.py")
+        self.assertEqual(built_path, self._bundle_target)
         self.assertTrue(built_path.is_file())
         source = built_path.read_text(encoding="utf-8")
         compile(source, str(built_path), "exec")

@@ -626,7 +626,7 @@ def stop_event_workers(*, drain: bool = True, timeout: float = 5.0) -> None:
                     shard_queue.get_nowait()
                     shard_queue.task_done()
                 except queue.Empty:
-                    break
+                    continue
 
     deadline = time.monotonic() + max(0.0, float(timeout))
     current = threading.current_thread()

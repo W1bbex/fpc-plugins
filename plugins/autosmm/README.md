@@ -6,7 +6,7 @@
 
 [![Version](https://img.shields.io/badge/Version-1.0-F59E0B?style=for-the-badge)](./AutoSMM.py)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/tests-180%20passed-22C55E?style=for-the-badge)](#%EF%B8%8F-%D1%81%D0%B1%D0%BE%D1%80%D0%BA%D0%B0-%D0%B8-%D1%82%D0%B5%D1%81%D1%82%D1%8B)
+[![Tests](https://img.shields.io/badge/tests-193%20passed-22C55E?style=for-the-badge)](#%EF%B8%8F-%D1%81%D0%B1%D0%BE%D1%80%D0%BA%D0%B0-%D0%B8-%D1%82%D0%B5%D1%81%D1%82%D1%8B)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)](./LICENSE)
 
 </div>
@@ -39,8 +39,7 @@
 1. Скачайте репозиторий (**Code → Download ZIP**) и распакуйте архив, либо клонируйте его.
 2. Откройте терминал в папке `plugins/autosmm`.
 3. Соберите однофайловый плагин:
-   - Windows: `py -3 build.py`
-   - Linux / macOS: `python3 build.py`
+   - Windows / Linux / macOS: `python build.py`
 4. Скопируйте полученный `AutoSMM.py` в папку `plugins/` FunPay Cardinal и перезапустите Cardinal (`/restart`).
 
 > [!IMPORTANT]
@@ -66,7 +65,7 @@ plugins/autosmm/
 │   ├── services/                    # analytics, currency, notifications, telemetry
 │   ├── storage/                     # SQLite (db, db_orders, db_state), migrations, backups, defaults
 │   └── tg/                          # Telegram UI и обработчики (lots, lot_editor, panels, settings, callback asmm:)
-└── tests/                           # 178 модульных и интеграционных тестов
+└── tests/                           # 193 модульных и интеграционных теста
 ```
 
 ---
@@ -75,8 +74,8 @@ plugins/autosmm/
 
 ```bash
 # Пересобрать AutoSMM.py
-py -3 build.py
+python build.py
 
 # Запустить тесты AutoSMM
-py -3 -m pytest tests -q
+python -m pytest tests -q
 ```

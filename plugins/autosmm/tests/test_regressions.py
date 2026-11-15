@@ -1,6 +1,8 @@
 import importlib
+import json
 import os
 import re
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -25,10 +27,11 @@ from src.core import (
     panel_balances,
     panel_errors,
     panel_submission,
+    refunds,
 )
 from src.services import analytics, currency, notifications
 from src.storage import db, db_orders, storage
-from src.tg import files, panels, templates
+from src.tg import files, lot_editor, panels, settings, templates
 
 
 def _build_fake_funpay_modules():
@@ -1105,17 +1108,24 @@ class AutoSmmRegressionsTests(unittest.TestCase):
                 self.assertIsNotNone(sig_no_ino)
                 self.assertEqual(len(sig_no_ino), 3)
 
-    def test_render_api_menu_caps_visible_services_at_25(self):
+    def test_render_api_menu_paginates_services(self):
         services = {
             str(i): {"name": f"Panel_{i}", "api_url": f"https://panel{i}.com/api"}
             for i in range(1, 35)
         }
         cfg = {"services": services}
         menu_text, kb = panels.render_api_menu(cfg, use_cache_only=True)
-        self.assertIn("...и ещё 9 сервисов", menu_text)
+        self.assertIn("стр. 1/5", menu_text)
         self.assertLess(len(menu_text), 4096)
         service_buttons = [b for row in kb.keyboard for b in row if b.callback_data.startswith("asmm:api_service_")]
-        self.assertEqual(len(service_buttons), 25)
+        self.assertEqual(len(service_buttons), 8)
+        nav_callbacks = [b.callback_data for row in kb.keyboard for b in row if "asmm:api_page_" in b.callback_data]
+        self.assertIn("asmm:api_page_1", nav_callbacks)
+
+        menu_text1, kb1 = panels.render_api_menu(cfg, use_cache_only=True, page=1)
+        self.assertIn("стр. 2/5", menu_text1)
+        service_buttons1 = [b for row in kb1.keyboard for b in row if b.callback_data.startswith("asmm:api_service_")]
+        self.assertEqual(len(service_buttons1), 8)
 
     def test_analytics_statistics_total_excludes_refunded_orders(self):
         now = time.time()
@@ -1232,6 +1242,304 @@ class AutoSmmRegressionsTests(unittest.TestCase):
                 self.assertFalse(has_clear_btn2)
         finally:
             rt.bot = orig_bot
+
+    def test_notifications_charge_handles_missing_currency_without_name_error(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            test_db = os.path.join(tmp_dir, "test.db")
+            db.init_db(test_db)
+            with mock.patch.object(rt, "DB_PATH", test_db):
+                db_orders.upsert_order(
+                    chat_id=10,
+                    order_id="TEST_NO_CURR",
+                    panel_order_id=555,
+                    status="pending",
+                    chistota=0.0,
+                    customer_url="https://example.com",
+                    quantity=10,
+                    service_number=1,
+                    currency="USD",
+                )
+                with mock.patch.object(
+                    notifications,
+                    "_panel_api_json",
+                    return_value=(None, {"status": "Completed", "charge": "5.0"}, "", False),
+                ):
+                    with mock.patch.object(
+                        panel_balances,
+                        "get_cached_service_balance",
+                        return_value={"currency": "USD"},
+                    ):
+                        spent, cur, spent_rub, fx_rate, net = notifications._fetch_start_notification_charge(
+                            order_id_funpay="TEST_NO_CURR",
+                            panel_order_id=555,
+                            api_url="https://panel.example/api/v2",
+                            api_key="valid_api_key_12345",
+                            lot_price=500.0,
+                            service_number=1,
+                        )
+                        self.assertEqual(spent, 5.0)
+                        self.assertEqual(cur, "USD")
+
+    def test_orders_status_apply_prefers_panel_currency_over_default_rub(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            test_db = os.path.join(tmp_dir, "test.db")
+            db.init_db(test_db)
+            with mock.patch.object(rt, "DB_PATH", test_db):
+                db_orders.upsert_order(
+                    chat_id=10,
+                    order_id="TEST_CUR_ORDER",
+                    panel_order_id=123,
+                    status="pending",
+                    chistota=0.0,
+                    customer_url="https://example.com",
+                    quantity=10,
+                    service_number=2,
+                    currency="RUB",
+                )
+                fake_c = SimpleNamespace(account=SimpleNamespace(), telegram=SimpleNamespace())
+                order_rec = db_orders.get_order("TEST_CUR_ORDER")
+                result = {"status": "Completed", "charge": "2.5"}
+                with mock.patch.object(
+                    orders,
+                    "get_cached_service_balance",
+                    return_value={"currency": "USD"},
+                ):
+                    with mock.patch.object(
+                        orders,
+                        "compute_order_profit_rub",
+                        wraps=currency.compute_order_profit_rub,
+                    ) as profit_spy:
+                        orders._apply_status_result(fake_c, order_rec, result)
+                        self.assertTrue(profit_spy.called)
+                        call_currency = profit_spy.call_args[0][2]
+                        self.assertEqual(call_currency, "USD")
+
+    def test_panel_balance_fetch_masks_api_key_on_get_fallback_error(self):
+        raw_key = "SECRET_SUPER_KEY_99999"
+        cfg = {
+            "api_url": "https://api.panel.example/v2",
+            "api_key": raw_key,
+        }
+        leaked_msg = f"Connection error to https://api.panel.example/v2?key={raw_key}"
+        logged_warnings = []
+        fake_logger = SimpleNamespace(
+            warning=lambda msg: logged_warnings.append(str(msg)),
+            debug=lambda msg: None,
+            error=lambda msg: None,
+            info=lambda msg: None,
+        )
+        orig_logger = rt.logger
+        try:
+            rt.logger = fake_logger
+            with mock.patch(
+                "src.core.panel_balances._panel_api_json",
+                side_effect=requests.RequestException(leaked_msg),
+            ):
+                res = panel_balances.fetch_service_balance_payload(1, cfg, timeout=2)
+                self.assertFalse(res["ok"])
+                self.assertTrue(logged_warnings)
+                for log in logged_warnings:
+                    self.assertNotIn(raw_key, log)
+                    self.assertIn("***", log)
+        finally:
+            rt.logger = orig_logger
+
+    def test_load_config_recovers_from_bak_when_primary_missing(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cfg_path = os.path.join(tmp_dir, "auto_lots.json")
+            bak_path = os.path.join(tmp_dir, "auto_lots.json.bak")
+            bak_data = {
+                "services": {"1": {"name": "RecoveredService"}},
+                "lot_mapping": {"lot_1": {"name": "RecoveredLot"}},
+            }
+            with open(bak_path, "w", encoding="utf-8") as fh:
+                json.dump(bak_data, fh)
+            self.assertFalse(os.path.exists(cfg_path))
+
+            with mock.patch.object(rt, "CONFIG_PATH", cfg_path):
+                with mock.patch.object(rt, "CONFIG_BAK_PATH", bak_path):
+                    cfg = storage.load_config()
+                    self.assertIn("1", cfg.get("services", {}))
+                    self.assertEqual(cfg["services"]["1"]["name"], "RecoveredService")
+                    self.assertTrue(os.path.exists(cfg_path))
+                    with open(bak_path, "r", encoding="utf-8") as fh:
+                        cur_bak = json.load(fh)
+                    self.assertEqual(cur_bak["services"]["1"]["name"], "RecoveredService")
+
+    def test_buyer_link_command_blocks_when_panel_add_submitted_or_final(self):
+        c = mock.MagicMock()
+        order_record = {
+            "order_id": "ABC12345",
+            "order_id_funpay": "ABC12345",
+            "buyer_id": "buyer_1",
+            "chat_id": 999,
+            "panel_add_submitted": 1,
+            "funpay_status": "closed",
+        }
+        with mock.patch("src.core.buyer_flow._resolve_buyer_order_for_action", return_value=order_record):
+            with mock.patch("src.core.buyer_flow.get_order_data", return_value=order_record):
+                with mock.patch("src.core.buyer_flow._send_buyer_message") as mock_send:
+                    res = buyer_flow._handle_buyer_link_command(c, "!ссылка", "buyer_1", 999)
+                    self.assertTrue(res)
+                    mock_send.assert_called_once()
+                    self.assertIn("передан в работу", mock_send.call_args[0][2])
+
+    def test_refund_order_survives_sqlite_error_and_cleans_waiting_for_link(self):
+        c = mock.MagicMock()
+        order_id = "REFUND_DB_ERR"
+        with rt.CONTEXT_LOCK:
+            rt.waiting_for_link[order_id] = {"link": "https://example.com"}
+
+        with mock.patch("src.core.refunds.load_config", return_value={"auto_refunds": True}):
+            with mock.patch("src.core.refunds.get_order_data", return_value=None):
+                with mock.patch("src.core.refunds.update_order_fields", side_effect=sqlite3.OperationalError("db locked")):
+                    with mock.patch("src.core.refunds._send_buyer_message") as mock_send_buyer:
+                        with mock.patch("src.core.refunds._send_admin_order_alert") as mock_alert:
+                            refunds.refund_order(
+                                c,
+                                order_id_funpay=order_id,
+                                buyer_chat_id=111,
+                                reason="Test cancel",
+                            )
+                            c.account.refund.assert_called_once_with(order_id)
+                            with rt.CONTEXT_LOCK:
+                                self.assertNotIn(order_id, rt.waiting_for_link)
+                            mock_send_buyer.assert_called_once()
+                            mock_alert.assert_called_once()
+
+    def test_clear_fallback_callback_preserves_card_context_and_rejects_missing_lot(self):
+        call = mock.MagicMock()
+        call.data = "asmm:clear_fallback_missing_lot_key"
+        call.message.chat.id = 555
+        call.message.message_id = 777
+
+        with mock.patch("src.tg.lot_editor.load_config", return_value={"lot_mapping": {}}):
+            with mock.patch("src.tg.lot_editor._dispatch_navigation_callback") as mock_dispatch:
+                lot_editor.clear_fallback_callback(call)
+                mock_dispatch.assert_called_once_with(call, "asmm:lot_settings")
+
+    def test_save_valid_links_failure_propagates_to_settings_handlers(self):
+        msg = mock.MagicMock()
+        msg.chat.id = 123
+        fake_bot = mock.MagicMock()
+        with mock.patch.object(rt, "bot", fake_bot):
+            with mock.patch("src.tg.settings.load_valid_links", return_value=[]):
+                with mock.patch("src.tg.settings.save_valid_links", return_value=False):
+                    settings.add_website(msg, "newsite.com")
+                    fake_bot.send_message.assert_called_once()
+                    self.assertIn("Ошибка сохранения", fake_bot.send_message.call_args[0][1])
+
+    def test_wipe_all_autosmm_data_clears_memory_contexts_and_config(self):
+        rt.config["test_key"] = "test_val"
+        rt.lot_mapping["lot_a"] = {"name": "A"}
+        with rt.CONTEXT_LOCK:
+            rt.waiting_for_link["123"] = {"order": 1}
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            test_db = os.path.join(tmp_dir, "autosmm.db")
+            with open(test_db, "w") as fh:
+                fh.write("db")
+            with mock.patch.object(rt, "DB_PATH", test_db):
+                with mock.patch.object(rt, "CONFIG_PATH", os.path.join(tmp_dir, "nonexistent.json")):
+                    removed, failed = storage.wipe_all_autosmm_data()
+                    self.assertEqual(len(rt.config), 0)
+                    self.assertEqual(len(rt.lot_mapping), 0)
+                    with rt.CONTEXT_LOCK:
+                        self.assertEqual(len(rt.waiting_for_link), 0)
+                    self.assertEqual(len(failed), 0)
+
+    def test_attempt_panel_cancel_validates_api_key_before_claim(self):
+        order_record = {
+            "order_id": "ORD-CANCEL-1",
+            "id_zakaz": 12345,
+            "service_number": 1,
+        }
+        cfg = {
+            "try_panel_cancel_after_funpay_refund": True,
+            "services": {
+                "1": {
+                    "api_url": "https://validpanel.com/api/v2",
+                    "api_key": "dummy_key",
+                }
+            },
+        }
+        with mock.patch("src.core.refunds.load_config", return_value=cfg):
+            with mock.patch("src.core.refunds.claim_panel_refund_cancel") as mock_claim:
+                res = refunds._attempt_panel_cancel_after_funpay_refund(order_record)
+                self.assertFalse(res)
+                mock_claim.assert_not_called()
+
+    def test_send_tg_notification_and_order_url_markup(self):
+        from src.tg import common as tg_common
+        fake_bot = mock.MagicMock()
+        with mock.patch.object(rt, "bot", fake_bot):
+            markup = tg_common.build_order_url_markup("https://funpay.com/orders/TEST1/")
+            self.assertIsNotNone(markup)
+            ok = tg_common.send_tg_notification(123456, "Test alert", reply_markup=markup)
+            self.assertTrue(ok)
+            fake_bot.send_message.assert_called_once_with(123456, "Test alert", reply_markup=markup)
+
+    def test_api_menu_nav_page_transitions(self):
+        call = mock.MagicMock()
+        call.data = "asmm:api_page_1"
+        call.message.chat.id = 456
+        call.message.message_id = 789
+
+        with mock.patch("src.tg.panels._open_api_menu") as mock_open:
+            panels._nav_api_page(call, "asmm:api_page_1")
+            mock_open.assert_called_once_with(456, message_id=789, force_refresh=False, page=1)
+
+        with mock.patch("src.tg.panels._open_api_menu") as mock_open:
+            panels._nav_api_page(call, "asmm:api_page_curr")
+            mock_open.assert_not_called()
+
+    def test_panel_service_config_and_smm_order_dto_contracts(self):
+        from src.models import OrderRecord, PanelServiceConfig, SmmOrderDTO
+        from src.core.panel_api import _extract_service_credentials
+
+        # PanelServiceConfig contract
+        panel_cfg = PanelServiceConfig.from_dict({
+            "api_url": "https://panel.example.com/api/v2",
+            "api_key": "secret123",
+            "name": "Main Panel",
+            "currency": "rub",
+        })
+        self.assertEqual(panel_cfg.api_url, "https://panel.example.com/api/v2")
+        self.assertEqual(panel_cfg["api_key"], "secret123")
+        self.assertEqual(panel_cfg.get("currency"), "RUB")
+        self.assertEqual(panel_cfg.to_dict()["name"], "Main Panel")
+
+        # Credentials extraction with typed config
+        app_cfg = {"services": {"1": panel_cfg}}
+        url, key, err = _extract_service_credentials(app_cfg, 1)
+        self.assertIsNone(err)
+        self.assertEqual(url, "https://panel.example.com/api/v2")
+        self.assertEqual(key, "secret123")
+
+        # SmmOrderDTO contract
+        order_rec = OrderRecord(
+            order_id="ORD-99",
+            buyer_username="customer1",
+            lot_title="Followers",
+            service_number=1,
+            panel_order_id=5555,
+            status="processing",
+            quantity=100,
+            total_quantity=100,
+            done_quantity=60,
+            left_quantity=40,
+            progress_percent=60,
+        )
+        dto = order_rec.to_dto()
+        self.assertIsInstance(dto, SmmOrderDTO)
+        self.assertEqual(dto.order_id, "ORD-99")
+        self.assertEqual(dto["panel_order_id"], 5555)
+        self.assertEqual(dto.get("buyer_username"), "customer1")
+        self.assertEqual(dto.done_quantity, 60)
+        self.assertEqual(dto.progress_percent, 60)
+        serialized = dto.to_dict()
+        self.assertEqual(serialized["order_id"], "ORD-99")
+        self.assertEqual(serialized["quantity"], 100)
 
 
 if __name__ == "__main__":

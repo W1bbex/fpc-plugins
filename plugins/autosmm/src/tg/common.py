@@ -41,6 +41,39 @@ def clean_tg_text(text: Any) -> str:
     return re.sub(r"\n{3,}", "\n\n", value)
 
 
+def build_order_url_markup(order_url: str) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("Перейти к заказу", url=order_url))
+    return kb
+
+
+def send_tg_notification(
+    chat_id: Any,
+    text: str,
+    *,
+    reply_markup: Any = None,
+    parse_mode: Optional[str] = None,
+    disable_web_page_preview: bool = False,
+    cardinal: Any = None,
+) -> bool:
+    bot = rt.bot or getattr(getattr(cardinal or rt.cardinal_instance, "telegram", None), "bot", None)
+    if not bot or not chat_id:
+        return False
+    try:
+        kwargs: Dict[str, Any] = {}
+        if reply_markup is not None:
+            kwargs["reply_markup"] = reply_markup
+        if parse_mode is not None:
+            kwargs["parse_mode"] = parse_mode
+        if disable_web_page_preview:
+            kwargs["disable_web_page_preview"] = disable_web_page_preview
+        bot.send_message(chat_id, text, **kwargs)
+        return True
+    except Exception as exc:
+        rt.logger.error(f"Не удалось отправить Telegram-уведомление в чат {chat_id}: {exc}")
+        return False
+
+
 def _safe_answer_callback(call: types.CallbackQuery, text: Optional[str] = None) -> None:
     if not rt.bot:
         return

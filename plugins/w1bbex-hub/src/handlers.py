@@ -88,12 +88,22 @@ class HubController(HubNavigation, HubActions, TelegramTransport):
                     self._alert(c, "Не удалось выполнить действие · откройте /hub и повторите попытку")
             finally:
                 if cb_id is not None:
-                    if cb_id not in self._acked_callbacks:
+                    lock = getattr(self, "_get_acked_lock", None)
+                    if callable(lock):
+                        with lock():
+                            was_acked = cb_id in self._acked_callbacks
+                    else:
+                        was_acked = cb_id in self._acked_callbacks
+                    if not was_acked:
                         try:
                             self._ack(c)
                         except Exception:
                             logger.debug("Could not acknowledge callback", exc_info=True)
-                    self._acked_callbacks.discard(cb_id)
+                    if callable(lock):
+                        with lock():
+                            self._acked_callbacks.discard(cb_id)
+                    else:
+                        self._acked_callbacks.discard(cb_id)
         return wrapper
 
     def main_menu(self, c: CallbackQuery) -> None:
@@ -204,6 +214,7 @@ def init_cardinal(cardinal: Optional[Cardinal]) -> Optional[HubController]:
         ("hub:diagnostics:", lambda c, arg: controller.plugin_info_menu(c, arg, view="diagnostics")),
         ("hub:catalog:", controller.catalog_page),
         ("hub:install:", lambda c, arg: controller.install_plugin(c, arg, background=True)),
+        ("hub:upd:", lambda c, arg: controller.install_plugin(c, arg, background=True)),
         ("hub:trial:", controller.trial_request),
         ("hub:trial_confirm:", lambda c, arg: controller.trial_confirm(c, arg, background=True)),
         ("hub:delete_confirm:", controller.delete_confirm_handler),

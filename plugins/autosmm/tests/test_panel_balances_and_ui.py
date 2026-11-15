@@ -271,7 +271,7 @@ class PaginationAndUiFixesTests(unittest.TestCase):
                 _, _, text0, kwargs0 = calls["edits"][-1]
                 kb0 = kwargs0["reply_markup"]
                 callbacks0 = [btn.callback_data for row in kb0.keyboard for btn in row]
-                self.assertIn("стр. 1/3", text0)
+                self.assertIn("стр. 1/6", text0)
                 self.assertIn("asmm:sites_page_1", callbacks0)
                 self.assertNotIn("asmm:sites_page_-1", callbacks0)
                 self.assertLessEqual(len(callbacks0), 30)
@@ -286,7 +286,7 @@ class PaginationAndUiFixesTests(unittest.TestCase):
                 _, _, text1, kwargs1 = calls["edits"][-1]
                 kb1 = kwargs1["reply_markup"]
                 callbacks1 = [btn.callback_data for row in kb1.keyboard for btn in row]
-                self.assertIn("стр. 2/3", text1)
+                self.assertIn("стр. 2/6", text1)
                 self.assertIn("asmm:sites_page_0", callbacks1)
                 self.assertIn("asmm:sites_page_2", callbacks1)
 

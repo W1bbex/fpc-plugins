@@ -33,6 +33,7 @@ from .panel_api import _panel_api_json
 from .panel_errors import (
     _normalize_api_key,
     _sanitize_secret_text,
+    _validate_api_key_for_action,
 )
 
 
@@ -72,9 +73,9 @@ def _attempt_panel_cancel_after_funpay_refund(order_record: Optional[Dict], sour
 
     api_url = str(service_cfg.get("api_url") or "").strip()
     api_key = _normalize_api_key(service_cfg.get("api_key"))
-    if not api_url or not api_key:
+    if not api_url or not api_key or _validate_api_key_for_action(service_number, "cancel", api_key):
         rt.logger.info(
-            f"PANEL CANCEL SKIPPED: order=#{order_id_funpay}, source={source}, reason=service_credentials_missing, service=#{service_number}"
+            f"PANEL CANCEL SKIPPED: order=#{order_id_funpay}, source={source}, reason=service_credentials_missing_or_invalid, service=#{service_number}"
         )
         return False
 
@@ -182,7 +183,10 @@ def refund_order(
                 f"Не удалось вернуть средства для заказа #{order_id_funpay}: {ex}. "
                 f"Технические детали: {detailed_reason}"
             )
-            update_order_fields(order_id_funpay, buyer_flow_state=BUYER_STATE_FAILED, updated_at=rt.now_str())
+            try:
+                update_order_fields(order_id_funpay, buyer_flow_state=BUYER_STATE_FAILED, updated_at=rt.now_str())
+            except sqlite3.Error as db_ex:
+                rt.logger.error(f"Не удалось обновить статус ошибки в SQLite для заказа #{order_id_funpay}: {db_ex}")
             try:
                 _send_admin_order_alert(
                     order_id_funpay=order_id_funpay,
@@ -199,21 +203,24 @@ def refund_order(
             f"Заказ #{order_id_funpay} был отменён (refund) для покупателя {buyer_chat_id}. "
             f"Причина: {reason}. Технические детали: {detailed_reason}"
         )
-        updated_ok = update_order_fields(
-            order_id_funpay,
-            funpay_status="refunded",
-            buyer_flow_state=BUYER_STATE_REFUNDED,
-            saved_link=None,
-            status_stop_reason=None,
-            refund_detected_at=rt.now_str(),
-            refund_source="auto_refund",
-            updated_at=rt.now_str(),
-        )
-        if not updated_ok:
-            rt.logger.error(
-                f"REFUND STATE PERSIST FAILED: заказ #{order_id_funpay} возвращён на FunPay, "
-                f"но обновление SQLite вернуло False."
+        try:
+            updated_ok = update_order_fields(
+                order_id_funpay,
+                funpay_status="refunded",
+                buyer_flow_state=BUYER_STATE_REFUNDED,
+                saved_link=None,
+                status_stop_reason=None,
+                refund_detected_at=rt.now_str(),
+                refund_source="auto_refund",
+                updated_at=rt.now_str(),
             )
+            if not updated_ok:
+                rt.logger.error(
+                    f"REFUND STATE PERSIST FAILED: заказ #{order_id_funpay} возвращён на FunPay, "
+                    f"но обновление SQLite вернуло False."
+                )
+        except sqlite3.Error as db_ex:
+            rt.logger.error(f"Не удалось записать статус возврата в SQLite для #{order_id_funpay}: {db_ex}")
         with rt.CONTEXT_LOCK:
             rt.waiting_for_link.pop(str(order_id_funpay), None)
 

@@ -193,8 +193,8 @@ def _is_disallowed_ip(ip_obj: Any) -> bool:
     return isinstance(ip_obj, ipaddress.IPv4Address) and ip_obj in _CGNAT_NETWORK
 
 
-def normalize_api_url(raw_url: Any, *, check_dns: bool = False) -> str:
-    """Normalize and validate an SMM panel API endpoint while blocking private/local targets."""
+def _sanitize_raw_url_string(raw_url: Any) -> str:
+    """Strip whitespace/markdown wrapper and prepend https scheme if missing."""
     raw_value = str(raw_url or "").strip()
     if not raw_value:
         raise ValueError("ссылка или домен не должны быть пустыми")
@@ -209,19 +209,11 @@ def normalize_api_url(raw_url: Any, *, check_dns: bool = False) -> str:
 
     if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://", raw_value):
         raw_value = f"https://{raw_value.lstrip('/')}"
+    return raw_value
 
-    parts = urlsplit(raw_value)
-    if str(parts.scheme or "").lower() not in ("http", "https"):
-        raise ValueError("поддерживаются только HTTP/HTTPS ссылки")
 
-    if not parts.netloc and parts.path:
-        parts = urlsplit(f"https://{str(parts.path).lstrip('/')}")
-
-    raw_netloc = str(parts.netloc or "").strip()
-    if "@" in raw_netloc:
-        raise ValueError("некорректный домен")
-
-    authority = raw_netloc
+def _extract_and_validate_port(parts: Any, authority: str) -> Optional[int]:
+    """Validate port syntax and bounds in authority."""
     if authority.startswith("["):
         if "]:" in authority:
             port_str = authority.split("]:", 1)[1]
@@ -238,7 +230,11 @@ def normalize_api_url(raw_url: Any, *, check_dns: bool = False) -> str:
         raise ValueError("некорректный порт") from ex
     if port is not None and not (1 <= port <= 65535):
         raise ValueError("некорректный порт")
+    return port
 
+
+def _extract_and_validate_hostname(parts: Any) -> str:
+    """Extract clean hostname and reject empty or internal domain names."""
     hostname = str(getattr(parts, "hostname", None) or "").strip().strip(".").lower()
     if hostname.startswith("www."):
         hostname = hostname[4:]
@@ -246,7 +242,30 @@ def normalize_api_url(raw_url: Any, *, check_dns: bool = False) -> str:
         raise ValueError("не удалось распознать домен")
     if hostname == "localhost" or hostname.endswith((".local", ".localhost", ".internal", ".home.arpa")):
         raise ValueError("локальные и внутренние домены запрещены")
+    return hostname
 
+
+def _parse_and_validate_url_parts(raw_url: Any) -> tuple[str, Optional[int]]:
+    """Parse raw URL string, strip markdown/slashes, enforce HTTP/HTTPS, and extract hostname and port."""
+    raw_value = _sanitize_raw_url_string(raw_url)
+    parts = urlsplit(raw_value)
+    if str(parts.scheme or "").lower() not in ("http", "https"):
+        raise ValueError("поддерживаются только HTTP/HTTPS ссылки")
+
+    if not parts.netloc and parts.path:
+        parts = urlsplit(f"https://{str(parts.path).lstrip('/')}")
+
+    raw_netloc = str(parts.netloc or "").strip()
+    if "@" in raw_netloc:
+        raise ValueError("некорректный домен")
+
+    port = _extract_and_validate_port(parts, raw_netloc)
+    hostname = _extract_and_validate_hostname(parts)
+    return hostname, port
+
+
+def _validate_host_and_ip(hostname: str) -> None:
+    """Validate that hostname does not target disallowed IP spaces or malformed domain syntax."""
     try:
         ip_obj = ipaddress.ip_address(hostname)
     except ValueError:
@@ -255,40 +274,51 @@ def normalize_api_url(raw_url: Any, *, check_dns: bool = False) -> str:
     if ip_obj is not None:
         if _is_disallowed_ip(ip_obj):
             raise ValueError("локальные и приватные IP-адреса запрещены")
+        return
+
+    labels = hostname.split(".")
+    if labels and all(_INT_LITERAL_LABEL_RE.fullmatch(label or "") for label in labels):
+        raise ValueError("локальные и приватные IP-адреса запрещены")
+    try:
+        socket.inet_aton(hostname)
+    except OSError:
+        pass
     else:
-        labels = hostname.split(".")
-        if labels and all(_INT_LITERAL_LABEL_RE.fullmatch(label or "") for label in labels):
-            raise ValueError("локальные и приватные IP-адреса запрещены")
+        raise ValueError("локальные и приватные IP-адреса запрещены")
+
+    if (
+        not re.fullmatch(r"[a-z0-9.-]+", hostname)
+        or ".." in hostname
+        or hostname.startswith(".")
+        or hostname.endswith(".")
+    ):
+        raise ValueError("некорректный домен")
+
+
+def _verify_resolved_dns_ips(hostname: str, port: Optional[int]) -> None:
+    """Resolve hostname via DNS and reject any resolved private or local IPs."""
+    try:
+        addr_infos = socket.getaddrinfo(hostname, port or 443, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        addr_infos = []
+    for _family, _socktype, _proto, _canonname, sockaddr in addr_infos:
+        raw_ip = str(sockaddr[0]).split("%", 1)[0] if isinstance(sockaddr, tuple) and sockaddr else ""
+        if not raw_ip:
+            continue
         try:
-            socket.inet_aton(hostname)
-        except OSError:
-            pass
-        else:
+            resolved_ip = ipaddress.ip_address(raw_ip)
+        except ValueError:
+            continue
+        if _is_disallowed_ip(resolved_ip):
             raise ValueError("локальные и приватные IP-адреса запрещены")
 
-        if (
-            not re.fullmatch(r"[a-z0-9.-]+", hostname)
-            or ".." in hostname
-            or hostname.startswith(".")
-            or hostname.endswith(".")
-        ):
-            raise ValueError("некорректный домен")
 
-        if check_dns:
-            try:
-                addr_infos = socket.getaddrinfo(hostname, port or 443, type=socket.SOCK_STREAM)
-            except socket.gaierror:
-                addr_infos = []
-            for _family, _socktype, _proto, _canonname, sockaddr in addr_infos:
-                raw_ip = str(sockaddr[0]).split("%", 1)[0] if isinstance(sockaddr, tuple) and sockaddr else ""
-                if not raw_ip:
-                    continue
-                try:
-                    resolved_ip = ipaddress.ip_address(raw_ip)
-                except ValueError:
-                    continue
-                if _is_disallowed_ip(resolved_ip):
-                    raise ValueError("локальные и приватные IP-адреса запрещены")
+def normalize_api_url(raw_url: Any, *, check_dns: bool = False) -> str:
+    """Normalize and validate an SMM panel API endpoint while blocking private/local targets."""
+    hostname, port = _parse_and_validate_url_parts(raw_url)
+    _validate_host_and_ip(hostname)
+    if check_dns:
+        _verify_resolved_dns_ips(hostname, port)
 
     canonical_host = f"[{hostname}]" if ":" in hostname else hostname
     if port is not None:
@@ -467,6 +497,127 @@ class OrderRecord:
             data.pop("fallback_used", None)
             data.pop("fallback_reason", None)
         return {k: v for k, v in data.items() if v is not None or k in ("id_zakaz", "panel_order_id")}
+
+    def to_dto(self) -> SmmOrderDTO:
+        """Convert this domain record into an immutable transfer DTO."""
+        return SmmOrderDTO.from_order_record(self)
+
+
+@dataclass(slots=True, frozen=True)
+class PanelServiceConfig:
+    """Strongly-typed contract for configured SMM API panels."""
+
+    api_url: str
+    api_key: str
+    name: str = ""
+    currency: str = "RUB"
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "PanelServiceConfig":
+        return cls(
+            api_url=str(raw.get("api_url") or "").strip(),
+            api_key=str(raw.get("api_key") or "").strip(),
+            name=str(raw.get("name") or "").strip(),
+            currency=str(raw.get("currency") or "RUB").strip().upper(),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "api_url": self.api_url,
+            "api_key": self.api_key,
+            "name": self.name,
+            "currency": self.currency,
+        }
+
+    def __getitem__(self, key: str) -> Any:
+        try:
+            return getattr(self, key)
+        except AttributeError as ex:
+            raise KeyError(key) from ex
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+
+@dataclass(slots=True, frozen=True)
+class SmmOrderDTO:
+    """Immutable lightweight Data Transfer Object for order state transfers."""
+
+    order_id: str
+    service_number: int = 1
+    panel_order_id: Optional[int] = None
+    buyer_username: str = ""
+    funpay_status: Optional[str] = "open"
+    buyer_flow_state: Optional[str] = "waiting_link"
+    customer_url: str = ""
+    status: str = "pending"
+    quantity: int = 0
+    total_quantity: int = 0
+    done_quantity: int = 0
+    left_quantity: int = 0
+    progress_percent: int = 0
+
+    @classmethod
+    def from_order_record(cls, rec: "OrderRecord") -> "SmmOrderDTO":
+        return cls(
+            order_id=rec.order_id,
+            service_number=rec.service_number,
+            panel_order_id=rec.panel_order_id,
+            buyer_username=rec.buyer_username,
+            funpay_status=rec.funpay_status,
+            buyer_flow_state=rec.buyer_flow_state,
+            customer_url=rec.customer_url,
+            status=rec.status,
+            quantity=rec.quantity,
+            total_quantity=rec.total_quantity,
+            done_quantity=rec.done_quantity,
+            left_quantity=rec.left_quantity,
+            progress_percent=rec.progress_percent,
+        )
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "SmmOrderDTO":
+        return cls(
+            order_id=str(raw.get("order_id") or ""),
+            service_number=safe_int(raw.get("service_number")) or 1,
+            panel_order_id=resolve_panel_order_id(raw),
+            buyer_username=str(raw.get("buyer_username") or ""),
+            funpay_status=get_effective_funpay_status(raw),
+            buyer_flow_state=str(raw.get("buyer_flow_state") or "waiting_link"),
+            customer_url=str(raw.get("customer_url") or ""),
+            status=str(raw.get("status") or "pending"),
+            quantity=safe_int(raw.get("quantity")) or 0,
+            total_quantity=safe_int(raw.get("total_quantity")) or 0,
+            done_quantity=safe_int(raw.get("done_quantity")) or 0,
+            left_quantity=safe_int(raw.get("left_quantity")) or 0,
+            progress_percent=safe_int(raw.get("progress_percent")) or 0,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "order_id": self.order_id,
+            "service_number": self.service_number,
+            "panel_order_id": self.panel_order_id,
+            "buyer_username": self.buyer_username,
+            "funpay_status": self.funpay_status,
+            "buyer_flow_state": self.buyer_flow_state,
+            "customer_url": self.customer_url,
+            "status": self.status,
+            "quantity": self.quantity,
+            "total_quantity": self.total_quantity,
+            "done_quantity": self.done_quantity,
+            "left_quantity": self.left_quantity,
+            "progress_percent": self.progress_percent,
+        }
+
+    def __getitem__(self, key: str) -> Any:
+        try:
+            return getattr(self, key)
+        except AttributeError as ex:
+            raise KeyError(key) from ex
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
 
 
 @dataclass(frozen=True)

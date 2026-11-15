@@ -110,12 +110,15 @@ def join_background_threads(timeout: float = 5.0) -> None:
         _BACKGROUND_THREADS.clear()
     current = threading.current_thread()
     for thread in candidates:
-        if thread is current or not thread.is_alive():
+        is_alive_fn = getattr(thread, "is_alive", None)
+        if thread is current or (callable(is_alive_fn) and not is_alive_fn()) or is_alive_fn is None:
             continue
         remaining = max(0.05, deadline - time.monotonic())
         if deadline - time.monotonic() <= 0:
             break
-        thread.join(timeout=remaining)
+        join_fn = getattr(thread, "join", None)
+        if callable(join_fn):
+            join_fn(timeout=remaining)
 
 
 def wait_with_stop(seconds: float, step: float = 0.25) -> bool:
@@ -330,6 +333,8 @@ def prune_stale_contexts(now_ts: Optional[float] = None, max_ui_age_seconds: int
 
 def clear_memory_contexts() -> None:
     """Reset in-memory buyer and Telegram UI wizard states."""
+    config.clear()
+    lot_mapping.clear()
     with CONTEXT_LOCK:
         for container in (
             waiting_for_link,

@@ -8,17 +8,12 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import requests
 
-try:
-    from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
-except ImportError:
-    InlineKeyboardButton = None  # type: ignore[assignment,misc]
-    InlineKeyboardMarkup = None  # type: ignore[assignment,misc]
-
 if TYPE_CHECKING:
     from cardinal import Cardinal
 
 from .. import runtime as rt
 from ..storage.storage import STATE_LOCK, _load_autosmm_state, _save_autosmm_state, load_config, update_state_fields
+from ..tg.common import send_tg_notification
 
 TELEMETRY_URL = "https://api.w1bbex.ru/v1/autosmm/telemetry"
 TELEMETRY_PING_INTERVAL_SECONDS = 86400
@@ -252,14 +247,8 @@ def _resolve_telemetry_warning_chat_id(c: Optional[Cardinal], state: Dict[str, A
 
 
 def _build_telemetry_guest_warning_markup() -> Any:
-    if InlineKeyboardMarkup is None or InlineKeyboardButton is None:
-        return None
-    kb = InlineKeyboardMarkup(row_width=1)
-    kb.add(
-        InlineKeyboardButton("✅ Согласиться и продолжить", callback_data="asmm:telemetry_accept"),
-        InlineKeyboardButton("🛡 Насколько это безопасно?", url=TELEMETRY_SECURITY_URL),
-    )
-    return kb
+    from ..tg.telemetry import build_telemetry_guest_warning_markup
+    return build_telemetry_guest_warning_markup(TELEMETRY_SECURITY_URL)
 
 
 def _build_telemetry_guest_warning_text(tier: str, remaining_seconds: float) -> str:
@@ -304,21 +293,20 @@ def _maybe_notify_telemetry_guest_expiring(
                 return None
             state_snapshot = dict(state)
 
-        bot = rt.bot or getattr(getattr(c or rt.cardinal_instance, "telegram", None), "bot", None)
-        target_chat_id = _resolve_telemetry_warning_chat_id(c, state_snapshot) if bot is not None else None
-        if bot is None or target_chat_id is None:
+        target_chat_id = _resolve_telemetry_warning_chat_id(c, state_snapshot)
+        if target_chat_id is None:
             return None
 
-        try:
-            bot.send_message(
-                target_chat_id,
-                _build_telemetry_guest_warning_text(tier, remaining),
-                parse_mode="HTML",
-                reply_markup=_build_telemetry_guest_warning_markup(),
-                disable_web_page_preview=True,
-            )
-        except Exception as exc:
-            rt.logger.warning(f"TELEMETRY GUEST WARNING ({tier}) FAILED: {exc}")
+        success = send_tg_notification(
+            target_chat_id,
+            _build_telemetry_guest_warning_text(tier, remaining),
+            reply_markup=_build_telemetry_guest_warning_markup(),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            cardinal=c,
+        )
+        if not success:
+            rt.logger.warning(f"TELEMETRY GUEST WARNING ({tier}) FAILED")
             return None
 
         sent_at = ref_dt.isoformat(timespec="seconds")
@@ -413,11 +401,13 @@ def _maybe_send_telemetry_ping(c: Optional[Cardinal] = None, force: bool = False
         _save_autosmm_state(state)
 
     try:
-        threading.Thread(
+        t = threading.Thread(
             target=_send_telemetry_ping_background,
             args=(c or rt.cardinal_instance,),
             daemon=True,
-        ).start()
+        )
+        rt.register_background_thread(t)
+        t.start()
     except Exception as ex:
         _set_telemetry_state_fields(telemetry_last_ping_error=str(ex)[:300])
         rt.logger.warning(f"TELEMETRY THREAD FAILED: {ex}")

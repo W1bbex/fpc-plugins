@@ -8,12 +8,6 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 import requests
 
-try:
-    from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
-except ImportError:
-    InlineKeyboardButton = None  # type: ignore[assignment,misc]
-    InlineKeyboardMarkup = None  # type: ignore[assignment,misc]
-
 if TYPE_CHECKING:
     from cardinal import Cardinal
 
@@ -29,8 +23,11 @@ from ..models import get_effective_funpay_status, safe_float
 from ..storage import db_orders
 from ..storage.defaults import DEFAULT_AFTER_COMPLETED_TEMPLATE
 from ..storage.storage import get_order_data, load_config, update_order_fields
+from ..tg.common import build_order_url_markup, send_tg_notification
 from .analytics import update_order_charge_and_net
 from .currency import compute_order_profit_rub, convert_to_rub, normalize_currency_code
+
+_build_order_url_markup = build_order_url_markup
 
 logger = logging.getLogger("FPC.autosmm")
 
@@ -45,7 +42,7 @@ def _send_admin_order_alert(
     """Send a manual-intervention alert for an order to the configured admin chat."""
     cfg = load_config()
     notification_chat_id = cfg.get("notification_chat_id")
-    if not notification_chat_id or rt.bot is None:
+    if not notification_chat_id:
         return False
 
     if bot_action is None:
@@ -60,12 +57,7 @@ def _send_admin_order_alert(
         f"Ссылка: https://funpay.com/orders/{order_id_funpay}/"
     )
 
-    try:
-        rt.bot.send_message(notification_chat_id, alert_text)
-        return True
-    except Exception as exc:
-        rt.logger.error(f"Не удалось отправить admin alert по заказу #{order_id_funpay}: {exc}")
-        return False
+    return send_tg_notification(notification_chat_id, alert_text)
 
 
 def _send_manual_check_alert_once(
@@ -153,7 +145,15 @@ def _fetch_start_notification_charge(
         if raw_currency not in (None, ""):
             currency = normalize_currency_code(raw_currency)
         else:
-            currency = normalize_currency_code(order_record.get("currency", "RUB"))
+            from ..core.panel_balances import get_cached_service_balance
+            srv_num = int(service_number) if service_number is not None else 1
+            srv_balance = get_cached_service_balance(srv_num)
+            panel_currency = srv_balance.get("currency")
+            if panel_currency not in (None, ""):
+                currency = normalize_currency_code(panel_currency)
+            else:
+                stored_order = get_order_data(order_id_funpay) or {}
+                currency = normalize_currency_code(stored_order.get("currency") or "RUB")
         fx_info = compute_order_profit_rub(lot_price, charge, currency)
         try:
             update_order_charge_and_net(
@@ -179,14 +179,6 @@ def _fetch_start_notification_charge(
             f"{_sanitize_secret_text(exc, api_key)}"
         )
         return None, None, None, None, None
-
-
-def _build_order_url_markup(order_url: str) -> Any:
-    if InlineKeyboardMarkup is None or InlineKeyboardButton is None:
-        return None
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("Перейти к заказу", url=order_url))
-    return kb
 
 
 def _format_order_started_text(
@@ -268,14 +260,20 @@ def send_order_started_notification(
         rt.logger.warning("Notification chat_id не задан в конфигурации.")
         return
 
-    charge, currency, spent_rub, _fx_rate, net_profit = _fetch_start_notification_charge(
-        order_id_funpay,
-        panel_order_id,
-        api_url,
-        api_key,
-        lot_price,
-        service_number,
-    )
+    try:
+        charge, currency, spent_rub, _fx_rate, net_profit = _fetch_start_notification_charge(
+            order_id_funpay,
+            panel_order_id,
+            api_url,
+            api_key,
+            lot_price,
+            service_number,
+        )
+    except Exception as fetch_ex:
+        rt.logger.warning(
+            f"Не удалось получить стоимость старта заказа #{order_id_funpay}: {fetch_ex}"
+        )
+        charge, currency, spent_rub, _fx_rate, net_profit = None, None, None, None, None
 
     try:
         stored_order = get_order_data(order_id_funpay) or {}
@@ -314,10 +312,11 @@ def send_order_started_notification(
             spent_rub=resolved_spent_rub,
             net_profit=net_profit,
         )
-        c.telegram.bot.send_message(
+        send_tg_notification(
             notification_chat_id,
             notification_text,
             reply_markup=_build_order_url_markup(order_url),
+            cardinal=c,
         )
     except Exception as exc:
         rt.logger.error(f"Ошибка при отправке уведомления о начале заказа: {exc}")
@@ -423,10 +422,7 @@ def _send_lot_match_manual_alert(order_id_funpay: Any, description: Any, resolve
             "проверьте привязки лотов вручную.",
         ]
 
-    try:
-        rt.bot.send_message(notification_chat_id, "\n".join(lines))
-    except Exception as exc:
-        rt.logger.error(f"Не удалось отправить alert по lot matching для заказа #{order_id_funpay}: {exc}")
+    send_tg_notification(notification_chat_id, "\n".join(lines))
 
 
 def _send_transport_error_after_add_alert(
@@ -443,7 +439,7 @@ def _send_transport_error_after_add_alert(
     """Alert admin chat after a transport error during panel order submission."""
     cfg = load_config()
     notification_chat_id = cfg.get("notification_chat_id")
-    if not notification_chat_id or rt.bot is None:
+    if not notification_chat_id:
         return
 
     balance_note, _risk_code = _build_transport_error_balance_note(balance_before, balance_after)
@@ -462,7 +458,4 @@ def _send_transport_error_after_add_alert(
         "Refund и резервная панель заблокированы.\n"
         "Проверьте панель вручную."
     )
-    try:
-        rt.bot.send_message(notification_chat_id, text_)
-    except Exception as exc:
-        rt.logger.error(f"Не удалось отправить transport-error alert по заказу #{order_id_funpay}: {exc}")
+    send_tg_notification(notification_chat_id, text_)

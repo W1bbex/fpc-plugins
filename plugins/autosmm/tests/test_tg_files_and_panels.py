@@ -40,6 +40,11 @@ _INSTALLED_STUB_KEYS = []
 def _ensure_telebot_stubs() -> None:
     if "telebot" in sys.modules:
         return
+    try:
+        import telebot  # noqa: F401
+        return
+    except ImportError:
+        pass
     telebot_mod = types.ModuleType("telebot")
     telebot_types_mod = types.ModuleType("telebot.types")
     telebot_types_mod.InlineKeyboardMarkup = _FakeMarkup
@@ -354,8 +359,7 @@ class TgFilesAndPanelsTests(unittest.TestCase):
             builder_spec = importlib.util.spec_from_file_location("build_autosmm_import_test", ROOT / "build.py")
             builder = importlib.util.module_from_spec(builder_spec)
             builder_spec.loader.exec_module(builder)
-            built_path = builder.build()
-            entry_path.write_text(built_path.read_text(encoding="utf-8"), encoding="utf-8")
+            builder.build(out_file=entry_path)
 
             spec = importlib.util.spec_from_file_location("_autosmm_bundle_no_side_effect_test", entry_path)
             orig_modules = dict(sys.modules)

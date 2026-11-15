@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-from ..models import normalize_api_url
+from ..models import PanelServiceConfig, normalize_api_url
 from ..storage.storage import load_config
 from .panel_errors import (
     _build_status_result_from_entry,
@@ -162,17 +162,17 @@ def _panel_api_json(
 def _extract_service_credentials(config: Any, service_number: Any) -> Tuple[Optional[str], str, Optional[str]]:
     cfg = config
     services = cfg.get("services") if isinstance(cfg, dict) else None
-    service_cfg = services.get(str(service_number)) if isinstance(services, dict) else None
-    if not isinstance(service_cfg, dict):
+    service_raw = services.get(str(service_number)) if isinstance(services, dict) else None
+    if not isinstance(service_raw, (dict, PanelServiceConfig)):
         return None, "", f"Нет настроек для service_number={service_number}"
-    raw_url = str(service_cfg.get("api_url") or "").strip()
-    if not raw_url:
+    service_cfg = PanelServiceConfig.from_dict(service_raw) if isinstance(service_raw, dict) else service_raw
+    if not service_cfg.api_url:
         return None, "", f"Не указан api_url для service_number={service_number}"
     try:
-        api_url = normalize_api_url(raw_url)
+        api_url = normalize_api_url(service_cfg.api_url)
     except ValueError as ex:
         return None, "", f"Некорректный api_url для service_number={service_number}: {ex}"
-    api_key = _normalize_api_key(service_cfg.get("api_key"))
+    api_key = _normalize_api_key(service_cfg.api_key)
     return api_url, api_key, None
 
 

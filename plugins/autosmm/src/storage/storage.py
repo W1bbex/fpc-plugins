@@ -183,24 +183,21 @@ def load_config() -> Dict[str, Any]:
     """Load auto_lots.json with automatic .bak recovery and default creation."""
     logger.debug("Загрузка конфигурации (файл настроек)...")
     with CONFIG_LOCK:
-        if not os.path.exists(rt.CONFIG_PATH):
-            logger.debug(f"Файл конфигурации {rt.CONFIG_PATH} не найден. Создаем новый файл.")
-            cfg = create_default_config()
-            save_config(cfg)
-            return cfg
-
         raw_data = None
-        try:
-            with open(rt.CONFIG_PATH, "r", encoding="utf-8") as fh:
-                file_content = fh.read()
-            if file_content.strip():
-                raw_data = json.loads(file_content)
-            else:
-                logger.error(f"Файл конфигурации {rt.CONFIG_PATH} пуст.")
-        except json.JSONDecodeError as exc:
-            logger.error(f"Ошибка при чтении JSON {rt.CONFIG_PATH}: {exc}")
-        except OSError as exc:
-            logger.error(f"Ошибка при открытии {rt.CONFIG_PATH}: {exc}")
+        if os.path.exists(rt.CONFIG_PATH):
+            try:
+                with open(rt.CONFIG_PATH, "r", encoding="utf-8") as fh:
+                    file_content = fh.read()
+                if file_content.strip():
+                    raw_data = json.loads(file_content)
+                else:
+                    logger.error(f"Файл конфигурации {rt.CONFIG_PATH} пуст.")
+            except json.JSONDecodeError as exc:
+                logger.error(f"Ошибка при чтении JSON {rt.CONFIG_PATH}: {exc}")
+            except OSError as exc:
+                logger.error(f"Ошибка при открытии {rt.CONFIG_PATH}: {exc}")
+        else:
+            logger.debug(f"Файл конфигурации {rt.CONFIG_PATH} не найден. Проверяем резервную копию.")
 
         if (not isinstance(raw_data, dict) or not raw_data) and os.path.exists(rt.CONFIG_BAK_PATH):
             try:
@@ -483,7 +480,8 @@ def reset_valid_links_to_defaults() -> List[str]:
     with CONFIG_LOCK:
         if save_valid_links(links):
             _set_valid_links_defaults_migrated()
-    return links
+            return links
+    return []
 
 
 def load_orders_data() -> List[Dict[str, Any]]:

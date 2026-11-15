@@ -224,9 +224,5 @@ def _looks_like_link_without_https(text_value: Any) -> bool:
     return _links_looks_like_link_without_https(text_value, allowed_domains=_default_allowed_domains)
 
 
-def is_valid_link(link: str) -> Tuple[bool, str]:
-    return _links_is_valid_link(link, allowed_domains=_default_allowed_domains)
-
-
 def is_valid_buyer_target(target: str) -> Tuple[bool, str]:
     return _links_is_valid_buyer_target(target, allowed_domains=_default_allowed_domains)

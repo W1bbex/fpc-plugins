@@ -27,6 +27,8 @@ def fetch_catalog(force_refresh: bool = False) -> list[dict[str, Any]]:
             if items and now - float(PLUGINS_CACHE["fetched_at"]) < CACHE_TTL_SECONDS:
                 return [dict(item) for item in items]
         PLUGINS_CACHE["last_attempt_at"] = now
+        req_gen = int(PLUGINS_CACHE.get("request_generation", 0)) + 1
+        PLUGINS_CACHE["request_generation"] = req_gen
 
     fetched = None
     try:
@@ -40,11 +42,12 @@ def fetch_catalog(force_refresh: bool = False) -> list[dict[str, Any]]:
         logger.warning("Catalog request failed", exc_info=True)
 
     with CACHE_LOCK:
-        PLUGINS_CACHE["checked_at"] = time.time()
-        PLUGINS_CACHE["error"] = fetched is None
-        if fetched is not None:
-            PLUGINS_CACHE["items"] = fetched
-            PLUGINS_CACHE["fetched_at"] = time.time()
+        if req_gen == PLUGINS_CACHE.get("request_generation"):
+            PLUGINS_CACHE["checked_at"] = time.time()
+            PLUGINS_CACHE["error"] = fetched is None
+            if fetched is not None:
+                PLUGINS_CACHE["items"] = fetched
+                PLUGINS_CACHE["fetched_at"] = time.time()
         return [dict(item) for item in PLUGINS_CACHE["items"]]
 
 

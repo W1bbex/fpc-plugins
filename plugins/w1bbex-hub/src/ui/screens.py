@@ -136,106 +136,174 @@ def render_plugins_menu(
     return card.build(), kb.build()
 
 
+def _clean_plugin_description(raw_desc: str, name: str) -> str:
+    """Strip redundant header duplicate of plugin name from description."""
+    clean = raw_desc.strip()
+    if not clean:
+        return ""
+    first, separator, rest = clean.partition("\n")
+    plain = re.sub(r"\W+", "", html.unescape(re.sub(r"<[^>]*>", "", first))).lower()
+    normalized_name = re.sub(r"\W+", "", name).lower()
+    if separator and re.fullmatch(re.escape(normalized_name) + r"(?:v?\d{1,16})?", plain):
+        return rest.lstrip("\n")
+    return clean
+
+
+def _append_description_body(card: CardBuilder, clean_desc: str, desc_mode: str, preview_limit: int) -> None:
+    """Format and append HTML or preview description to the card."""
+    if not clean_desc:
+        return
+    if desc_mode == "html":
+        safe = sanitize_telegram_html(clean_desc)
+        card.paragraph(safe) if safe != esc(clean_desc) else card.quote(safe)
+    elif desc_mode == "preview" and preview_limit > 0:
+        card.paragraph(esc(description_preview(clean_desc, preview_limit)))
+
+
+def _append_plugin_replacement_notice(card: CardBuilder, state: dict[str, Any], status: str) -> None:
+    """Append replacement warning if manual copy will be overwritten."""
+    if state["needs_restart"] or status != "manual":
+        return
+    if state["has_update"]:
+        card.paragraph("Ручная копия будет заменена установкой через Hub")
+    elif not state["installed_entry"] and (state["is_free"] or state["has_key"]):
+        card.paragraph("Ручная копия будет заменена установкой через Hub")
+
+
+def _compose_plugin_info_card(
+    state: dict[str, Any],
+    name: str,
+    icon: str,
+    desc_mode: str,
+    clean_desc: str,
+    preview_limit: int = 250,
+) -> str:
+    """Render card title, lifecycle banners, description, and replacement notices."""
+    card = CardBuilder(tg_icon(icon), name)
+    if state.get("loaded_uuid") and not state.get("loaded_enabled"):
+        card.paragraph("Отключён в Cardinal")
+    if state["needs_restart"]:
+        card.paragraph("Перезапустите Cardinal, чтобы применить изменения")
+    elif state["status_code"] == "broken_files":
+        card.paragraph("Файл загрузчика не найден · переустановите плагин")
+    elif state["has_update"]:
+        card.paragraph(f"Доступно обновление до {code(state['latest_version'])}")
+    if not state.get("catalog_known", True):
+        card.paragraph("<i>Плагина нет в текущем каталоге · показано локальное состояние</i>")
+
+    _append_description_body(card, clean_desc, desc_mode, preview_limit)
+    _append_plugin_replacement_notice(card, state, state["status_code"])
+    return card.build()
+
+
+def _build_bounded_plugin_card_text(state: dict[str, Any], expanded: bool, name: str, icon: str) -> tuple[str, str]:
+    """Render bounded info card text ensuring Telegram 4096 character limits are respected."""
+    raw_desc = str(state.get("description") or "").strip()
+    clean_desc = _clean_plugin_description(raw_desc, name)
+
+    if not clean_desc:
+        desc_mode, limit = "none", 0
+    elif expanded and len(clean_desc) > 3500:
+        desc_mode, limit = "preview", 2600
+    elif len(clean_desc) <= 3500:
+        desc_mode, limit = "html", 0
+    else:
+        desc_mode, limit = "preview", 250
+
+    rendered = _compose_plugin_info_card(state, name, icon, desc_mode, clean_desc, limit)
+    if len(rendered) > 4096 and clean_desc:
+        preview_limit = 2600 if expanded else 250
+        while preview_limit > 0:
+            rendered = _compose_plugin_info_card(state, name, icon, "preview", clean_desc, preview_limit)
+            if len(rendered) <= 4096:
+                break
+            preview_limit //= 2
+        if len(rendered) > 4096:
+            rendered = _compose_plugin_info_card(state, name, icon, "none", clean_desc, 0)
+    return rendered, clean_desc
+
+
+def _append_primary_action_buttons(kb: KeyboardBuilder, state: dict[str, Any], pid: str, latest: str, status: str, commands: list) -> None:
+    """Append restart, update, recover, or open buttons."""
+    if state["needs_restart"]:
+        kb.row(Btn("Перезапустить Cardinal", f"hub:restart:{state['restart_action']}:{pid}", style="success", icon="refresh"))
+        return
+    if state["has_update"] and (state["installed_entry"] or status == "manual"):
+        kb.row(Btn(f"Обновить до {latest}", f"hub:install:{pid}", style="success", icon="download"))
+    elif status == "broken_files":
+        kb.row(Btn("Восстановить плагин", f"hub:install:{pid}", style="primary", icon="refresh"))
+    elif status in {"active", "manual"} and state.get("loaded_enabled") and format_primary_command(commands):
+        kb.row(Btn("Открыть плагин", f"hub:open:{pid}", style="success", icon="plugin"))
+    if state["has_update"] and status == "active" and format_primary_command(commands):
+        kb.row(Btn("Открыть плагин", f"hub:open:{pid}", icon="plugin"))
+
+
+def _append_installed_entry_buttons(kb: KeyboardBuilder, state: dict[str, Any], pid: str, status: str) -> None:
+    """Append reinstall and delete buttons for installed plugins."""
+    buttons = []
+    if not state["needs_restart"] and status != "broken_files" and not state["has_update"]:
+        buttons.append(Btn("Переустановить", f"hub:install:{pid}", icon="refresh"))
+    buttons.append(Btn("Удалить", f"hub:delete_confirm:{pid}", style="danger", icon="trash"))
+    kb.row(*buttons)
+
+
+def _append_uninstalled_entry_buttons(kb: KeyboardBuilder, state: dict[str, Any], pid: str, status: str) -> None:
+    """Append install, replace manual, or trial buttons for catalog plugins."""
+    if status == "restart_delete" or (status == "manual" and state["has_update"]):
+        return
+    if state["is_free"] or state["has_key"]:
+        label = "Заменить ручную установку" if status == "manual" else "Установить плагин"
+        kb.row(Btn(label, f"hub:install:{pid}", style="success", icon="download"))
+    elif state.get("catalog_known", True):
+        kb.row(Btn("Пробный доступ", f"hub:trial:{pid}", icon="clock"),
+               Btn("Добавить ключ", "hub:activate_key", icon="key"))
+
+
+def _append_lifecycle_and_install_buttons(kb: KeyboardBuilder, state: dict[str, Any], pid: str, status: str) -> None:
+    """Append enable/disable, reinstall, delete, install, or trial buttons."""
+    uid = state.get("loaded_uuid")
+    if uid and not state["needs_restart"]:
+        enabled = bool(state.get("loaded_enabled"))
+        kb.row(Btn("Отключить" if enabled else "Включить", f"hub:plugin_{'disable' if enabled else 'enable'}:{pid}",
+                   style="danger" if enabled else "success"))
+    if state["installed_entry"]:
+        _append_installed_entry_buttons(kb, state, pid, status)
+    else:
+        _append_uninstalled_entry_buttons(kb, state, pid, status)
+
+
+def _build_plugin_info_keyboard(
+    state: dict[str, Any],
+    pid: str,
+    latest: str,
+    status: str,
+    desc: str,
+    rendered_text: str,
+    expanded: bool,
+    catalog_view: str,
+) -> InlineKeyboardMarkup:
+    """Construct complete interactive keyboard for plugin card."""
+    kb = KeyboardBuilder()
+    commands = state.get("commands") or []
+    _append_primary_action_buttons(kb, state, pid, latest, status, commands)
+    _append_lifecycle_and_install_buttons(kb, state, pid, status)
+    if desc and (len(desc) > 3500 or len(rendered_text) >= 4096):
+        kb.row(Btn("Свернуть описание" if expanded else "Полное описание", f"hub:{'info' if expanded else 'description'}:{pid}"))
+    kb.row(Btn("Диагностика", f"hub:diagnostics:{pid}", icon="info"))
+    destination = f"hub:catalog:{catalog_view}:0" if catalog_view in {"mine", "attention"} else "hub:plugins_menu"
+    kb.row(Btn("Назад", destination, style="danger", icon="back"))
+    return kb.build()
+
+
 def render_plugin_info(state: dict[str, Any], expanded: bool = False, catalog_view: str = "all") -> tuple[str, InlineKeyboardMarkup]:
     """Put status and next action above description; keep technical data opt-in."""
     pid, name = str(state["id"]), str(state["name"])
     latest, status = str(state["latest_version"]), str(state["status_code"])
     icon = "rocket" if pid.lower() == "autosmm" else "plugin"
 
-    def _compose_info_card(desc_mode: str, preview_limit: int = 250) -> tuple[str, str]:
-        card = CardBuilder(tg_icon(icon), name)
-        if state.get("loaded_uuid") and not state.get("loaded_enabled"):
-            card.paragraph("Отключён в Cardinal")
-        if state["needs_restart"]:
-            card.paragraph("Перезапустите Cardinal, чтобы применить изменения")
-        elif status == "broken_files":
-            card.paragraph("Файл загрузчика не найден · переустановите плагин")
-        elif state["has_update"]:
-            card.paragraph(f"Доступно обновление до {code(latest)}")
-        if not state.get("catalog_known", True):
-            card.paragraph("<i>Плагина нет в текущем каталоге · показано локальное состояние</i>")
-        raw_desc = str(state.get("description") or "").strip()
-        clean_desc = ""
-        if raw_desc:
-            first, separator, rest = raw_desc.partition("\n")
-            plain = re.sub(r"\W+", "", html.unescape(re.sub(r"<[^>]*>", "", first))).lower()
-            normalized_name = re.sub(r"\W+", "", name).lower()
-            if separator and re.fullmatch(re.escape(normalized_name) + r"(?:v?\d{1,16})?", plain):
-                raw_desc = rest.lstrip("\n")
-            clean_desc = raw_desc
-        if clean_desc:
-            if desc_mode == "html":
-                safe = sanitize_telegram_html(clean_desc)
-                card.paragraph(safe) if safe != esc(clean_desc) else card.quote(safe)
-            elif desc_mode == "preview" and preview_limit > 0:
-                card.paragraph(esc(description_preview(clean_desc, preview_limit)))
-        if state["needs_restart"]:
-            pass
-        elif state["has_update"] and (state["installed_entry"] or status == "manual"):
-            if status == "manual":
-                card.paragraph("Ручная копия будет заменена установкой через Hub")
-        elif status != "restart_delete" and not (status == "manual" and state["has_update"]) and not state["installed_entry"]:
-            if (state["is_free"] or state["has_key"]) and status == "manual":
-                card.paragraph("Ручная копия будет заменена установкой через Hub")
-        return card.build(), clean_desc
-
-    desc_val = str(state.get("description") or "").strip()
-    if not desc_val:
-        rendered_text, desc = _compose_info_card("none")
-    elif expanded and len(desc_val) > 3500:
-        rendered_text, desc = _compose_info_card("preview", 2600)
-    elif len(desc_val) <= 3500:
-        rendered_text, desc = _compose_info_card("html")
-    else:
-        rendered_text, desc = _compose_info_card("preview", 250)
-
-    if len(rendered_text) > 4096 and desc:
-        preview_limit = 2600 if expanded else 250
-        while preview_limit > 0:
-            rendered_text, _ = _compose_info_card("preview", preview_limit)
-            if len(rendered_text) <= 4096:
-                break
-            preview_limit = preview_limit // 2
-        if len(rendered_text) > 4096:
-            rendered_text, _ = _compose_info_card("none")
-
-    commands = state.get("commands") or []
-
-    kb = KeyboardBuilder()
-    uid = state.get("loaded_uuid")
-    if state["needs_restart"]:
-        kb.row(Btn("Перезапустить Cardinal", f"hub:restart:{state['restart_action']}:{pid}", style="success", icon="refresh"))
-    elif state["has_update"] and (state["installed_entry"] or status == "manual"):
-        kb.row(Btn(f"Обновить до {latest}", f"hub:install:{pid}", style="success", icon="download"))
-    elif status == "broken_files":
-        kb.row(Btn("Восстановить плагин", f"hub:install:{pid}", style="primary", icon="refresh"))
-    elif status in {"active", "manual"} and state.get("loaded_enabled") and format_primary_command(commands):
-        kb.row(Btn("Открыть плагин", f"hub:open:{pid}", style="success", icon="plugin"))
-    if state["has_update"] and not state["needs_restart"] and status == "active" and format_primary_command(commands):
-        kb.row(Btn("Открыть плагин", f"hub:open:{pid}", icon="plugin"))
-    if uid and not state["needs_restart"]:
-        enabled = bool(state.get("loaded_enabled"))
-        kb.row(Btn("Отключить" if enabled else "Включить", f"hub:plugin_{'disable' if enabled else 'enable'}:{pid}",
-                   style="danger" if enabled else "success"))
-    if state["installed_entry"]:
-        buttons = []
-        if not state["needs_restart"] and status != "broken_files" and not state["has_update"]:
-            buttons.append(Btn("Переустановить", f"hub:install:{pid}", icon="refresh"))
-        buttons.append(Btn("Удалить", f"hub:delete_confirm:{pid}", style="danger", icon="trash"))
-        kb.row(*buttons)
-    elif status != "restart_delete" and not (status == "manual" and state["has_update"]):
-        if state["is_free"] or state["has_key"]:
-            label = "Заменить ручную установку" if status == "manual" else "Установить плагин"
-            kb.row(Btn(label, f"hub:install:{pid}", style="success", icon="download"))
-        elif state.get("catalog_known", True):
-            kb.row(Btn("Пробный доступ", f"hub:trial:{pid}", icon="clock"),
-                   Btn("Добавить ключ", "hub:activate_key", icon="key"))
-    if desc and (len(desc) > 3500 or len(rendered_text) >= 4096):
-        kb.row(Btn("Свернуть описание" if expanded else "Полное описание", f"hub:{'info' if expanded else 'description'}:{pid}"))
-    kb.row(Btn("Диагностика", f"hub:diagnostics:{pid}", icon="info"))
-    destination = f"hub:catalog:{catalog_view}:0" if catalog_view in {"mine", "attention"} else "hub:plugins_menu"
-    kb.row(Btn("Назад", destination, style="danger", icon="back"))
-    return rendered_text, kb.build()
+    rendered_text, desc = _build_bounded_plugin_card_text(state, expanded, name, icon)
+    markup = _build_plugin_info_keyboard(state, pid, latest, status, desc, rendered_text, expanded, catalog_view)
+    return rendered_text, markup
 
 
 def render_plugin_diagnostics(state: dict[str, Any]) -> tuple[str, InlineKeyboardMarkup]:
@@ -273,3 +341,60 @@ def render_environment(sys_info: dict[str, str]) -> tuple[str, InlineKeyboardMar
     card.tree(None, [f"Hub: {code(VERSION)}", f"ОС: {esc(sys_info.get('os', 'неизвестно'))}",
                      f"Python: {esc(sys_info.get('python_version', 'неизвестно'))}"])
     return card.build(), KeyboardBuilder().row(Btn("Настройки", "hub:settings", icon="back")).build()
+
+
+def render_check_interval(enabled: bool, interval: int) -> tuple[str, InlineKeyboardMarkup]:
+    card = CardBuilder(tg_icon("refresh"), "Частота проверки обновлений")
+    card.paragraph(f"Сейчас: каждые {esc(interval)} мин" if enabled else "Сейчас: не проверять автоматически")
+    card.paragraph("Выберите интервал или укажите свой: от 5 до 10 080 минут")
+    kb = KeyboardBuilder()
+    for options in ((30, 60), (360, 1440)):
+        labels = {30: "30 минут", 60: "1 час", 360: "6 часов", 1440: "24 часа"}
+        kb.row(*(Btn(labels[value], f"hub:set_interval:{value}", style="success" if enabled and interval == value else "primary") for value in options))
+    kb.row(Btn("Свой интервал", "hub:custom_interval", icon="settings"))
+    kb.row(Btn("Не проверять", "hub:set_interval:0", style="danger"))
+    kb.row(Btn("Назад", "hub:settings", icon="back"))
+    return card.build(), kb.build()
+
+
+def render_custom_interval_prompt() -> tuple[str, InlineKeyboardMarkup]:
+    text = "Введите интервал проверки в минутах: от <b>5</b> до <b>10 080</b>. Для отмены нажмите кнопку ниже или отправьте «отмена»."
+    kb = KeyboardBuilder().row(Btn("Отмена", "hub:check_interval")).build()
+    return text, kb
+
+
+def render_check_updates_in_progress() -> tuple[str, InlineKeyboardMarkup]:
+    card = CardBuilder(tg_icon("refresh"), "Проверка обновлений")
+    card.paragraph("Проверяем Hub и установленные плагины…")
+    kb = KeyboardBuilder().row(Btn("Назад", "hub:settings", icon="back")).build()
+    return card.build(), kb
+
+
+def render_check_updates_result(
+    latest: Optional[str],
+    newer: bool,
+    available: bool,
+    updates: list[dict[str, Any]],
+) -> tuple[str, InlineKeyboardMarkup]:
+    result = CardBuilder(tg_icon("refresh"), "Проверка обновлений")
+    result.paragraph("Hub: " + (f"доступна версия <b>{esc(latest)}</b>" if newer else "последняя версия установлена" if latest else "не удалось проверить"))
+    if not available:
+        result.paragraph("Плагины: не удалось проверить каталог")
+    elif updates:
+        result.paragraph("Доступны обновления плагинов:\n" + "\n".join(f"• {esc(s['name'])}: {esc(s['latest_version'])}" for s in updates[:20]))
+    else:
+        result.paragraph("Плагины: обновлений не найдено")
+    kb = KeyboardBuilder()
+    if newer:
+        kb.row(Btn("Что нового в Hub", "hub:update_hub", style="primary", icon="info"))
+    if updates:
+        kb.row(Btn("Обновления плагинов", "hub:catalog:attention:0", style="primary", icon="apps"))
+    kb.row(Btn("Назад", "hub:settings", style="danger", icon="back"))
+    return result.build(), kb.build()
+
+
+def render_check_updates_error() -> tuple[str, InlineKeyboardMarkup]:
+    result = CardBuilder(tg_icon("alert"), "Не удалось проверить обновления")
+    result.paragraph("Повторите попытку позже")
+    kb = KeyboardBuilder().row(Btn("Назад", "hub:settings", icon="back")).build()
+    return result.build(), kb

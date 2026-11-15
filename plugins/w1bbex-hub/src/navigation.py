@@ -15,11 +15,11 @@ from .release_notes import fetch_release_notes
 from .runtime import VERSION, STOP_EVENT, logger
 from .transport import _is_authorized
 from .ui.outcomes import render_hub_release
-from .ui.kit import Btn, CardBuilder, KeyboardBuilder, esc
-from .ui.icons import tg_icon
 from .ui import (
-    render_environment, render_licenses, render_main_menu, render_plugin_diagnostics,
-    render_plugin_info, render_plugins_menu, render_settings,
+    render_check_interval, render_check_updates_error, render_check_updates_in_progress,
+    render_check_updates_result, render_custom_interval_prompt, render_environment,
+    render_licenses, render_main_menu, render_plugin_diagnostics, render_plugin_info,
+    render_plugins_menu, render_settings,
 )
 
 
@@ -92,6 +92,14 @@ class HubNavigation:
                 return False
             in_flight.add(key)
             return True
+
+    def _is_action_in_flight(self, key: str) -> bool:
+        lock = vars(self).get("_actions_lock")
+        in_flight = vars(self).get("_in_flight_actions")
+        if lock is None or in_flight is None:
+            return False
+        with lock:
+            return key in in_flight
 
     def _end_action(self, key: str) -> None:
         lock = vars(self).get("_actions_lock")
@@ -286,17 +294,7 @@ class HubNavigation:
     def _build_check_interval_card(data: dict[str, Any]) -> tuple[str, Any]:
         enabled = bool(data.get("auto_check_updates", True))
         interval = _valid_interval(data)
-        card = CardBuilder(tg_icon("refresh"), "Частота проверки обновлений")
-        card.paragraph(f"Сейчас: каждые {esc(interval)} мин" if enabled else "Сейчас: не проверять автоматически")
-        card.paragraph("Выберите интервал или укажите свой: от 5 до 10 080 минут")
-        kb = KeyboardBuilder()
-        for options in ((30, 60), (360, 1440)):
-            labels = {30: "30 минут", 60: "1 час", 360: "6 часов", 1440: "24 часа"}
-            kb.row(*(Btn(labels[value], f"hub:set_interval:{value}", style="success" if enabled and interval == value else "primary") for value in options))
-        kb.row(Btn("Свой интервал", "hub:custom_interval", icon="settings"))
-        kb.row(Btn("Не проверять", "hub:set_interval:0", style="danger"))
-        kb.row(Btn("Назад", "hub:settings", icon="back"))
-        return card.build(), kb.build()
+        return render_check_interval(enabled, interval)
 
     def check_interval_menu(self, callback: Any) -> None:
         text, markup = self._build_check_interval_card(load_data())
@@ -324,10 +322,10 @@ class HubNavigation:
         return self.check_interval_menu(callback)
 
     def custom_interval_prompt(self, callback: Any) -> None:
-        prompt_kb = KeyboardBuilder().row(Btn("Отмена", "hub:check_interval")).build()
+        text, prompt_kb = render_custom_interval_prompt()
         msg = self._send_html(
             callback.message.chat.id,
-            "Введите интервал проверки в минутах: от <b>5</b> до <b>10 080</b>. Для отмены нажмите кнопку ниже или отправьте «отмена».",
+            text,
             reply_markup=prompt_kb,
         )
         self._set_hub_state(
@@ -403,57 +401,44 @@ class HubNavigation:
         action_key = f"check_updates:{chat}:{message}"
         if not self._try_begin_action(action_key):
             return self._alert(callback, "Проверка обновлений уже выполняется")
-        background = self._menu_background
-        with background.lock:
-            background.serial += 1
-            serial = background.serial
-            background.views[(chat, message)] = serial
-        card = CardBuilder(tg_icon("refresh"), "Проверка обновлений")
-        card.paragraph("Проверяем Hub и установленные плагины…")
-        self._edit_html(card.build(), chat, message, reply_markup=KeyboardBuilder().row(Btn("Назад", "hub:settings", icon="back")).build())
-
-        def check() -> None:
-            try:
-                latest, _ = fetch_release_notes()
-                states, _ = self._states(force_refresh=True)
-                available = catalog_status()["available"]
-                newer = bool(latest and is_newer_version(latest, VERSION))
-                updates = [state for state in states if state.get("has_update") and not state.get("needs_restart")] if available else []
-                result = CardBuilder(tg_icon("refresh"), "Проверка обновлений")
-                result.paragraph("Hub: " + (f"доступна версия <b>{esc(latest)}</b>" if newer else "последняя версия установлена" if latest else "не удалось проверить"))
-                if not available:
-                    result.paragraph("Плагины: не удалось проверить каталог")
-                elif updates:
-                    result.paragraph("Доступны обновления плагинов:\n" + "\n".join(f"• {esc(s['name'])}: {esc(s['latest_version'])}" for s in updates[:20]))
-                else:
-                    result.paragraph("Плагины: обновлений не найдено")
-                kb = KeyboardBuilder()
-                if newer:
-                    kb.row(Btn("Что нового в Hub", "hub:update_hub", style="primary", icon="info"))
-                if updates:
-                    kb.row(Btn("Обновления плагинов", "hub:catalog:attention:0", style="primary", icon="apps"))
-                kb.row(Btn("Назад", "hub:settings", style="danger", icon="back"))
-                if latest:
-                    with background.lock:
-                        background.version = (latest, newer)
-                        background.checked = time.monotonic()
-                body, markup = result.build(), kb.build()
-            except Exception:
-                logger.exception("Manual update check failed")
-                result = CardBuilder(tg_icon("alert"), "Не удалось проверить обновления")
-                result.paragraph("Повторите попытку позже")
-                body, markup = result.build(), KeyboardBuilder().row(Btn("Назад", "hub:settings", icon="back")).build()
-            finally:
-                self._end_action(action_key)
+        try:
+            background = self._menu_background
             with background.lock:
-                should_edit = not STOP_EVENT.is_set() and background.views.get((chat, message)) == serial
-            if should_edit:
-                try:
-                    self._edit_html(body, chat, message, reply_markup=markup)
-                except Exception:
-                    logger.exception("Failed displaying manual update check")
+                background.serial += 1
+                serial = background.serial
+                background.views[(chat, message)] = serial
+            card_text, card_markup = render_check_updates_in_progress()
+            self._edit_html(card_text, chat, message, reply_markup=card_markup)
 
-        threading.Thread(target=check, name="hub-manual-update-check", daemon=True).start()
+            def check() -> None:
+                try:
+                    latest, _ = fetch_release_notes()
+                    states, _ = self._states(force_refresh=True)
+                    available = catalog_status()["available"]
+                    newer = bool(latest and is_newer_version(latest, VERSION))
+                    updates = [state for state in states if state.get("has_update") and not state.get("needs_restart")] if available else []
+                    body, markup = render_check_updates_result(latest, newer, available, updates)
+                    if latest:
+                        with background.lock:
+                            background.version = (latest, newer)
+                            background.checked = time.monotonic()
+                except Exception:
+                    logger.exception("Manual update check failed")
+                    body, markup = render_check_updates_error()
+                finally:
+                    self._end_action(action_key)
+                with background.lock:
+                    should_edit = not STOP_EVENT.is_set() and background.views.get((chat, message)) == serial
+                if should_edit:
+                    try:
+                        self._edit_html(body, chat, message, reply_markup=markup)
+                    except Exception:
+                        logger.exception("Failed displaying manual update check")
+
+            threading.Thread(target=check, name="hub-manual-update-check", daemon=True).start()
+        except Exception:
+            self._end_action(action_key)
+            raise
 
     def environment_menu(self, callback: Any) -> None:
         text, markup = render_environment(hub_api.get_sys_info())

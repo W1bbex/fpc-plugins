@@ -96,10 +96,19 @@ def auto_smm_delete(message: types.Message) -> None:
     except Exception as ex:
         rt.logger.warning(f"Не удалось отправить аварийный бэкап пользователю: {ex}")
 
-    wipe_all_autosmm_data()
+    removed, failed = wipe_all_autosmm_data()
 
     filename = os.path.basename(backup_path)
-    txt = f"✅ Данные AutoSMM очищены.\n\nПеред очисткой создан аварийный бэкап:\n<code>{h(filename)}</code>\n\nРекомендуется перезапустить Cardinal."
+    if failed:
+        failed_names = ", ".join(os.path.basename(f) for f in failed)
+        txt = (
+            f"⚠️ Данные AutoSMM частично очищены (удалено файлов: {removed}).\n\n"
+            f"Не удалось удалить занятые файлы:\n<code>{h(failed_names)}</code>\n\n"
+            f"Перед очисткой создан аварийный бэкап:\n<code>{h(filename)}</code>\n\n"
+            f"Остановите или перезапустите Cardinal, чтобы освободить заблокированные файлы."
+        )
+    else:
+        txt = f"✅ Данные AutoSMM очищены.\n\nПеред очисткой создан аварийный бэкап:\n<code>{h(filename)}</code>\n\nРекомендуется перезапустить Cardinal."
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("◀️ В меню", callback_data="asmm:return_to_settings"))
     rt.bot.send_message(message.chat.id, txt, reply_markup=kb, parse_mode="HTML")

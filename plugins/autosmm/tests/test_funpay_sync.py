@@ -737,19 +737,24 @@ class TelegramFileUploadStateTests(unittest.TestCase):
             document=SimpleNamespace(file_id="valid"),
         )
 
+        def _restore_side_effect(payload):
+            if not isinstance(payload, dict):
+                return False, "Файл не похож на полный бэкап AutoSMM."
+            return True, "✅ Бэкап восстановлен"
+
         with (
             mock.patch.object(rt, "cardinal_instance", SimpleNamespace(telegram=fake_tg)),
             mock.patch.object(rt, "bot", fake_bot),
-            mock.patch.object(tg_files, "_restore_backup_wrapper", return_value=(True, "✅ Бэкап восстановлен")) as restore_mock,
+            mock.patch.object(tg_files, "_restore_backup_wrapper", side_effect=_restore_side_effect) as restore_mock,
         ):
             tg_files.restore_backup_prompt(call)
             self.assertEqual(states.get((100, 42)), tg_common.STATE_RESTORE_BACKUP)
 
-            # JSON list instead of backup dict must be rejected by restore wrapper or handled cleanly without crash.
+            # JSON list instead of backup dict must be rejected by restore wrapper with error message.
             tg_files.handle_backup_restore_upload(msg_list_payload)
             self.assertNotIn((100, 42), states)
             restore_mock.assert_called_once_with(["lot_mapping"])
-            self.assertIn("Бэкап восстановлен", sent_messages[-1][1])
+            self.assertIn("не похож на полный бэкап", sent_messages[-1][1])
             restore_mock.reset_mock()
 
             # Unauthorized user must be blocked even if called directly.
