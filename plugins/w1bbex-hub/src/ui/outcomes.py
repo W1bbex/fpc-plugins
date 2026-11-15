@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Union
 from telebot.types import InlineKeyboardMarkup
 from ..runtime import DEFAULT_CHANNEL_URL, GITHUB_URL, SUPPORT_URL
 from .formatters import format_command_lines, format_primary_command, mask_key
 from .icons import tg_icon
 from .kit import Btn, CardBuilder, KeyboardBuilder, bold, code, esc
+
+if TYPE_CHECKING:
+    from ..core import PluginUpdateDTO
 
 
 def render_delete_confirm(state: dict[str, Any]) -> tuple[str, InlineKeyboardMarkup]:
@@ -376,7 +379,7 @@ def render_restart_in_progress() -> str:
 
 
 def render_update_notification(
-    update: dict[str, Any],
+    update: Union[dict[str, Any], "PluginUpdateDTO"],
     notify_enabled: bool = True,
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Render a release notification with the correct Hub or plugin update action."""

@@ -83,22 +83,34 @@ def restore_snapshot(
 ) -> bool:
     """Replace orders and optional kv_state atomically from a snapshot."""
     ts_now = rt.now_str()
+    orders_list = list(orders or [])
+    params_list = []
+    for idx, item in enumerate(orders_list):
+        if not isinstance(item, Mapping):
+            raise ValueError(
+                f"Invalid order entry in snapshot at index {idx}: expected mapping, got {type(item).__name__}"
+            )
+        prepared = _prepare_order_params(item)
+        if prepared is None:
+            raise ValueError(f"Order entry at index {idx} missing required fields (order_id): {item!r}")
+        params_list.append(prepared)
+
+    rows_to_write = None
+    if state is not None:
+        if not isinstance(state, Mapping):
+            raise ValueError(f"Invalid state entry in snapshot: expected mapping, got {type(state).__name__}")
+        rows_to_write = [
+            (str(key), json.dumps(value, ensure_ascii=False), ts_now)
+            for key, value in state.items()
+        ]
+
     with _connect(db_path) as conn:
         conn.execute("DELETE FROM orders")
-        params_list = [
-            prepared
-            for item in (orders or [])
-            if isinstance(item, Mapping) and (prepared := _prepare_order_params(item)) is not None
-        ]
         if params_list:
             conn.executemany(_UPSERT_ORDER_SQL, params_list)
 
-        if state is not None:
+        if rows_to_write is not None:
             conn.execute("DELETE FROM kv_state")
-            rows_to_write = [
-                (str(key), json.dumps(value, ensure_ascii=False), ts_now)
-                for key, value in state.items()
-            ]
             if rows_to_write:
                 conn.executemany(
                     "INSERT INTO kv_state (key, value_json, updated_at) VALUES (?, ?, ?)",

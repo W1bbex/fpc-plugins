@@ -30,7 +30,7 @@ from src.core import (
     refunds,
 )
 from src.services import analytics, currency, notifications
-from src.storage import db, db_orders, storage
+from src.storage import backups, db, db_orders, db_state, storage
 from src.tg import files, lot_editor, panels, settings, templates
 
 
@@ -1540,6 +1540,127 @@ class AutoSmmRegressionsTests(unittest.TestCase):
         serialized = dto.to_dict()
         self.assertEqual(serialized["order_id"], "ORD-99")
         self.assertEqual(serialized["quantity"], 100)
+
+    def test_funpay_check_timeout_halts_panel_order_creation_and_notifies_buyer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "autosmm.db"
+            with mock.patch.object(rt, "DB_PATH", str(db_path)):
+                storage.save_orders_data([
+                    {
+                        "order_id": "FPFAIL1",
+                        "chat_id": 999,
+                        "buyer_username": "buyer99",
+                        "status": "pending",
+                        "funpay_status": "open",
+                        "service_number": 1,
+                        "lot_title": "Test Lot",
+                    }
+                ])
+                sent_buyer_messages = []
+                fake_cardinal = SimpleNamespace(
+                    account=SimpleNamespace(
+                        get_order=mock.MagicMock(side_effect=requests.exceptions.Timeout("FunPay timeout"))
+                    ),
+                    send_message=lambda chat_id, text: sent_buyer_messages.append((chat_id, text)),
+                )
+
+                with mock.patch("src.core.panel_submission.send_order_to_service") as mock_panel_api:
+                    with mock.patch("src.core.panel_submission.load_config", return_value={"fallback_enabled": False}):
+                        panel_submission.process_link_without_confirmation(
+                            fake_cardinal,
+                            {
+                                "order_id_funpay": "FPFAIL1",
+                                "chat_id": 999,
+                                "buyer_id": "buyer99",
+                                "buyer_username": "buyer99",
+                                "link": "https://t.me/testchannel",
+                                "service_id": 10,
+                                "service_number": 1,
+                                "real_amount": 100,
+                                "price": 50.0,
+                            },
+                        )
+
+                # SMM Panel API must NOT be called when FunPay check fails
+                mock_panel_api.assert_not_called()
+
+                # Buyer must be notified about temporary verification issue
+                self.assertTrue(any(999 == cid and "временно недоступен" in txt for cid, txt in sent_buyer_messages))
+
+                # Order must NOT be marked as refunded in SQLite
+                fresh = storage.get_order_data("FPFAIL1")
+                self.assertNotEqual(fresh.get("buyer_flow_state"), engine.BUYER_STATE_REFUNDED)
+                self.assertEqual(fresh.get("status"), "pending")
+
+    def test_corrupt_v2_backup_rejected_by_validation_and_does_not_wipe_db(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "autosmm.db"
+            with mock.patch.object(rt, "DB_PATH", str(db_path)):
+                storage.save_orders_data([
+                    {
+                        "order_id": "EXISTING1",
+                        "chat_id": 111,
+                        "status": "pending",
+                        "funpay_status": "open",
+                    }
+                ])
+                corrupt_payload = {
+                    "autosmm_backup_version": 2,
+                    "orders": [None, {"status": "pending"}],
+                    "state": {},
+                    "files": {},
+                }
+
+                # 1. Validation upfront must reject corrupt orders list
+                ok, err = backups._validate_backup_wrapper(corrupt_payload)
+                self.assertFalse(ok)
+                self.assertIn("некорректная запись заказа", err)
+
+                # 2. db_state.restore_snapshot must raise ValueError without deleting existing orders
+                with self.assertRaises(ValueError):
+                    db_state.restore_snapshot(
+                        orders=[None, {"status": "pending"}],
+                        state={},
+                        db_path=str(db_path),
+                    )
+
+                # Verify SQLite orders were untouched
+                remaining = storage.load_orders_data()
+                self.assertEqual(len(remaining), 1)
+                self.assertEqual(remaining[0]["order_id"], "EXISTING1")
+
+    def test_storage_typed_order_records_and_dto_mapping(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "autosmm.db"
+            with mock.patch.object(rt, "DB_PATH", str(db_path)):
+                storage.save_orders_data([
+                    {
+                        "order_id": "REC1",
+                        "buyer_username": "buyer_rec",
+                        "service_number": 2,
+                        "quantity": 250,
+                        "status": "in_progress",
+                        "panel_order_id": 7777,
+                    }
+                ])
+
+                rec = storage.get_order_record("REC1")
+                self.assertIsNotNone(rec)
+                self.assertIsInstance(rec, models.OrderRecord)
+                self.assertEqual(rec.order_id, "REC1")
+                self.assertEqual(rec.service_number, 2)
+                self.assertEqual(rec.quantity, 250)
+                self.assertEqual(rec.panel_order_id, 7777)
+
+                dto = rec.to_dto()
+                self.assertIsInstance(dto, models.SmmOrderDTO)
+                self.assertEqual(dto.order_id, "REC1")
+                self.assertEqual(dto.quantity, 250)
+                self.assertEqual(dto.panel_order_id, 7777)
+
+                records = storage.list_order_records()
+                self.assertEqual(len(records), 1)
+                self.assertIsInstance(records[0], models.OrderRecord)
 
 
 if __name__ == "__main__":

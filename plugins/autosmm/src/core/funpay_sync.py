@@ -42,6 +42,35 @@ from .links import normalize_incoming_text
 from .refunds import _attempt_panel_cancel_after_funpay_refund
 
 BUYER_REFUND_BLOCK_TEXT = "По этому заказу оформлен возврат.\nАвтоматическое выполнение недоступно."
+BUYER_FUNPAY_UNAVAILABLE_TEXT = (
+    "⏳ Не удалось проверить статус заказа на FunPay (сервис временно недоступен).\n"
+    "Пожалуйста, повторите попытку через 1-2 минуты."
+)
+
+
+class RefundGateResult:
+    """Tri-state result of refund gating: OK (proceed), REFUNDED (abort), or ERROR (check failed)."""
+
+    __slots__ = ("blocked", "status", "error")
+
+    def __init__(self, blocked: bool, status: str = "ok", error: Optional[str] = None) -> None:
+        self.blocked = bool(blocked)
+        self.status = str(status)  # "ok", "refunded", "error"
+        self.error = error
+
+    @property
+    def is_refunded(self) -> bool:
+        return self.status == "refunded"
+
+    @property
+    def is_error(self) -> bool:
+        return self.status == "error"
+
+    def __bool__(self) -> bool:
+        return self.blocked
+
+    def __repr__(self) -> str:
+        return f"RefundGateResult(blocked={self.blocked}, status={self.status!r}, error={self.error!r})"
 
 FUNPAY_STATUS_SYNC_INTERVAL_SECONDS = 1800
 FUNPAY_STATUS_RECENT_CHECK_SECONDS = 1800
@@ -324,8 +353,16 @@ def _parse_fetched_order_status(order_data: Any, order_id_funpay: str) -> Dict[s
 
 def _fetch_funpay_status_via_cardinal(c: "Cardinal", order_id_funpay: str) -> Dict[str, Any]:
     """Fetch current FunPay order status via Cardinal account client."""
+    account = getattr(c, "account", None)
+    get_order_fn = getattr(account, "get_order", None)
+    if not callable(get_order_fn):
+        return {
+            "ok": False,
+            "error": "cardinal_client_unavailable",
+            "detail": "c.account.get_order is not available",
+        }
     try:
-        order_data = c.account.get_order(order_id_funpay)
+        order_data = get_order_fn(order_id_funpay)
         return _parse_fetched_order_status(order_data, order_id_funpay)
     except Exception as ex:
         return {"ok": False, "error": "cardinal_error", "detail": str(ex)}
@@ -385,10 +422,16 @@ def _refresh_funpay_status_for_order(
     latest_order = get_order_data(order_id_funpay) or dict(order_record)
 
     if not force_check and not _funpay_status_needs_recheck(latest_order, FUNPAY_STATUS_RECENT_CHECK_SECONDS):
-        return latest_order
+        cached = dict(latest_order)
+        cached["_funpay_check_ok"] = True
+        return cached
 
-    if c is None:
-        return latest_order
+    account = getattr(c, "account", None)
+    get_order_fn = getattr(account, "get_order", None)
+    if c is None or not callable(get_order_fn):
+        cached = dict(latest_order)
+        cached["_funpay_check_ok"] = None
+        return cached
 
     result = _fetch_funpay_status_via_cardinal(c, order_id_funpay)
     checked_at = rt.now_str()
@@ -399,9 +442,12 @@ def _refresh_funpay_status_for_order(
             f"FUNPAY STATUS REFRESH FAILED: order=#{order_id_funpay}, "
             f"error={result.get('error')}, detail={result.get('detail')}"
         )
-        return latest_order
+        failed_copy = dict(latest_order)
+        failed_copy["_funpay_check_ok"] = False
+        failed_copy["_funpay_check_error"] = str(result.get("error") or "fetch_failed")
+        return failed_copy
 
-    return _apply_funpay_status_update(
+    updated = _apply_funpay_status_update(
         order_id_funpay,
         latest_order,
         str(result.get("funpay_status") or ""),
@@ -410,6 +456,9 @@ def _refresh_funpay_status_for_order(
         refund_source="refund_gate_refresh",
         swallow_save_error=True,
     )
+    if isinstance(updated, dict):
+        updated["_funpay_check_ok"] = True
+    return updated
 
 
 def _apply_refund_gate(
@@ -417,17 +466,15 @@ def _apply_refund_gate(
     order_record: Optional[Dict],
     notify_chat_id: Optional[int] = None,
     force_check: bool = False,
-) -> bool:
-    """Return True and stop further buyer flow when the FunPay order is refunded."""
+    block_on_error: bool = False,
+) -> RefundGateResult:
+    """Evaluate FunPay refund status. Return RefundGateResult (falsy if OK to proceed, truthy if blocked)."""
     if not isinstance(order_record, dict):
-        return False
+        return RefundGateResult(blocked=False, status="ok")
 
     latest_order = _refresh_funpay_status_for_order(c, order_record, force_check=force_check)
     if not isinstance(latest_order, dict) or not latest_order:
         latest_order = order_record
-
-    if not _is_order_refundedish(latest_order):
-        return False
 
     order_id_funpay = str(
         latest_order.get("order_id")
@@ -436,6 +483,26 @@ def _apply_refund_gate(
         or order_record.get("order_id_funpay")
         or ""
     ).strip().lstrip("#")
+
+    # If FunPay status could not be verified and caller requested strict blocking, do not proceed with paid submission
+    if block_on_error and latest_order.get("_funpay_check_ok") is False:
+        rt.logger.warning(
+            f"REFUND GATE BLOCKED ON ERROR: order=#{order_id_funpay}, "
+            f"error={latest_order.get('_funpay_check_error')}"
+        )
+        if notify_chat_id is not None and c is not None:
+            try:
+                _send_buyer_message(c, notify_chat_id, BUYER_FUNPAY_UNAVAILABLE_TEXT)
+            except Exception as ex:
+                rt.logger.warning(f"REFUND GATE NOTIFY FAILED: order=#{order_id_funpay}, error={ex}")
+        return RefundGateResult(
+            blocked=True,
+            status="error",
+            error=str(latest_order.get("_funpay_check_error") or "fetch_failed"),
+        )
+
+    if not _is_order_refundedish(latest_order):
+        return RefundGateResult(blocked=False, status="ok")
 
     if order_id_funpay:
         try:
@@ -456,7 +523,7 @@ def _apply_refund_gate(
         except Exception as ex:
             rt.logger.warning(f"REFUND GATE NOTIFY FAILED: order=#{order_id_funpay}, error={ex}")
 
-    return True
+    return RefundGateResult(blocked=True, status="refunded")
 
 
 def _funpay_status_needs_recheck(order_record: Dict, min_age_seconds: int) -> bool:

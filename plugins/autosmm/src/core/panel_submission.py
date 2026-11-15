@@ -19,6 +19,7 @@ from ..storage.storage import (
     ORDERS_LOCK,
     claim_order_for_panel_submission,
     get_order_data,
+    get_order_record,
     load_config,
     update_order_fields,
     upsert_order_data,
@@ -275,7 +276,8 @@ def _finalize_created_order(
     except Exception as balance_ex:
         rt.logger.debug(f"Не удалось запустить обновление баланса панели #{service_number}: {balance_ex}")
 
-    latest_after_save = get_order_data(order_id_funpay)
+    latest_record = get_order_record(order_id_funpay)
+    latest_after_save = latest_record.to_dict() if latest_record else get_order_data(order_id_funpay)
     if latest_after_save and _is_order_refundedish(latest_after_save):
         rt.logger.warning(
             f"CONCURRENT REFUND DETECTED AFTER PANEL ADD: order=#{order_id_funpay}, panel_order_id={panel_order_id}"
@@ -617,10 +619,19 @@ def process_link_without_confirmation(c: "Cardinal", data: Dict) -> None:
     fallback_enabled = bool(cfg.get("fallback_enabled", False))
     with rt.get_order_lock(order_id_str):
         existing_order = get_order_data(order_id_str)
+        target_order = existing_order or {"order_id": order_id_str}
 
-        if existing_order and _apply_refund_gate(c, existing_order, notify_chat_id=buyer_chat_id, force_check=True):
-            with rt.CONTEXT_LOCK:
-                rt.waiting_for_link.pop(order_id_str, None)
+        gate_res = _apply_refund_gate(
+            c,
+            target_order,
+            notify_chat_id=buyer_chat_id,
+            force_check=True,
+            block_on_error=True,
+        )
+        if gate_res:
+            if getattr(gate_res, "is_refunded", False):
+                with rt.CONTEXT_LOCK:
+                    rt.waiting_for_link.pop(order_id_str, None)
             return
         if existing_order and _has_panel_order(existing_order):
             with rt.CONTEXT_LOCK:

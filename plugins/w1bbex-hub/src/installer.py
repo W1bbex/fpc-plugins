@@ -201,6 +201,9 @@ class _InstallRollbackContext:
     archived_legacy_pairs: list[tuple[str, str]] = field(default_factory=list)
     wrote_save: bool = False
     wrote_loader: bool = False
+    plugin_name: Optional[str] = None
+    prev_installed_entry: Optional[dict[str, Any]] = None
+    persisted_installed: bool = False
 
     def _rollback_files(self) -> None:
         """Restore previous loader and binary files if modified."""
@@ -236,9 +239,35 @@ class _InstallRollbackContext:
             except OSError:
                 logger.warning("Rollback failed to restore legacy plugin %s from %s", orig_path, archived_dest, exc_info=True)
 
+    def _rollback_metadata(self) -> None:
+        """Restore previous installed record in config if modified."""
+        if not self.persisted_installed or not self.plugin_name:
+            return
+        target_name = self.plugin_name
+        prev_entry = (
+            dict(self.prev_installed_entry)
+            if isinstance(self.prev_installed_entry, dict) and self.prev_installed_entry
+            else None
+        )
+        try:
+            def _restore_fn(d: dict[str, Any]) -> None:
+                installed = d.setdefault("installed", {})
+                if not isinstance(installed, dict):
+                    return
+                if prev_entry:
+                    installed[target_name] = prev_entry
+                else:
+                    installed.pop(target_name, None)
+
+            update_data(_restore_fn)
+            logger.info("Rolled back installed metadata for plugin %s", target_name)
+        except OSError:
+            logger.warning("Rollback failed for installed metadata %s", target_name, exc_info=True)
+
     def rollback(self) -> None:
-        """Rollback all filesystem modifications under the installation lock."""
+        """Rollback all filesystem modifications and metadata under the installation lock."""
         with PLUGIN_FS_LOCK:
+            self._rollback_metadata()
             self._rollback_files()
             self._rollback_candidates_and_legacy()
 
@@ -483,6 +512,9 @@ def _commit_installed_plugin(
             ctx,
         )
 
+        ctx.plugin_name = plugin_name
+        ctx.prev_installed_entry = dict(old_entry) if isinstance(old_entry, dict) and old_entry else None
+
         _persist_installed_record(
             plugin_name,
             plugin_label,
@@ -492,6 +524,7 @@ def _commit_installed_plugin(
             plugin_info,
             old_entry,
         )
+        ctx.persisted_installed = True
 
         clean_old_plugin(plugin_name, new_stub_path=loader_path, old_stub_path=old_stub)
         if old_bin_dir and os.path.normcase(os.path.abspath(old_bin_dir)) != os.path.normcase(
@@ -552,7 +585,7 @@ def download_plugin(
             api_desc,
             ctx,
         )
-    except OSError as exc:
+    except Exception as exc:
         ctx.rollback()
         if isinstance(exc, PermissionError):
             logger.exception("Plugin binary locked during reinstall of %s", plugin_name)

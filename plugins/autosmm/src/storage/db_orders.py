@@ -11,6 +11,8 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 from .. import runtime as rt
 from ..models import (
     BuyerFlowState,
+    OrderRecord,
+    SmmOrderDTO,
     extract_progress_values,
     get_effective_funpay_status,
     is_refunded_funpay_status,
@@ -318,6 +320,25 @@ def list_orders(
     with _connect(db_path, read_only=True) as conn:
         rows = conn.execute(sql, params).fetchall()
         return [_row_to_order_dict(row) for row in rows]
+
+
+def get_order_record(order_id: str, db_path: Optional[str] = None) -> Optional[OrderRecord]:
+    """Fetch a single order and return a strongly typed OrderRecord."""
+    data = get_order(order_id, db_path=db_path)
+    return OrderRecord.from_dict(data) if data is not None else None
+
+
+def list_order_records(
+    db_path: Optional[str] = None,
+    *,
+    status: Optional[str] = None,
+    exclude_statuses: Optional[Iterable[str]] = None,
+) -> List[OrderRecord]:
+    """Return orders as strongly typed OrderRecords."""
+    return [
+        OrderRecord.from_dict(d)
+        for d in list_orders(db_path=db_path, status=status, exclude_statuses=exclude_statuses)
+    ]
 
 
 def replace_all_orders(orders: Iterable[Mapping[str, Any]], db_path: Optional[str] = None) -> bool:

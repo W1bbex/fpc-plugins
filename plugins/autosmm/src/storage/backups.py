@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import sqlite3
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 import uuid
 
 from .. import runtime as rt
@@ -179,11 +179,37 @@ def _validate_backup_wrapper(payload: Any) -> Tuple[bool, str]:
         if "lot_mapping" in cfg_payload and not isinstance(cfg_payload["lot_mapping"], dict):
             return False, "В бэкапе некорректный раздел lot_mapping в auto_lots.json."
 
+    if version == 1:
+        raw_orders = files.get("orders_data.json")
+        if raw_orders is not None:
+            if not isinstance(raw_orders, list):
+                return False, "В бэкапе некорректный формат файла orders_data.json."
+            for idx, ord_entry in enumerate(raw_orders):
+                if not isinstance(ord_entry, Mapping):
+                    return False, f"В legacy orders_data.json некорректная запись заказа #{idx}."
+                oid = str(ord_entry.get("order_id") or ord_entry.get("order_id_funpay") or "").strip()
+                if not oid:
+                    return False, f"В legacy orders_data.json запись заказа #{idx} не содержит order_id."
+
     if version == 2:
-        if not isinstance(payload.get("orders"), list):
+        orders = payload.get("orders")
+        if not isinstance(orders, list):
             return False, "В бэкапе некорректный раздел orders."
-        if not isinstance(payload.get("state"), dict):
+        for idx, ord_entry in enumerate(orders):
+            if not isinstance(ord_entry, Mapping):
+                return (
+                    False,
+                    f"В бэкапе некорректная запись заказа #{idx}: ожидался объект, получено {type(ord_entry).__name__}.",
+                )
+            oid = str(ord_entry.get("order_id") or ord_entry.get("order_id_funpay") or "").strip()
+            if not oid:
+                return False, f"В бэкапе запись заказа #{idx} не содержит обязательного поля order_id."
+        state = payload.get("state")
+        if not isinstance(state, dict):
             return False, "В бэкапе некорректный раздел state."
+        for state_key in state.keys():
+            if not isinstance(state_key, str) or not state_key.strip():
+                return False, f"В бэкапе некорректный ключ состояния: {state_key!r}."
     return True, "OK"
 
 

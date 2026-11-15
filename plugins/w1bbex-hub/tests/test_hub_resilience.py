@@ -803,3 +803,74 @@ def test_plugin_update_dto_contract_and_rendering(isolated_hub: Path) -> None:
     assert pending[0].urgency == "critical"
     assert pending[0]["changelog"] == "Critical security patch"
 
+
+def test_installer_rollback_restores_config_metadata_on_failure(isolated_hub: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # 1. Simulate an existing plugin in config.json
+    storage.update_data(
+        lambda d: d.setdefault("installed", {}).__setitem__(
+            "test_plug",
+            {
+                "name": "OldPlugin",
+                "version": "1.0",
+                "stub_path": "plugins/old_stub.py",
+                "bin_dir": "plugins/w1bbex/old_dir",
+            },
+        )
+    )
+
+    ctx = installer._InstallRollbackContext(
+        save_path=str(isolated_hub / "plugins" / "w1bbex" / "new_dir" / "test_plug.py"),
+        expected_loader_path=str(isolated_hub / "plugins" / "test_plug.py"),
+        plugin_name="test_plug",
+        prev_installed_entry={
+            "name": "OldPlugin",
+            "version": "1.0",
+            "stub_path": "plugins/old_stub.py",
+            "bin_dir": "plugins/w1bbex/old_dir",
+        },
+    )
+
+    # Simulate updated metadata
+    storage.update_data(
+        lambda d: d.setdefault("installed", {}).__setitem__(
+            "test_plug",
+            {
+                "name": "NewPlugin",
+                "version": "2.0",
+                "stub_path": "plugins/new_stub.py",
+                "bin_dir": "plugins/w1bbex/new_dir",
+            },
+        )
+    )
+    ctx.persisted_installed = True
+
+    # Rollback must restore the old metadata in config.json
+    ctx.rollback()
+
+    cfg = storage.load_data()
+    entry = cfg["installed"].get("test_plug")
+    assert entry is not None
+    assert entry["version"] == "1.0"
+    assert entry["name"] == "OldPlugin"
+
+    # 2. Simulate a brand new plugin that had no previous entry
+    new_ctx = installer._InstallRollbackContext(
+        save_path=str(isolated_hub / "plugins" / "w1bbex" / "fresh" / "fresh.py"),
+        expected_loader_path=str(isolated_hub / "plugins" / "fresh.py"),
+        plugin_name="fresh_plugin",
+        prev_installed_entry=None,
+    )
+    storage.update_data(
+        lambda d: d.setdefault("installed", {}).__setitem__(
+            "fresh_plugin",
+            {"name": "Fresh", "version": "1.0"},
+        )
+    )
+    new_ctx.persisted_installed = True
+
+    # Rollback must remove the fresh entry completely
+    new_ctx.rollback()
+
+    cfg2 = storage.load_data()
+    assert "fresh_plugin" not in cfg2.get("installed", {})
+

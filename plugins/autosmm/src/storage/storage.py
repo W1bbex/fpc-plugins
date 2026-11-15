@@ -16,7 +16,14 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 import uuid
 
 from .. import runtime as rt
-from ..models import is_plausible_allowed_domain, normalize_allowed_domain, optional_float, safe_float, safe_int
+from ..models import (
+    OrderRecord,
+    is_plausible_allowed_domain,
+    normalize_allowed_domain,
+    optional_float,
+    safe_float,
+    safe_int,
+)
 from . import db, db_orders, db_state
 from . import migrations
 from .defaults import (
@@ -497,6 +504,16 @@ def save_orders_data(orders_list: List[Dict[str, Any]]) -> bool:
 def get_order_data(order_id_funpay: str) -> Optional[Dict[str, Any]]:
     """Return a single order dictionary by FunPay order ID, or None."""
     return db_orders.get_order(order_id_funpay)
+
+
+def get_order_record(order_id_funpay: str) -> Optional[OrderRecord]:
+    """Return a strongly typed OrderRecord by FunPay order ID, or None."""
+    return db_orders.get_order_record(order_id_funpay)
+
+
+def list_order_records(*, status: Optional[str] = None) -> List[OrderRecord]:
+    """Return all orders as strongly typed OrderRecords."""
+    return db_orders.list_order_records(status=status)
 
 
 def upsert_order_data(
