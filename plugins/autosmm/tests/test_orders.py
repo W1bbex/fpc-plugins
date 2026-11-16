@@ -641,7 +641,6 @@ class OrdersConcurrencyAndAlertsTests(unittest.TestCase):
             rt.DB_PATH = orig_db
 
     def test_concurrent_status_polling_does_not_overwrite_newer_completed_result(self):
-        from src.core import funpay_events
         from src.storage import db
 
         orig_db = rt.DB_PATH
@@ -668,12 +667,16 @@ class OrdersConcurrencyAndAlertsTests(unittest.TestCase):
                     release_slow.wait(timeout=5)
                     return {"ok": True, "status": "pending", "charge": 1.0, "remains": 80}
 
-                def fast_fetch(service_number, panel_order_id):
-                    return {"ok": True, "status": "completed", "charge": 1.0, "remains": 0}
+                def fast_batch(service_number, order_ids):
+                    return {
+                        "ok": True,
+                        "entries": {"9002": {"status": "Completed", "charge": 1.0, "remains": 0}},
+                    }
 
                 cardinal = mock.MagicMock()
                 with (
                     mock.patch.object(orders, "_fetch_single_order_status", side_effect=slow_fetch),
+                    mock.patch.object(orders, "_fetch_batch_order_status", side_effect=fast_batch),
                     mock.patch.object(orders, "_send_completion_notification_if_needed"),
                 ):
                     t_slow = threading.Thread(
@@ -684,10 +687,7 @@ class OrdersConcurrencyAndAlertsTests(unittest.TestCase):
                     t_slow.start()
                     self.assertTrue(entered_slow.wait(timeout=5))
 
-                    with mock.patch.object(funpay_events, "_fetch_single_order_status", side_effect=fast_fetch):
-                        handled = funpay_events._handle_buyer_check_command(cardinal, "чек FP-RACE-1", 555, 77)
-                        self.assertTrue(handled)
-
+                    orders._check_pending_orders_batch(cardinal)
                     after_fast = storage.get_order_data("FP-RACE-1")
                     self.assertEqual(after_fast["status"], "completed")
                     self.assertEqual(after_fast["progress_percent"], 100)
