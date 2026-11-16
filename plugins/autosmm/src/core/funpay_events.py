@@ -59,7 +59,7 @@ from .funpay_sync import (
     _sync_funpay_status_from_order_event,
 )
 from .links import normalize_incoming_text
-from .orders import _apply_status_result, _find_order_by_any_order_ref
+from .orders import _apply_status_result, _find_order_by_any_order_ref, _next_order_status_seq
 from ..models import safe_int as _safe_int
 from .panel_api import (
     _extract_service_credentials,
@@ -134,10 +134,11 @@ def _handle_buyer_check_command(
 
     parsed_service_number = _safe_int(found.get("service_number"))
     service_number = parsed_service_number if (parsed_service_number is not None and parsed_service_number > 0) else 1
+    req_seq = _next_order_status_seq()
     result = _fetch_single_order_status(service_number, panel_order_id)
     order_id_funpay = str(found.get("order_id") or found.get("order_id_funpay") or "")
     if result.get("ok"):
-        _apply_status_result(c, found, result)
+        _apply_status_result(c, found, result, request_seq=req_seq)
         found = get_order_data(order_id_funpay) or found
         status_text = _human_panel_status(found)
         quantity_text = _format_buyer_progress(found)

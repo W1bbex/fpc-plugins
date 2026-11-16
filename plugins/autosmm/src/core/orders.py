@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 import time
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple
 
 if TYPE_CHECKING:
     from cardinal import Cardinal
@@ -48,6 +49,36 @@ STATUS_BATCH_SIZE = 50
 STATUS_BATCH_INTERVAL_SECONDS = 300
 INCORRECT_ORDER_ID_MAX_ATTEMPTS = 3
 
+_STATUS_SEQ_LOCK = threading.Lock()
+_STATUS_SEQ_COUNTER = 0
+
+
+def _next_order_status_seq() -> int:
+    global _STATUS_SEQ_COUNTER
+    with _STATUS_SEQ_LOCK:
+        _STATUS_SEQ_COUNTER += 1
+        return _STATUS_SEQ_COUNTER
+
+
+def _is_stale_status_update(
+    latest: Mapping[str, Any],
+    *,
+    mapped_status: Optional[str] = None,
+    request_seq: Optional[int] = None,
+    allow_completed_regression: bool = False,
+) -> Optional[str]:
+    last_applied_seq = _safe_int(latest.get("status_applied_seq")) or 0
+    if request_seq is not None and request_seq < last_applied_seq:
+        return f"stale_seq ({request_seq} < {last_applied_seq})"
+    current_status = str(latest.get("status") or "").strip().lower()
+    if (
+        not allow_completed_regression
+        and current_status == "completed"
+        and mapped_status in (None, "pending", "unknown")
+    ):
+        return f"completed_regression ({current_status} -> {mapped_status})"
+    return None
+
 _SOFT_STATUS_ERRORS = (
     "timeout",
     "rate_limited",
@@ -73,19 +104,26 @@ def _mark_order_unknown(
     stop_reason: str,
     log_detail: str,
     alert_reason: str = "не удалось подтвердить состояние заказа",
+    *,
+    request_seq: Optional[int] = None,
 ) -> None:
     order_id_funpay = str(order_record.get("order_id"))
-    rt.logger.error(f"ORDER STATUS UNKNOWN: order=#{order_id_funpay}, reason={stop_reason}, detail={log_detail}")
     fields = {
         "status": "unknown",
         "status_stop_reason": stop_reason,
         "status_last_error": stop_reason,
         "status_last_checked_at": rt.now_str(),
+        "status_applied_seq": request_seq if request_seq is not None else _next_order_status_seq(),
     }
     with ORDERS_LOCK:
         latest = get_order_data(order_id_funpay)
         if latest is None or _is_order_refundedish(latest):
             return
+        stale_reason = _is_stale_status_update(latest, mapped_status="unknown", request_seq=request_seq)
+        if stale_reason:
+            rt.logger.info(f"ORDER UNKNOWN SKIPPED ({stale_reason}): order=#{order_id_funpay}")
+            return
+        rt.logger.error(f"ORDER STATUS UNKNOWN: order=#{order_id_funpay}, reason={stop_reason}, detail={log_detail}")
         update_order_fields(order_id_funpay, **fields)
         order_record.update(latest)
         order_record.update(fields)
@@ -97,6 +135,9 @@ def _apply_status_result(
     order_record: Dict,
     result: Dict,
     background_sync: bool = False,
+    *,
+    request_seq: Optional[int] = None,
+    allow_completed_regression: bool = False,
 ) -> None:
     order_id_funpay = str(order_record.get("order_id"))
     latest_initial = get_order_data(order_id_funpay)
@@ -130,6 +171,17 @@ def _apply_status_result(
         if latest is None or _is_order_refundedish(latest):
             rt.logger.info(f"STATUS APPLY SKIPPED AFTER CONCURRENT REFUND: order=#{order_id_funpay}")
             return
+        stale_reason = _is_stale_status_update(
+            latest,
+            mapped_status=mapped_status,
+            request_seq=request_seq,
+            allow_completed_regression=allow_completed_regression,
+        )
+        if stale_reason:
+            rt.logger.info(f"STATUS APPLY SKIPPED ({stale_reason}): order=#{order_id_funpay}")
+            return
+
+        applied_seq = request_seq if request_seq is not None else _next_order_status_seq()
 
         progress_fields: Dict[str, Any] = {"panel_status": mapped_status}
         remains_value = _safe_int(result.get("remains"))
@@ -162,6 +214,7 @@ def _apply_status_result(
             "status_last_checked_at": rt.now_str(),
             "status_last_error": None,
             "incorrect_order_id_attempts": 0,
+            "status_applied_seq": applied_seq,
             "updated_at": rt.now_str(),
             **progress_fields,
         }
@@ -192,7 +245,7 @@ def _apply_status_result(
         _send_manual_check_alert_once(order_record, "не удалось подтвердить состояние заказа")
 
 
-def _handle_incorrect_order_id(order_record: Dict[str, Any]) -> None:
+def _handle_incorrect_order_id(order_record: Dict[str, Any], *, request_seq: Optional[int] = None) -> None:
     """Retry bounded times on the order's assigned panel before stopping as unknown."""
     order_id_funpay = str(order_record.get("order_id"))
     reached_limit = False
@@ -201,11 +254,16 @@ def _handle_incorrect_order_id(order_record: Dict[str, Any]) -> None:
         latest = get_order_data(order_id_funpay)
         if latest is None or _is_order_refundedish(latest):
             return
+        stale_reason = _is_stale_status_update(latest, mapped_status="unknown", request_seq=request_seq)
+        if stale_reason:
+            rt.logger.info(f"INCORRECT ORDER ID SKIPPED ({stale_reason}): order=#{order_id_funpay}")
+            return
         attempts = int(latest.get("incorrect_order_id_attempts", 0) or 0) + 1
         fields: Dict[str, Any] = {
             "incorrect_order_id_attempts": attempts,
             "status_last_error": "incorrect_order_id",
             "status_last_checked_at": rt.now_str(),
+            "status_applied_seq": request_seq if request_seq is not None else _next_order_status_seq(),
         }
         if attempts >= INCORRECT_ORDER_ID_MAX_ATTEMPTS:
             reached_limit = True
@@ -235,14 +293,27 @@ def _handle_panel_status_error(
     error_code: str,
     detail: Any,
     background_sync: bool = False,
+    *,
+    request_seq: Optional[int] = None,
 ) -> None:
     if error_code == "incorrect_order_id":
-        _handle_incorrect_order_id(order_record)
+        _handle_incorrect_order_id(order_record, request_seq=request_seq)
         return
     if error_code in _SOFT_STATUS_ERRORS:
-        update_order_fields(str(order_record.get("order_id")), status_last_error=error_code, status_last_checked_at=rt.now_str())
+        order_id_funpay = str(order_record.get("order_id"))
+        with ORDERS_LOCK:
+            latest = get_order_data(order_id_funpay)
+            if latest is None or _is_order_refundedish(latest):
+                return
+            if _is_stale_status_update(latest, mapped_status=None, request_seq=request_seq):
+                return
+            update_order_fields(
+                order_id_funpay,
+                status_last_error=error_code,
+                status_last_checked_at=rt.now_str(),
+            )
         return
-    _mark_order_unknown(order_record, "status_unknown", detail)
+    _mark_order_unknown(order_record, "status_unknown", detail, request_seq=request_seq)
 
 
 def _sync_single_order_status(c: "Cardinal", order_record: Dict, background_sync: bool = False) -> None:
@@ -257,15 +328,24 @@ def _sync_single_order_status(c: "Cardinal", order_record: Dict, background_sync
     service_number = int(order_record.get("service_number") or 1)
     order_id_funpay = str(order_record.get("order_id"))
 
+    req_seq = _next_order_status_seq()
     result = _fetch_single_order_status(service_number, panel_order_id)
     if result.get("ok"):
-        _apply_status_result(c, order_record, result, background_sync=background_sync)
+        _apply_status_result(c, order_record, result, background_sync=background_sync, request_seq=req_seq)
         return
 
     error_code = result.get("error", "unknown")
     detail = result.get("detail", "")
     rt.logger.warning(f"STATUS CHECK RESULT: order=#{order_id_funpay}, service=#{service_number}, error={error_code}, detail={detail}")
-    _handle_panel_status_error(c, order_record, service_number, error_code, detail, background_sync=background_sync)
+    _handle_panel_status_error(
+        c,
+        order_record,
+        service_number,
+        error_code,
+        detail,
+        background_sync=background_sync,
+        request_seq=req_seq,
+    )
 
 
 def _is_batch_transport_error(error_code: Any) -> bool:
@@ -344,6 +424,7 @@ def _check_pending_orders_batch(c: "Cardinal") -> None:
             if not order_ids:
                 continue
 
+            batch_seq = _next_order_status_seq()
             result = _fetch_batch_order_status(service_number, order_ids)
             if rt.STOP_EVENT.is_set():
                 return
@@ -352,6 +433,7 @@ def _check_pending_orders_batch(c: "Cardinal") -> None:
                 detail = result.get("detail", "")
                 if _is_batch_transport_error(error_code):
                     rt.logger.warning(f"BATCH STATUS RETRY: service=#{service_number}, orders={order_ids}, error={error_code}, detail={detail}")
+                    batch_seq = _next_order_status_seq()
                     retry_result = _fetch_batch_order_status(service_number, order_ids)
                     if rt.STOP_EVENT.is_set():
                         return
@@ -384,7 +466,7 @@ def _check_pending_orders_batch(c: "Cardinal") -> None:
 
                 entry_result = _build_status_result_from_entry(entry)
                 if entry_result.get("ok"):
-                    _apply_status_result(c, order_record, entry_result, background_sync=True)
+                    _apply_status_result(c, order_record, entry_result, background_sync=True, request_seq=batch_seq)
                     continue
 
                 entry_error = entry_result.get("error", "unknown")
@@ -392,7 +474,15 @@ def _check_pending_orders_batch(c: "Cardinal") -> None:
                     f"BATCH STATUS ENTRY ERROR: order={order_record.get('order_id')}, "
                     f"service=#{service_number}, error={entry_error}, detail={entry_result.get('detail')}"
                 )
-                _handle_panel_status_error(c, order_record, service_number, entry_error, entry_result.get("detail", ""), background_sync=True)
+                _handle_panel_status_error(
+                    c,
+                    order_record,
+                    service_number,
+                    entry_error,
+                    entry_result.get("detail", ""),
+                    background_sync=True,
+                    request_seq=batch_seq,
+                )
 
 
 def check_order_status(

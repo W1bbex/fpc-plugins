@@ -580,3 +580,125 @@ class OrdersConcurrencyAndAlertsTests(unittest.TestCase):
             rt.RUNNING = orig_running
             rt.DB_PATH = orig_db
 
+    def test_apply_status_result_ignores_stale_sequence_and_completed_rollback(self):
+        from src.storage import db
+
+        orig_db = rt.DB_PATH
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                rt.DB_PATH = str(Path(tmp) / "autosmm.db")
+                db.init_db(rt.DB_PATH)
+                storage.upsert_order_data(
+                    77,
+                    "FP-MONO-1",
+                    9001,
+                    "pending",
+                    100.0,
+                    "https://t.me/test",
+                    100,
+                    1,
+                )
+                row = storage.get_order_data("FP-MONO-1")
+                with mock.patch.object(orders, "_send_completion_notification_if_needed"):
+                    orders._apply_status_result(
+                        mock.MagicMock(),
+                        row,
+                        {"ok": True, "status": "completed", "charge": 1.0, "remains": 0},
+                    )
+                    after_done = storage.get_order_data("FP-MONO-1")
+                    self.assertEqual(after_done["status"], "completed")
+                    self.assertEqual(after_done["progress_percent"], 100)
+
+                    # Delayed pending result (direct call & stale sequence) must not revert completed
+                    orders._apply_status_result(
+                        mock.MagicMock(),
+                        dict(after_done),
+                        {"ok": True, "status": "pending", "charge": 1.0, "remains": 80},
+                    )
+                    stale_seq = max(0, int(after_done.get("status_applied_seq") or 1) - 1)
+                    orders._apply_status_result(
+                        mock.MagicMock(),
+                        dict(after_done),
+                        {"ok": True, "status": "pending", "charge": 1.0, "remains": 80},
+                        request_seq=stale_seq,
+                    )
+                    stored = storage.get_order_data("FP-MONO-1")
+                    self.assertEqual(stored["status"], "completed")
+                    self.assertEqual(stored["progress_percent"], 100)
+                    self.assertEqual(stored["done_quantity"], 100)
+
+                    # Explicit refill transition remains allowed
+                    orders._apply_status_result(
+                        mock.MagicMock(),
+                        dict(stored),
+                        {"ok": True, "status": "pending", "charge": 1.0, "remains": 25},
+                        allow_completed_regression=True,
+                    )
+                    refilled = storage.get_order_data("FP-MONO-1")
+                    self.assertEqual(refilled["status"], "pending")
+                    self.assertEqual(refilled["progress_percent"], 75)
+        finally:
+            rt.DB_PATH = orig_db
+
+    def test_concurrent_status_polling_does_not_overwrite_newer_completed_result(self):
+        from src.core import funpay_events
+        from src.storage import db
+
+        orig_db = rt.DB_PATH
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                rt.DB_PATH = str(Path(tmp) / "autosmm.db")
+                db.init_db(rt.DB_PATH)
+                storage.upsert_order_data(
+                    77,
+                    "FP-RACE-1",
+                    9002,
+                    "pending",
+                    100.0,
+                    "https://t.me/test",
+                    100,
+                    1,
+                )
+                row = storage.get_order_data("FP-RACE-1")
+                entered_slow = threading.Event()
+                release_slow = threading.Event()
+
+                def slow_fetch(service_number, panel_order_id):
+                    entered_slow.set()
+                    release_slow.wait(timeout=5)
+                    return {"ok": True, "status": "pending", "charge": 1.0, "remains": 80}
+
+                def fast_fetch(service_number, panel_order_id):
+                    return {"ok": True, "status": "completed", "charge": 1.0, "remains": 0}
+
+                cardinal = mock.MagicMock()
+                with (
+                    mock.patch.object(orders, "_fetch_single_order_status", side_effect=slow_fetch),
+                    mock.patch.object(orders, "_send_completion_notification_if_needed"),
+                ):
+                    t_slow = threading.Thread(
+                        target=orders._sync_single_order_status,
+                        args=(cardinal, dict(row)),
+                        kwargs={"background_sync": True},
+                    )
+                    t_slow.start()
+                    self.assertTrue(entered_slow.wait(timeout=5))
+
+                    with mock.patch.object(funpay_events, "_fetch_single_order_status", side_effect=fast_fetch):
+                        handled = funpay_events._handle_buyer_check_command(cardinal, "чек FP-RACE-1", 555, 77)
+                        self.assertTrue(handled)
+
+                    after_fast = storage.get_order_data("FP-RACE-1")
+                    self.assertEqual(after_fast["status"], "completed")
+                    self.assertEqual(after_fast["progress_percent"], 100)
+
+                    release_slow.set()
+                    t_slow.join(timeout=5)
+
+                final = storage.get_order_data("FP-RACE-1")
+                self.assertEqual(final["status"], "completed")
+                self.assertEqual(final["progress_percent"], 100)
+                self.assertEqual(final["done_quantity"], 100)
+        finally:
+            rt.DB_PATH = orig_db
+

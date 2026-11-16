@@ -65,7 +65,7 @@ plugins/autosmm/
 │   ├── services/                    # analytics, currency, notifications, telemetry
 │   ├── storage/                     # SQLite (db, db_orders, db_state), migrations, backups, defaults
 │   └── tg/                          # Telegram UI и обработчики (lots, lot_editor, panels, settings, callback asmm:)
-└── tests/                           # 196 модульных и интеграционных тестов
+└── tests/                           # 198 модульных и интеграционных тестов
 ```
 
 ---
