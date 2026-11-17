@@ -518,6 +518,22 @@ def update_order_fields(order_id: str, db_path: Optional[str] = None, **fields: 
     return True
 
 
+def get_max_status_applied_seq(db_path: Optional[str] = None) -> int:
+    """Return the highest persisted status_applied_seq across all orders."""
+    max_seq = 0
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT extra_json FROM orders WHERE extra_json LIKE '%status_applied_seq%'"
+        ).fetchall()
+    for row in rows:
+        extra = _json_loads_optional(row["extra_json"], {})
+        if isinstance(extra, dict):
+            seq = safe_int(extra.get("status_applied_seq"))
+            if seq is not None and seq > max_seq:
+                max_seq = seq
+    return max_seq
+
+
 def mark_order_refunded_atomic(
     order_id: str,
     *,

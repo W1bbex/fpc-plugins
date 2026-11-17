@@ -442,6 +442,35 @@ def _apply_charge_and_net(
         record["chistota"] = 0.0
 
 
+def build_order_charge_fields(
+    summa: Any,
+    spent: float,
+    currency: str = "USD",
+    net_profit: Optional[float] = None,
+    *,
+    spent_rub: Optional[float] = None,
+    fx_rate_to_rub: Optional[float] = None,
+    fallback_chistota: float = 0.0,
+) -> Dict[str, Any]:
+    """Compute normalized spend, RUB conversion, and net profit fields for an order."""
+    spent_f = safe_float(spent, 0.0)
+    currency_str = normalize_currency_code(currency or "USD")
+    resolved_rub, resolved_rate = _resolve_charge_fx(spent_f, currency_str, spent_rub, fx_rate_to_rub)
+    if net_profit is not None:
+        chistota_val = safe_float(net_profit, fallback_chistota)
+    elif resolved_rub is not None:
+        chistota_val = round(safe_float(summa, 0.0) - resolved_rub, 2)
+    else:
+        chistota_val = 0.0
+    return {
+        "spent": spent_f,
+        "currency": currency_str,
+        "chistota": chistota_val,
+        "spent_rub": resolved_rub,
+        "fx_rate_to_rub": resolved_rate,
+    }
+
+
 def _analytics_update_order_charge_and_net(
     order_id_funpay: str,
     spent: float,
@@ -450,6 +479,7 @@ def _analytics_update_order_charge_and_net(
     *,
     spent_rub: Optional[float] = None,
     fx_rate_to_rub: Optional[float] = None,
+    request_seq: Optional[int] = None,
     order_store: Any = None,
     load_log: Any = None,
     write_log: Any = None,
@@ -469,19 +499,18 @@ def _analytics_update_order_charge_and_net(
             existing = get_order_data(str(order_id_funpay))
             if existing is None:
                 return
-            if net_profit is not None:
-                chistota_val = safe_float(net_profit, safe_float(existing.get("chistota"), 0.0))
-            elif resolved_rub is not None:
-                chistota_val = round(safe_float(existing.get("summa"), 0.0) - resolved_rub, 2)
-            else:
-                chistota_val = 0.0
-            update_fields: Dict[str, Any] = {
-                "spent": spent_f,
-                "currency": currency_str,
-                "chistota": chistota_val,
-                "spent_rub": resolved_rub,
-                "fx_rate_to_rub": resolved_rate,
-            }
+            last_seq = safe_int(existing.get("status_applied_seq")) or 0
+            if request_seq is not None and request_seq < last_seq:
+                return
+            update_fields = build_order_charge_fields(
+                existing.get("summa"),
+                spent_f,
+                currency=currency_str,
+                net_profit=net_profit,
+                spent_rub=resolved_rub,
+                fx_rate_to_rub=resolved_rate,
+                fallback_chistota=safe_float(existing.get("chistota"), 0.0),
+            )
             update_order_fields(str(order_id_funpay), **update_fields)
         return
 
@@ -574,6 +603,7 @@ def update_order_charge_and_net(
     *,
     spent_rub: Optional[float] = None,
     fx_rate_to_rub: Optional[float] = None,
+    request_seq: Optional[int] = None,
 ) -> None:
     _analytics_update_order_charge_and_net(
         str(order_id_funpay),
@@ -582,6 +612,7 @@ def update_order_charge_and_net(
         net_profit,
         spent_rub=spent_rub,
         fx_rate_to_rub=fx_rate_to_rub,
+        request_seq=request_seq,
     )
 
 

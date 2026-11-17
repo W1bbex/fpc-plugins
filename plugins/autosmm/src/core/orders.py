@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import threading
 import time
@@ -27,6 +28,7 @@ from ..storage.storage import (
     STATE_LOCK,
     _load_autosmm_state,
     _save_autosmm_state,
+    get_max_status_applied_seq,
     get_order_data,
     load_orders_data,
     update_order_fields,
@@ -49,13 +51,32 @@ STATUS_BATCH_SIZE = 50
 STATUS_BATCH_INTERVAL_SECONDS = 300
 INCORRECT_ORDER_ID_MAX_ATTEMPTS = 3
 
-_STATUS_SEQ_LOCK = threading.Lock()
+_STATUS_SEQ_LOCK = threading.RLock()
 _STATUS_SEQ_COUNTER = 0
+_STATUS_SEQ_SEEDED_DB: Optional[str] = None
+
+
+def sync_status_seq_floor(*, force: bool = False) -> int:
+    """Seed the in-process sequence counter from the highest persisted status_applied_seq."""
+    global _STATUS_SEQ_COUNTER, _STATUS_SEQ_SEEDED_DB
+    raw_db = getattr(rt, "DB_PATH", None)
+    db_key = os.path.normcase(os.path.abspath(str(raw_db))) if raw_db else None
+    with _STATUS_SEQ_LOCK:
+        if db_key and (force or _STATUS_SEQ_SEEDED_DB != db_key):
+            try:
+                max_seq = get_max_status_applied_seq()
+                if max_seq > _STATUS_SEQ_COUNTER:
+                    _STATUS_SEQ_COUNTER = max_seq
+                _STATUS_SEQ_SEEDED_DB = db_key
+            except (sqlite3.Error, OSError, ValueError, TypeError) as exc:
+                rt.logger.debug(f"Не удалось прочитать max status_applied_seq из БД: {exc}")
+        return _STATUS_SEQ_COUNTER
 
 
 def _next_order_status_seq() -> int:
     global _STATUS_SEQ_COUNTER
     with _STATUS_SEQ_LOCK:
+        sync_status_seq_floor()
         _STATUS_SEQ_COUNTER += 1
         return _STATUS_SEQ_COUNTER
 
@@ -124,7 +145,9 @@ def _mark_order_unknown(
             rt.logger.info(f"ORDER UNKNOWN SKIPPED ({stale_reason}): order=#{order_id_funpay}")
             return
         rt.logger.error(f"ORDER STATUS UNKNOWN: order=#{order_id_funpay}, reason={stop_reason}, detail={log_detail}")
-        update_order_fields(order_id_funpay, **fields)
+        if not update_order_fields(order_id_funpay, **fields):
+            rt.logger.error(f"ORDER STATUS UNKNOWN WRITE FAILED: order=#{order_id_funpay}")
+            return
         order_record.update(latest)
         order_record.update(fields)
     _send_manual_check_alert_once(order_record, alert_reason)
@@ -219,23 +242,31 @@ def _apply_status_result(
             **progress_fields,
         }
         fields["status_stop_reason"] = "unknown_status" if mapped_status == "unknown" else None
+        if fx_info is not None:
+            latest_summa = _safe_float(latest.get("summa"), lot_summa)
+            spent_rub_val = fx_info["spent_rub"]
+            net_profit_val = (
+                round(latest_summa - spent_rub_val, 2)
+                if spent_rub_val is not None
+                else None
+            )
+            fields.update(
+                analytics.build_order_charge_fields(
+                    latest_summa,
+                    fx_info["spent"],
+                    currency=fx_info["currency"],
+                    net_profit=net_profit_val,
+                    spent_rub=spent_rub_val,
+                    fx_rate_to_rub=fx_info["fx_rate_to_rub"],
+                    fallback_chistota=_safe_float(latest.get("chistota"), 0.0),
+                )
+            )
 
-        update_order_fields(order_id_funpay, **fields)
+        if not update_order_fields(order_id_funpay, **fields):
+            rt.logger.error(f"STATUS WRITE FAILED: order=#{order_id_funpay}")
+            return
         order_record.update(latest)
         order_record.update(fields)
-
-    if fx_info is not None:
-        try:
-            analytics.update_order_charge_and_net(
-                order_id_funpay,
-                fx_info["spent"],
-                currency=fx_info["currency"],
-                net_profit=fx_info["net_profit"],
-                spent_rub=fx_info["spent_rub"],
-                fx_rate_to_rub=fx_info["fx_rate_to_rub"],
-            )
-        except (sqlite3.Error, OSError, ValueError, TypeError) as ex:
-            rt.logger.error(f"Не удалось обновить затраты/профит для заказа #{order_id_funpay}: {ex}")
 
     if mapped_status == "completed":
         _send_completion_notification_if_needed(c, order_record)
@@ -271,7 +302,9 @@ def _handle_incorrect_order_id(order_record: Dict[str, Any], *, request_seq: Opt
                 "status": "unknown",
                 "status_stop_reason": "incorrect_order_id",
             })
-        update_order_fields(order_id_funpay, **fields)
+        if not update_order_fields(order_id_funpay, **fields):
+            rt.logger.error(f"INCORRECT ORDER ID WRITE FAILED: order=#{order_id_funpay}")
+            return
         order_record.update(latest)
         order_record.update(fields)
 

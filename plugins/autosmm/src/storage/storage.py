@@ -554,6 +554,11 @@ def update_order_fields(order_id_funpay: str, **fields: Any) -> bool:
     return db_orders.update_order_fields(order_id_funpay, **fields)
 
 
+def get_max_status_applied_seq() -> int:
+    """Return the highest persisted status_applied_seq across stored orders."""
+    return db_orders.get_max_status_applied_seq()
+
+
 def claim_order_for_panel_submission(
     order_id_funpay: str,
     *,

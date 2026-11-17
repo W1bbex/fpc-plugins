@@ -16,7 +16,7 @@ from telebot import types
 from . import runtime as rt
 from .core.buyer_flow import _recover_buyer_flow_runtime
 from .core.funpay_events import auto_smm_handler, start_event_workers, stop_event_workers
-from .core.orders import start_order_checking
+from .core.orders import start_order_checking, sync_status_seq_floor
 from .services.telemetry import _telemetry_gate_allows_menu
 from .storage.storage import (
     CONFIG_LOCK,
@@ -351,6 +351,7 @@ def _register_telegram_callbacks(c_: Cardinal) -> None:
 def init_commands(c_: Cardinal) -> None:
     """Initialize AutoSMM storage, configuration, Telegram commands, and handlers during PRE_INIT."""
     _bootstrap_runtime()
+    sync_status_seq_floor(force=True)
     logger.debug("AutoSMM init_commands() started")
     rt.cardinal_instance = c_
     tg = getattr(c_, "telegram", None)
@@ -381,6 +382,7 @@ def init_commands(c_: Cardinal) -> None:
 def start_runtime(c_: Cardinal) -> None:
     """Recover buyer-flow runtime state and start background workers once Cardinal account init completes."""
     logger.debug("AutoSMM start_runtime() started")
+    sync_status_seq_floor(force=True)
     rt.cardinal_instance = c_
     tg = getattr(c_, "telegram", None)
     bot = getattr(tg, "bot", None)
