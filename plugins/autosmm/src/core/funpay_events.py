@@ -64,13 +64,13 @@ from ..models import safe_int as _safe_int
 from .panel_api import (
     _extract_service_credentials,
     _fetch_single_order_status,
-    _panel_api_json,
 )
 from .panel_errors import (
     _normalize_api_key,
     _sanitize_secret_text,
     _validate_api_key_for_action,
 )
+from .panel_http import _panel_api_json
 
 logger = logging.getLogger("FPC.autosmm")
 

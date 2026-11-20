@@ -78,6 +78,28 @@ from .funpay_sync import (
 from .panel_submission import process_link_without_confirmation
 
 
+def _buyer_order_is_protected(order_record: Dict[str, Any]) -> bool:
+    """Keep duplicate events from resetting an order that needs to retain its state."""
+    stop_reason = str(order_record.get("status_stop_reason") or "").strip().lower()
+    panel_status = str(order_record.get("panel_status") or "").strip().lower()
+    protected_states = {
+        BUYER_STATE_REFUNDED,
+        BUYER_STATE_PANEL_CREATED,
+        BUYER_STATE_COMPLETED,
+        BUYER_STATE_FAILED,
+        BUYER_STATE_WAITING_CONFIRM,
+        BUYER_STATE_LINK_PAUSED,
+    }
+    return (
+        _is_order_refundedish(order_record)
+        or _has_panel_order(order_record)
+        or bool(order_record.get("panel_add_submitted"))
+        or panel_status == "manual_check"
+        or stop_reason in ("panel_add_in_flight", "transport_error_after_add", "persist_failed_after_add")
+        or _get_buyer_flow_state(order_record) in protected_states
+    )
+
+
 def _upsert_buyer_flow_order_record(
     chat_id: int,
     buyer_id: Any,
@@ -94,41 +116,23 @@ def _upsert_buyer_flow_order_record(
     saved_link: Optional[str] = None,
     lot_key: Optional[str] = None,
 ) -> bool:
-    """Create or update a FunPay order record and its buyer-flow runtime state atomically."""
+    """Persist the buyer-flow order without resetting an already protected order."""
     order_id_str = str(order_id_funpay)
     now_str_val = rt.now_str()
     with ORDERS_LOCK:
         base = db_orders.get_order(order_id_str) or {}
-        if base:
-            base_state = _get_buyer_flow_state(base)
-            stop_reason = str(base.get("status_stop_reason") or "").strip().lower()
-            panel_status_val = str(base.get("panel_status") or "").strip().lower()
-            protected_states = {
-                BUYER_STATE_REFUNDED,
-                BUYER_STATE_PANEL_CREATED,
-                BUYER_STATE_COMPLETED,
-                BUYER_STATE_FAILED,
-                BUYER_STATE_WAITING_CONFIRM,
-                BUYER_STATE_LINK_PAUSED,
-            }
-            if (
-                _is_order_refundedish(base)
-                or _has_panel_order(base)
-                or bool(base.get("panel_add_submitted"))
-                or panel_status_val == "manual_check"
-                or stop_reason in ("panel_add_in_flight", "transport_error_after_add", "persist_failed_after_add")
-                or base_state in protected_states
-            ):
-                return False
+        if base and _buyer_order_is_protected(base):
+            return False
 
         created_at = int(safe_float(base.get("created_at"), time.time()))
         resolved_lot_key = lot_key if lot_key not in (None, "") else base.get("lot_key")
         resolved_funpay_status = (
-            "refunded"
-            if _is_order_refundedish(base)
-            else (_normalize_funpay_status(base.get("funpay_status")) or _normalize_funpay_status(funpay_status) or "open")
+            _normalize_funpay_status(base.get("funpay_status"))
+            or _normalize_funpay_status(funpay_status)
+            or "open"
         )
         effective_saved_link = saved_link if saved_link not in (None, "") else base.get("saved_link")
+        quantity = int(real_amount or 0)
         record_update: Dict[str, Any] = {
             "chat_id": chat_id,
             "buyer_id": buyer_id,
@@ -137,10 +141,10 @@ def _upsert_buyer_flow_order_record(
             "lot_title": lot_title or base.get("lot_title") or base.get("service_name") or "",
             "service_name": lot_title or base.get("service_name") or "—",
             "service_id": service_id,
-            "quantity": int(real_amount or 0),
-            "total_quantity": int(real_amount or 0),
+            "quantity": quantity,
+            "total_quantity": quantity,
             "done_quantity": 0,
-            "left_quantity": int(real_amount or 0),
+            "left_quantity": quantity,
             "progress_percent": 0,
             "order_amount": order_amount,
             "order_price": order_price,

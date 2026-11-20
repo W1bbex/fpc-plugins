@@ -522,6 +522,36 @@ class BuyerFlowEdgeTests(unittest.TestCase):
             rt.waiting_for_link.clear()
             rt.waiting_for_link.update(orig_wait)
 
+    def test_duplicate_order_event_keeps_manual_check_after_panel_add(self):
+        order_id = "FP-MANUAL"
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(rt, "DB_PATH", str(Path(tmp) / "autosmm.db")):
+            storage.save_orders_data([{
+                "order_id": order_id,
+                "buyer_flow_state": engine.BUYER_STATE_WAITING_LINK,
+                "panel_status": "manual_check",
+                "status_stop_reason": "transport_error_after_add",
+                "order_price": 50,
+            }])
+            before = storage.get_order_data(order_id)
+            self.assertEqual(before["panel_status"], "manual_check")
+            self.assertEqual(before["status_stop_reason"], "transport_error_after_add")
+
+            updated = buyer_flow._upsert_buyer_flow_order_record(
+                chat_id=101,
+                buyer_id=77,
+                buyer_username="buyer1",
+                order_id_funpay=order_id,
+                lot_title="Lot",
+                order_price=100,
+                order_amount=1,
+                service_id=10,
+                real_amount=100,
+                service_number=1,
+            )
+
+            self.assertFalse(updated)
+            self.assertEqual(storage.get_order_data(order_id), before)
+
     def test_persist_created_order_records_updates_chistota_and_preserves_refunded(self):
         import tempfile
         from pathlib import Path

@@ -45,7 +45,7 @@ from .panel_api import (
     _fetch_single_order_status,
 )
 from .panel_balances import get_cached_service_balance
-from .panel_errors import _build_status_result_from_entry
+from .panel_status_parser import _build_status_result_from_entry
 
 STATUS_BATCH_SIZE = 50
 STATUS_BATCH_INTERVAL_SECONDS = 300

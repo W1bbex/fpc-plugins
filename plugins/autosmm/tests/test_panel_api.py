@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from src.core import panel_api, panel_errors
+from src.core import panel_api, panel_errors, panel_http, panel_status_parser
 
 
 class PanelApiTests(unittest.TestCase):
@@ -19,23 +19,23 @@ class PanelApiTests(unittest.TestCase):
         self.assertEqual(request.call_args.args[1]["action"], "add")
 
     def test_add_timeout_does_not_retry_with_get(self):
-        error = panel_api.requests.exceptions.Timeout("timeout")
-        with patch.object(panel_api.requests, "post", side_effect=error), patch.object(panel_api.requests, "get") as get:
-            with self.assertRaises(panel_api.requests.exceptions.Timeout):
-                panel_api._panel_api_request("https://example.invalid", {"action": "add", "key": "test"})
+        error = panel_http.requests.exceptions.Timeout("timeout")
+        with patch.object(panel_http.requests, "post", side_effect=error), patch.object(panel_http.requests, "get") as get:
+            with self.assertRaises(panel_http.requests.exceptions.Timeout):
+                panel_http._panel_api_request("https://example.invalid", {"action": "add", "key": "test"})
         get.assert_not_called()
 
     def test_batch_result_preserves_order_identifiers(self):
         payload = {"123": {"status": "Completed"}, "456": {"status": "Pending"}}
-        result = panel_errors._extract_batch_status_entries(payload, [123, 456])
+        result = panel_status_parser._extract_batch_status_entries(payload, [123, 456])
         self.assertEqual(result, payload)
-        self.assertEqual(panel_errors._build_status_result_from_entry(result["123"])["status"], "completed")
+        self.assertEqual(panel_status_parser._build_status_result_from_entry(result["123"])["status"], "completed")
 
     def test_add_uses_get_when_post_method_is_rejected(self):
         rejected = SimpleNamespace(status_code=405, text="", json=lambda: {})
         accepted = SimpleNamespace(status_code=200, text="", json=lambda: {"order": 42})
-        with patch.object(panel_api.requests, "post", return_value=rejected), patch.object(panel_api.requests, "get", return_value=accepted) as get:
-            self.assertIs(panel_api._panel_api_request("https://example.invalid", {"action": "add"}), accepted)
+        with patch.object(panel_http.requests, "post", return_value=rejected), patch.object(panel_http.requests, "get", return_value=accepted) as get:
+            self.assertIs(panel_http._panel_api_request("https://example.invalid", {"action": "add"}), accepted)
         get.assert_called_once()
 
     def test_single_status_accepts_panel_order_id_and_uses_modern_user_agent(self):
@@ -46,7 +46,7 @@ class PanelApiTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["status"], "completed")
         self.assertEqual(request.call_args.args[1]["order"], 9001)
-        self.assertNotIn("MSIE 5.01", panel_api.PANEL_API_HEADERS.get("User-Agent", ""))
+        self.assertNotIn("MSIE 5.01", panel_http.PANEL_API_HEADERS.get("User-Agent", ""))
 
 
 class PanelApiHardeningTests(unittest.TestCase):
@@ -67,7 +67,7 @@ class PanelApiHardeningTests(unittest.TestCase):
         self.assertNotEqual(classified.get("error_class"), "PANEL_ERROR")
 
         with mock.patch.object(
-            panel_api.requests,
+            panel_http.requests,
             "post",
             return_value=mock.MagicMock(
                 status_code=502,
@@ -95,7 +95,7 @@ class PanelApiHardeningTests(unittest.TestCase):
         secret = "SUPER_SECRET_API_KEY_987"
         cfg = {"services": {"1": {"api_url": "https://panel.example/api/v2", "api_key": secret}}}
         with mock.patch.object(
-            panel_api.requests,
+            panel_http.requests,
             "post",
             side_effect=requests.RequestException(
                 f"Failed request to https://panel.example/api/v2?key={secret}&action=status"

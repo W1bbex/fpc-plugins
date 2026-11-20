@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 
 from .. import runtime as rt
 from ..core.buyer_messages import _render_template
-from ..core.panel_api import _panel_api_json
+from ..core.panel_http import _panel_api_json
 from ..core.panel_errors import (
     _build_transport_error_balance_note,
     _sanitize_secret_text,

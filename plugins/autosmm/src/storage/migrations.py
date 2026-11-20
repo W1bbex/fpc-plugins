@@ -1,4 +1,4 @@
-"""One-shot legacy JSON-to-SQLite migration and v1 backup merge helpers."""
+"""Migrate legacy file layouts and import JSON data into SQLite."""
 
 from __future__ import annotations
 
@@ -6,6 +6,8 @@ from datetime import datetime
 import json
 import logging
 import os
+import shutil
+import sqlite3
 import time
 from typing import Any, Dict, List, Mapping, Optional
 
@@ -169,3 +171,103 @@ def migrate_legacy_json_to_sqlite(
         f"AUTO SMM SQLITE MIGRATION: импортировано заказов={inserted}, ключей состояния={len(legacy_state)}."
     )
     return True
+
+
+def _path_has_content(path_value: str) -> bool:
+    try:
+        return os.path.exists(path_value) and os.path.getsize(path_value) > 0
+    except OSError:
+        return os.path.exists(path_value)
+
+
+def _copy_storage_file_if_needed(new_path: str, old_path: str, copied: List[str], source_label: str) -> None:
+    try:
+        if _path_has_content(new_path) or not os.path.exists(old_path):
+            return
+        parent = os.path.dirname(new_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        shutil.copy2(old_path, new_path)
+        copied.append(f"{os.path.basename(old_path)} -> {os.path.basename(new_path)} ({source_label})")
+    except OSError as exc:
+        logger.warning(f"AUTO SMM STORAGE MIGRATION: не удалось скопировать {old_path} -> {new_path}: {exc}")
+
+
+def _nested_storage_file_map() -> Dict[str, str]:
+    base = rt.BASE_STORAGE_DIR
+    return {
+        rt.CONFIG_PATH: str(base / "config" / "auto_lots.json"),
+        rt.VALID_LINKS_PATH: str(base / "config" / "valid_link.json"),
+        rt.ORDERS_PATH: str(base / "orders" / "auto_smm_orders.json"),
+        rt.ORDERS_DATA_PATH: str(base / "orders" / "orders_data.json"),
+        rt.ORDERS_RUNTIME_PATH: str(base / "runtime" / "orders_runtime.json"),
+        rt.AUTOSMM_STATE_PATH: str(base / "runtime" / "auto_smm_state.json"),
+    }
+
+
+def _legacy_storage_file_map() -> Dict[str, str]:
+    return {
+        rt.CONFIG_PATH: rt.LEGACY_CONFIG_PATH,
+        rt.VALID_LINKS_PATH: rt.LEGACY_VALID_LINKS_PATH,
+        rt.ORDERS_PATH: rt.LEGACY_ORDERS_PATH,
+        rt.ORDERS_DATA_PATH: rt.LEGACY_ORDERS_DATA_PATH,
+        rt.ORDERS_RUNTIME_PATH: rt.LEGACY_ORDERS_RUNTIME_PATH,
+        rt.AUTOSMM_STATE_PATH: rt.LEGACY_AUTOSMM_STATE_PATH,
+    }
+
+
+def _sqlite_order_file_targets() -> set[str]:
+    return {
+        os.path.normcase(os.path.abspath(str(path)))
+        for path in (rt.ORDERS_PATH, rt.ORDERS_DATA_PATH, rt.ORDERS_RUNTIME_PATH, rt.AUTOSMM_STATE_PATH)
+        if path
+    }
+
+
+def migrate_autosmm_files_from_legacy_if_needed() -> None:
+    """Migrate legacy file layouts and import JSON orders/state into SQLite once."""
+    try:
+        rt.ensure_storage_dirs()
+        db.init_db()
+        sqlite_targets = _sqlite_order_file_targets()
+        already_migrated = bool(db_state.load_state().get("legacy_json_migrated_at"))
+
+        copied: List[str] = []
+        nested_sqlite_sources: List[str] = []
+        for new_path, old_path in _nested_storage_file_map().items():
+            is_sqlite_src = os.path.normcase(os.path.abspath(str(new_path))) in sqlite_targets
+            if is_sqlite_src and already_migrated:
+                if os.path.exists(old_path):
+                    _archive_migrated_file(old_path)
+                continue
+            _copy_storage_file_if_needed(new_path, old_path, copied, "nested")
+            if is_sqlite_src and os.path.exists(old_path):
+                nested_sqlite_sources.append(old_path)
+        if copied:
+            logger.debug(f"AUTO SMM STORAGE MIGRATION: nested -> flat: {', '.join(copied)}")
+
+        legacy_copied: List[str] = []
+        legacy_sqlite_sources: List[str] = []
+        for new_path, legacy_path in _legacy_storage_file_map().items():
+            is_sqlite_src = os.path.normcase(os.path.abspath(str(new_path))) in sqlite_targets
+            if is_sqlite_src and already_migrated:
+                if os.path.exists(legacy_path):
+                    _archive_migrated_file(legacy_path)
+                continue
+            _copy_storage_file_if_needed(new_path, legacy_path, legacy_copied, "storage/cache")
+            if is_sqlite_src and os.path.exists(legacy_path):
+                legacy_sqlite_sources.append(legacy_path)
+
+        migrated_to_sqlite = migrate_legacy_json_to_sqlite()
+        if migrated_to_sqlite or already_migrated:
+            for source_path in (*nested_sqlite_sources, *legacy_sqlite_sources):
+                _archive_migrated_file(source_path)
+
+        if legacy_copied:
+            db_state.update_state_fields(
+                legacy_files_migrated_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                legacy_files_migrated_from="storage/cache",
+            )
+            logger.debug(f"AUTO SMM LEGACY MIGRATION: скопированы файлы: {', '.join(legacy_copied)}")
+    except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
+        logger.exception(f"AUTO SMM LEGACY MIGRATION FAILED: {exc}")

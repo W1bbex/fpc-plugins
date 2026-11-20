@@ -26,6 +26,8 @@ from src.core import (
     orders,
     panel_balances,
     panel_errors,
+    panel_http,
+    panel_status_parser,
     panel_submission,
     refunds,
 )
@@ -505,8 +507,8 @@ class AutoSmmRegressionsTests(unittest.TestCase):
         import logging
         from src.core import panel_api, panel_errors
 
-        self.assertEqual(panel_errors._normalize_runtime_status("Partially Completed"), "partial")
-        self.assertEqual(panel_errors._normalize_runtime_status("Completed"), "completed")
+        self.assertEqual(panel_status_parser._normalize_runtime_status("Partially Completed"), "partial")
+        self.assertEqual(panel_status_parser._normalize_runtime_status("Completed"), "completed")
 
         err_status = panel_errors._classify_panel_api_result(
             action="status",
@@ -551,8 +553,8 @@ class AutoSmmRegressionsTests(unittest.TestCase):
             json=lambda: {"error": f"bad key={secret}"},
         )
         try:
-            with mock.patch("src.core.panel_api.requests.post", return_value=fake_resp):
-                panel_api._panel_api_json(
+            with mock.patch("src.core.panel_http.requests.post", return_value=fake_resp):
+                panel_http._panel_api_json(
                     f"https://panel.example/api/v2?key={secret}",
                     {"key": secret, "action": "status", "order": 1},
                     timeout=5,
@@ -584,10 +586,10 @@ class AutoSmmRegressionsTests(unittest.TestCase):
                 "src.models.socket.getaddrinfo",
                 return_value=[(_socket.AF_INET, _socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))],
             ),
-            mock.patch("src.core.panel_api.requests.post") as post_mock,
+            mock.patch("src.core.panel_http.requests.post") as post_mock,
         ):
             with self.assertRaises(ValueError):
-                panel_api._panel_api_request("https://rebind.attacker.net/api/v2", {"action": "balance"})
+                panel_http._panel_api_request("https://rebind.attacker.net/api/v2", {"action": "balance"})
             post_mock.assert_not_called()
 
     def test_funpay_sync_partial_refund_guard_and_concurrent_cancel_dedup(self):
@@ -966,10 +968,8 @@ class AutoSmmRegressionsTests(unittest.TestCase):
                 self.assertEqual(orders_list[0]["order_id"], "FP-TEST-2")
 
     def test_panel_status_without_currency_defaults_to_order_or_panel_currency(self):
-        from src.core import panel_errors
-
         entry = {"status": "Completed", "charge": "25.00"}
-        parsed = panel_errors._build_status_result_from_entry(entry)
+        parsed = panel_status_parser._build_status_result_from_entry(entry)
         self.assertTrue(parsed["ok"])
         self.assertIsNone(parsed["currency"])
         self.assertEqual(parsed["charge"], "25.00")
@@ -1090,9 +1090,9 @@ class AutoSmmRegressionsTests(unittest.TestCase):
         self.assertGreater(call_count[0], first_calls)
 
     def test_normalize_runtime_status_maps_refunded_to_canceled(self):
-        self.assertEqual(panel_errors._normalize_runtime_status("Refunded"), "canceled")
-        self.assertEqual(panel_errors._normalize_runtime_status("partially refunded"), "partial")
-        self.assertEqual(panel_errors._normalize_runtime_status("order refunded"), "canceled")
+        self.assertEqual(panel_status_parser._normalize_runtime_status("Refunded"), "canceled")
+        self.assertEqual(panel_status_parser._normalize_runtime_status("partially refunded"), "partial")
+        self.assertEqual(panel_status_parser._normalize_runtime_status("order refunded"), "canceled")
 
     def test_db_stat_signature_supports_zero_inode_filesystems(self):
         with tempfile.NamedTemporaryFile() as tmp:

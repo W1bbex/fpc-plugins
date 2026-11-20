@@ -831,7 +831,7 @@ class TgUiHardeningTests(unittest.TestCase):
 
     def test_panels_ssrf_block_and_placeholder_skip_and_comma_balance(self):
         from unittest import mock
-        from src.core import panel_api
+        from src.core import panel_http
         from src.tg import panels as tg_panels
 
         for bad_url in (
@@ -852,7 +852,7 @@ class TgUiHardeningTests(unittest.TestCase):
         tg_panels._invalidate_balance_cache()
         with (
             mock.patch.object(
-                panel_api.requests,
+                panel_http.requests,
                 "post",
                 return_value=mock.MagicMock(
                     status_code=200,

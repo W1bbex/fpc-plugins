@@ -29,7 +29,7 @@ from .engine import (
     BUYER_STATE_FAILED,
     BUYER_STATE_REFUNDED,
 )
-from .panel_api import _panel_api_json
+from .panel_http import _panel_api_json
 from .panel_errors import (
     _normalize_api_key,
     _sanitize_secret_text,

@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 from .. import runtime as rt
 from ..models import normalize_api_url
 from ..storage.storage import load_config
-from .panel_api import _panel_api_json
+from .panel_http import _panel_api_json
 from .panel_errors import (
     _normalize_api_key,
     _sanitize_secret_text,

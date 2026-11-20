@@ -61,11 +61,11 @@ plugins/autosmm/
 │   ├── runtime.py                   # Метаданные версии (1.0), пути и общие блокировки
 │   ├── models.py                    # Модели данных заказов и конфигурации
 │   ├── plugin.py                    # Регистрация команд (/autosmm, /chatid) и хуков Cardinal
-│   ├── core/                        # Бизнес-логика: buyer_flow, engine, links, orders, panel_api, panel_errors, refunds
+│   ├── core/                        # Бизнес-логика: buyer_flow, engine, links, orders, panel_api, panel_http, panel_errors, panel_status_parser, refunds
 │   ├── services/                    # analytics, currency, notifications, telemetry
-│   ├── storage/                     # SQLite (db, db_orders, db_state), migrations, backups, defaults
+│   ├── storage/                     # SQLite (db, db_orders, db_state), config_storage, order_log, migrations, backups, defaults
 │   └── tg/                          # Telegram UI и обработчики (lots, lot_editor, panels, settings, callback asmm:)
-└── tests/                           # 203 модульных и интеграционных тестов
+└── tests/                           # 204 модульных и интеграционных теста
 ```
 
 ---
